@@ -23,12 +23,27 @@ started, and nothing enforces anything new yet.
 
 | | |
 |---|---|
-| `hwprivacy.service` (user) | **active**, PID 2331, ~15 h uptime, 1.3 % of a core, 20 MB RSS |
-| Binary it runs | `~/projects/hwprivacy/target/release/hwprivacy-daemon` — the **dev tree**, not `/usr/bin` |
+| `hwprivacy.service` (user) | **active**, restarted 2026-08-04 23:40 |
+| Binary it runs | `~/.local/bin/hwprivacy-daemon` — **no longer the dev tree** |
+| `hwprivacy-ctl/-tui/-gui` | also in `~/.local/bin`, which is on `PATH` — call them by name |
 | `hwprivacy-lsm` | **not** installed, **not** running, no systemd unit. Runs only when invoked by hand as root. |
 
-`cargo build --release` in this tree swaps the binary underneath a live
-service. Restart with `systemctl --user restart hwprivacy` after building.
+**Changed 2026-08-04:** the service used to run straight out of
+`target/release/`, so `cargo build --release` swapped the binary underneath a
+live service. It now runs from `~/.local/bin`. Consequence: **after rebuilding
+you must re-install for the change to take effect** —
+
+```bash
+cargo build --release --workspace
+install -m 0755 target/release/hwprivacy-{daemon,ctl,tui,gui} ~/.local/bin/
+systemctl --user restart hwprivacy
+```
+
+Also fixed then: the D-Bus activation file had been pointing at
+`/home/perieteanu/hwprivacy/...` — a path that does not exist (the project is
+under `projects/`). D-Bus activation had therefore never worked; the service
+only ever started because systemd started it. Both files are regenerated
+correctly by `hwprivacy-daemon install`.
 
 **Nothing new enforces anything.** The kernel program denies nothing by
 construction and is never pinned — stopping the process detaches it.

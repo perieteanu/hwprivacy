@@ -81,10 +81,14 @@ hwprivacy-ctl status                   # or ./target/release/hwprivacy-ctl
 journalctl --user -u hwprivacy -f      # the defects are visible here, not just in code
 ```
 
-- Daemon runs from **`target/release/`**, not `/usr/bin`. `make install` has
-  never been run; no `.deb` has ever been built.
-  **`cargo build --release` swaps the binary underneath a live service** —
-  `systemctl --user restart hwprivacy` after building.
+- Daemon runs from **`~/.local/bin/hwprivacy-daemon`** (since 2026-08-04; it
+  used to run out of `target/release/`, where a rebuild swapped the binary
+  underneath the live service). All four binaries are in `~/.local/bin`, which
+  is on `PATH`. **After rebuilding you must re-install for it to take effect:**
+  `install -m 0755 target/release/hwprivacy-{daemon,ctl,tui,gui} ~/.local/bin/`
+  then `systemctl --user restart hwprivacy`.
+  `make install` (which targets `/usr/bin`, needs sudo) has never been run; no
+  `.deb` has ever been built.
 - Config: `~/.config/hwprivacy/config.toml`. The daemon **rewrites the whole
   file** on any rule change — comments and hand-formatting are destroyed.
   Stop the daemon before hand-editing.
