@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=HWPrivacy
+Comment=Hardware Privacy Controls
+Exec=hwprivacy-gui
+Icon=preferences-system-privacy
+Categories=System;Settings;

@@ -1,0 +1,30 @@
+[package]
+name = "hwprivacy-lsm"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+authors = ["perieteanu"]
+description = "Kernel-level camera access enforcement for hwprivacy, via eBPF LSM"
+
+# Deliberately its own workspace during Phase 1.
+#
+# The parent tree's `cargo build --release --workspace` builds the daemon that
+# is currently RUNNING as a systemd service. Adding this crate as a member
+# before the eBPF toolchain (clang, libbpf-dev, bpftool) is installed would
+# break that build. This crate joins the parent workspace once Phase 1
+# compiles — see docs-yaml/ROADMAP.yaml.
+[workspace]
+
+[[bin]]
+name = "hwprivacy-lsm"
+path = "src/main.rs"
+
+[dependencies]
+libbpf-rs = "0.27"          # MSRV 1.82; local rustc is 1.85
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+libc = "0.2"
+
+[build-dependencies]
+libbpf-cargo = "0.27"

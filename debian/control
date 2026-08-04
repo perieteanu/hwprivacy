@@ -1,0 +1,46 @@
+Source: hwprivacy
+Section: utils
+Priority: optional
+Maintainer: perieteanu <perieteanu@debian.org>
+Build-Depends: debhelper-compat (= 13),
+               cargo,
+               rustc,
+               libgtk-4-dev,
+               libdbus-1-dev,
+               pkg-config
+Standards-Version: 4.6.2
+Homepage: https://github.com/perieteanu/hwprivacy
+
+Package: hwprivacy-daemon
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         pipewire,
+         wireplumber
+Description: Hardware privacy daemon
+ Background service that manages hardware privacy controls such as
+ camera, microphone, and other device toggles via D-Bus.
+
+Package: hwprivacy-ctl
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         hwprivacy-daemon
+Description: Hardware privacy command-line tool
+ Command-line interface for controlling hardware privacy settings
+ through the hwprivacy daemon.
+
+Package: hwprivacy-tui
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         hwprivacy-daemon
+Description: Hardware privacy terminal UI
+ Terminal user interface for controlling hardware privacy settings
+ through the hwprivacy daemon.
+
+Package: hwprivacy-gui
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         hwprivacy-daemon,
+         libgtk-4-1
+Description: Hardware privacy graphical UI
+ GTK 4 graphical user interface for controlling hardware privacy
+ settings through the hwprivacy daemon.

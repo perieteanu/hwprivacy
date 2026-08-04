@@ -1,0 +1,23 @@
+[package]
+name = "hwprivacy-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hwprivacy-daemon"
+path = "src/main.rs"
+
+[dependencies]
+hwprivacy-common = { path = "../hwprivacy-common" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+zbus = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+anyhow = { workspace = true }
+clap = { workspace = true }
+notify-rust = "=4.11.3"
+chrono = { version = "0.4", features = ["serde"] }

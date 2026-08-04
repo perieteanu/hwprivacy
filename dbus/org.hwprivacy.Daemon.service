@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.hwprivacy.Daemon
+Exec=/usr/bin/hwprivacy-daemon

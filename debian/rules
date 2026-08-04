@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	cargo build --release --workspace
+
+override_dh_auto_install:
+	install -D -m 0755 target/release/hwprivacy-daemon debian/hwprivacy-daemon/usr/bin/hwprivacy-daemon
+	install -D -m 0755 target/release/hwprivacy-ctl debian/hwprivacy-ctl/usr/bin/hwprivacy-ctl
+	install -D -m 0755 target/release/hwprivacy-tui debian/hwprivacy-tui/usr/bin/hwprivacy-tui
+	install -D -m 0755 target/release/hwprivacy-gui debian/hwprivacy-gui/usr/bin/hwprivacy-gui
+	install -D -m 0644 debian/hwprivacy-daemon.service debian/hwprivacy-daemon/usr/lib/systemd/user/hwprivacy-daemon.service
+	install -D -m 0644 dbus/org.hwprivacy.Daemon.service debian/hwprivacy-daemon/usr/share/dbus-1/services/org.hwprivacy.Daemon.service
+	install -D -m 0644 debian/hwprivacy-gui.desktop debian/hwprivacy-gui/usr/share/applications/hwprivacy-gui.desktop
+
+override_dh_auto_test:

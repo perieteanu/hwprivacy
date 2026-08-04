@@ -1,0 +1,180 @@
+# What lives where, how data flows, who owns what.
+# Read this second, after MISSION.yaml.
+# Verified against source + the live running daemon on 2026-08-04.
+---
+shape:
+  language: "Rust 2021"
+  layout: "Cargo workspace, 5 crates, 3434 LOC of first-party code"
+  build: "cargo build --release --workspace  (or: make build)"
+  binaries: 4
+  tests: 0          # <-- there are none. Not a typo.
+
+crates:
+  hwprivacy-common:
+    loc: 504
+    purpose: "Shared types + the zbus client proxy. Every other crate depends on it."
+    files:
+      config.rs:         "Permission enum (5 levels), AppRule, Config, TOML load/save, normalize_app_name"
+      device.rs:         "DeviceCategory (Microphone|Camera|Monitor), ProtectedDevice"
+      stream.rs:         "StreamInfo, ActiveConnection, AccessEvent, AccessAction"
+      dbus_interface.rs: "#[zbus::proxy] trait HwPrivacy — the client side of the API"
+
+  hwprivacy-daemon:
+    loc: 1638
+    purpose: "The only component that enforces anything. Everything else is a viewer."
+    files:
+      main.rs:            "CLI (run/install/uninstall/service-status), the monitoring loop, systemd+D-Bus unit installation"
+      device_discovery.rs: "pw-dump JSON -> Vec<ProtectedDevice>. Classifies by media.class."
+      pipewire_monitor.rs: "capture_graph() -> GraphSnapshot; diff_links(); app identity resolution"
+      policy_engine.rs:   "classify_link() (which side is the device), evaluate() (rule -> PolicyDecision)"
+      link_manager.rs:    "destroy_link() via pw-link --disconnect, fallback pw-cli destroy"
+      stream_tracker.rs:  "active connections, 500-event ring buffer, one-shot grants, dismiss cooldowns"
+      notification.rs:    "2-stage freedesktop notifications via notify-rust"
+      dbus_service.rs:    "#[zbus::interface] server impl — 11 methods, 3 declared signals"
+      state.rs:           "DaemonState = config + devices + tracker + known_link_ids + block_all"
+
+  hwprivacy-ctl:
+    loc: 196
+    purpose: "CLI. status | devices | rules {list,set,remove} | streams | log | block-all | unblock-all"
+    note: "Pure D-Bus client. Cannot function without the daemon."
+
+  hwprivacy-tui:
+    loc: 498
+    purpose: "ratatui 4-panel view (Devices/Streams/Rules/Events). Polls D-Bus every 1s."
+    keys: "Tab=cycle panel, Up/Down=select, r=refresh, q/Esc=quit; in Rules: a=allow d=deny e=ask_each w=while_in_use x=remove"
+
+  hwprivacy-gui:
+    loc: 598
+    purpose: "GTK4 notebook (4 tabs) + ksni StatusNotifierItem tray. Polls D-Bus every 2s."
+    files:
+      main.rs:   "gtk::Application, tray thread + mpsc bridge, raw GLib log writer to suppress GTK 4.18 noise"
+      window.rs: "tabs, add-rule form, Block All / Unblock All / Refresh, dbus_worker on its own tokio runtime"
+      tray.rs:   "ksni tray: Show / Hide to Tray / Exit; left-click toggles window"
+    note: "Close button hides to tray (connect_close_request returns Propagation::Stop). Ctrl+Q or tray Exit really quits."
+
+enforcement_pipeline:
+  substrate: "polling — subprocess `pw-dump`, parsed as JSON"
+  cadence: "policy.poll_interval_ms, default 500"
+  measured_cost_2026_08_04:
+    pw_dump_output: "272 KB of JSON per call"
+    rate: "2 calls/sec => ~544 KB/s parsed continuously"
+    cpu: "8m15s CPU over 11h05m uptime = 1.2% of one core, at idle"
+    rss: "20.7 MB"
+  steps:
+    - "1. capture_graph(): pw-dump -> HashMap<node_id, NodeInfo> + Vec<PwLink>"
+    - "2. diff_links(): links whose link_id is not in state.known_link_ids"
+    - "3. classify_link(): is either endpoint a ProtectedDevice? which side is the app?"
+    - "4. devices.is_guarded(category)? if not, skip entirely"
+    - "5. block_all flag? destroy + log + next"
+    - "6. evaluate(): one-shot grant, else config.get_permission(app, category) -> PolicyDecision"
+    - "7. act: Allow=track it | Deny=destroy+notify | Ask/AskEach=destroy first, then prompt"
+    - "8. reap: drop tracker entries whose link_id vanished from the graph"
+
+  critical_property: >
+    Enforcement is DESTRUCTIVE and RETROACTIVE, not preventive. The link is
+    created by PipeWire, carries data, and is then torn down. Everything about
+    the current design follows from that.
+
+  critical_blind_spot: >
+    The substrate can only observe what enters the PipeWire graph. A process
+    that opens /dev/video0 (V4L2) or /dev/snd/pcmC0D0c (ALSA) directly creates
+    no node and no link, and is therefore invisible — not 'allowed', not
+    'missed', but structurally unobservable. Demonstrated 2026-08-04 for both
+    camera and microphone. See ROADMAP.yaml > security_gaps > g5/g6.
+    Any future work on this substrate inherits this blind spot; only a layer
+    below PipeWire closes it.
+
+app_identity_resolution:
+  where: "pipewire_monitor.rs parse_node()"
+  precedence:
+    - "pipewire.access.portal.app_id  (sandboxed apps)"
+    - "application.name / application.process.binary / node.description"
+    - "basename of /proc/<pid>/exe"
+    - "systemd unit / cgroup leaf from /proc/<pid>/cgroup"
+    - "literal 'unknown'"
+  annotation: >
+    If a cgroup unit is known and not already in the label, it is appended as
+    ' [unit]' — producing e.g. 'Firefox [pipewire-pulse]'.
+  pid_resolution: "pipewire.sec.pid (server-attested) preferred over application.process.id; accepts JSON number or string"
+  matching: >
+    config.rs normalize_app_name() lowercases and strips ONE trailing ' [...]'
+    annotation, but only when the string ends with ']'. So 'Firefox
+    [pipewire-pulse]' -> 'firefox' and matches a rule named 'firefox'.
+  trap: >
+    Notification bodies render '{app} (pid:{n})'. A rule created by copying
+    that whole string ends with ')', so nothing is stripped and the rule can
+    NEVER match. One such dead rule exists in the live config.
+
+device_classification:
+  where: "device_discovery.rs classify_node()"
+  rules:
+    "Audio/Source":  "Microphone (unless node.name contains '.monitor' -> Monitor)"
+    "Video/Source":  "Camera"
+    "Audio/Sink":    "Monitor — registered so the sink->stream tap pattern can be caught"
+  live_result_2026_08_04:
+    - "monitor    alsa_output.pci-0000_00_1f.3.analog-stereo   Built-in Audio Analog Stereo"
+    - "microphone alsa_input.pci-0000_00_1f.3.analog-stereo    Built-in Audio Analog Stereo"
+    - "camera     v4l2_input.pci-0000_00_14.0-usb-0_7_1.0      Integrated Camera (V4L2)"
+    - "monitor    alsa_output.pci-0000_01_00.1.hdmi-stereo     HDMI Digital Stereo"
+  rescan: "every ~5s, but only for the first 120s after start (late hardware at autostart)"
+
+dbus_api:
+  service: "org.hwprivacy.Daemon"
+  path: "/org/hwprivacy/Daemon"
+  bus: "session"
+  methods: 11
+  method_list:
+    - "GetDevices() -> a(sssb)              (category, node, description, guarded)"
+    - "GetRules() -> a(sss)                 (app, device, permission)"
+    - "SetRule(app, device, perm) -> b"
+    - "RemoveRule(app) -> b"
+    - "GetActiveStreams() -> a(susssssb)    (app, pid, device, node, media, perm, active)"
+    - "GetStatus() -> (buuuu)               (running, devices, rules, blocked, streams)"
+    - "GetEvents(last_n) -> a(ssss)         (timestamp, app, device, action)"
+    - "BlockAll() -> b"
+    - "UnblockAll() -> b"
+    - "AllowStream(serial) -> b"
+    - "DenyStream(serial) -> b"
+  signals_declared: ["AccessAttempt", "RuleChanged", "StreamEvent"]
+  signals_actually_emitted: ["RuleChanged"]
+  consequence: >
+    AccessAttempt and StreamEvent are dead declarations. TUI and GUI therefore
+    POLL (1s / 2s) instead of subscribing. Any README claim that clients are
+    signal-driven is false.
+
+state_ownership:
+  authoritative_config: "~/.config/hwprivacy/config.toml (system fallback: /etc/hwprivacy/config.toml)"
+  written_by: "the daemon only — via Config::save(), whole-file rewrite with toml::to_string_pretty"
+  written_when:
+    - "SetRule / RemoveRule over D-Bus"
+    - "a user choice on an action notification"
+    - "on `hwprivacy-daemon install`, if no config exists yet"
+  hazard: >
+    Whole-file rewrite. Comments and hand-formatting in config.toml are
+    destroyed on any rule change. Do not put explanatory comments there.
+  in_memory_only:
+    - "event ring buffer (500 entries, lost on restart)"
+    - "blocked_count"
+    - "one_shot_allowed grants"
+    - "dismiss_cooldowns"
+    - "block_all flag"
+
+deployment:
+  systemd_user_unit: "~/.config/systemd/user/hwprivacy.service  (generated by `hwprivacy-daemon install`)"
+  dbus_activation:   "~/.local/share/dbus-1/services/org.hwprivacy.Daemon.service"
+  live_2026_08_04: >
+    Running as PID 2331 from /home/perieteanu/projects/hwprivacy/target/release/
+    — i.e. from the DEV TREE, not from /usr/bin. `make install` has never been
+    run and no .deb has ever been built. Rebuilding the workspace replaces the
+    binary underneath the running service.
+  debian_dir: "complete (control, rules, changelog, copyright, compat, .service, .desktop, 4x .install) but never exercised"
+
+external_dependencies:
+  runtime_binaries: ["pw-dump", "pw-link", "pw-cli"]
+  note: "Called as subprocesses. If PipeWire tooling is absent the daemon degrades to a no-op that logs warnings."
+  notable_crates:
+    notify-rust: "=4.11.3 — hard-pinned for Debian 13 MSRV (rustc 1.85)"
+    zbus: "4, tokio feature, default-features off"
+    gtk4: "0.9"
+    ksni: "0.2"
+    ratatui: "0.28 + crossterm 0.28"

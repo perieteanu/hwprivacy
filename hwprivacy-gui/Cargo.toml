@@ -1,0 +1,19 @@
+[package]
+name = "hwprivacy-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hwprivacy-gui"
+path = "src/main.rs"
+
+[dependencies]
+hwprivacy-common = { path = "../hwprivacy-common" }
+zbus = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+gtk = { package = "gtk4", version = "0.9" }
+async-channel = "2"
+futures-util = "0.3"
+ksni = "0.2"

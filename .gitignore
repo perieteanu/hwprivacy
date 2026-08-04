@@ -1,0 +1,12 @@
+# Rust build artifacts — ~3.2 GB of this tree
+target/
+
+# Generated from the RUNNING kernel's BTF by the Phase 0 toolchain script.
+# Machine- and kernel-specific, 2.6 MB, regenerate with:
+#   bpftool btf dump file /sys/kernel/btf/vmlinux format c > src/bpf/vmlinux.h
+hwprivacy-lsm/src/bpf/vmlinux.h
+
+# Editor / OS noise
+*.swp
+*~
+.DS_Store

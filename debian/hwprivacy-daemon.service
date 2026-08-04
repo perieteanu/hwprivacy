@@ -1,0 +1,11 @@
+[Unit]
+Description=HWPrivacy Hardware Privacy Daemon
+After=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/hwprivacy-daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

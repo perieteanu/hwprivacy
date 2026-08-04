@@ -1,0 +1,30 @@
+use hwprivacy_common::device::ProtectedDevice;
+use hwprivacy_common::Config;
+use crate::stream_tracker::StreamTracker;
+use std::collections::HashSet;
+
+/// Full runtime state of the daemon.
+pub struct DaemonState {
+    /// Configuration (rules, policy, device toggles)
+    pub config: Config,
+    /// Discovered protected devices
+    pub devices: Vec<ProtectedDevice>,
+    /// Stream tracker (active connections, events, pending)
+    pub tracker: StreamTracker,
+    /// Known link IDs from last graph poll (for diff detection)
+    pub known_link_ids: HashSet<u32>,
+    /// Emergency block-all mode
+    pub block_all: bool,
+}
+
+impl DaemonState {
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            devices: Vec::new(),
+            tracker: StreamTracker::new(),
+            known_link_ids: HashSet::new(),
+            block_all: false,
+        }
+    }
+}

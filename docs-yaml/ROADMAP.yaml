@@ -1,0 +1,326 @@
+# What's built, what's broken, what's next.
+# Updated when work lands or priorities shift.
+---
+current_state:
+  date: "2026-08-04"
+  stage: "build"
+  reality_check: >
+    This project is FEATURE-COMPLETE and was mis-remembered as unfinished. All
+    five planned phases exist in code, `cargo check --workspace` is clean, and
+    the daemon has been running continuously as a systemd user service. What
+    failed was not scope — it was four behavioural defects that made daily use
+    unpredictable.
+
+  verified_working:
+    - "Cargo workspace, 5 crates, 3434 LOC, builds clean (5 trivial warnings, 0 errors)"
+    - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
+    - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
+    - "Link destruction via pw-link --disconnect with pw-cli fallback"
+    - "5 permission levels + per-stream gating for browsers"
+    - "D-Bus service, 11 methods, session bus, activation file installed"
+    - "hwprivacy-ctl — all 7 command groups functional against the live daemon"
+    - "hwprivacy-tui — 4 panels, keyboard rule editing"
+    - "hwprivacy-gui — GTK4 tabs, add/remove rules, ksni tray, close-to-tray"
+    - "2-stage notifications (instant BLOCKED + action prompt)"
+    - "`hwprivacy-daemon install/uninstall` — systemd user unit + D-Bus activation"
+    - "Complete debian/ packaging tree"
+
+  measured_live_2026_08_04:
+    daemon_pid: 2331
+    uptime: "11h05m"
+    cpu: "8m15s = 1.2% of one core, at idle"
+    rss: "20.7 MB"
+    guarded_devices: 4
+    active_rules: 8
+    blocked_attempts: 26
+    running_from: "target/release/ — the dev tree, NOT /usr/bin"
+
+blockers:
+  label: "Why it 'did not work properly'. Fix these before anything else."
+  b1_dismiss_writes_deny:
+    severity: critical
+    what: "Dismissing a notification writes a permanent `deny` rule instead of doing nothing."
+    where: "hwprivacy-daemon/src/notification.rs:146 — `perm.or(Some(Permission::Deny))`"
+    effect: "The unreachable `None` arm in main.rs:382 means record_dismiss()/is_in_cooldown() are dead code. Config silently accumulated denials the user never chose."
+    evidence: "journalctl 18:47:04 — 'dismissed — no rule saved' immediately followed by 'User set rule: ... = deny'"
+    mode: execute
+    est_minutes: 20
+
+  b2_stale_oneshot_grants:
+    severity: critical
+    what: "`ask_each` streams get silently ALLOWED with no prompt."
+    where: "hwprivacy-daemon/src/stream_tracker.rs:128 grant_one_shot()"
+    effect: "one_shot_allowed: Vec<u32> is never pruned and is keyed on the PipeWire node id, which PipeWire recycles. An old grant leaks onto an unrelated later stream."
+    evidence: "live event log — 'Firefox [pipewire-pulse] microphone ALLOWED' while config says microphone = ask_each"
+    mode: execute
+    est_minutes: 45
+
+  b3_duplicate_prompts:
+    severity: high
+    what: "A stereo capture produces two identical BLOCKED popups and two rule prompts."
+    where: "hwprivacy-daemon/src/main.rs — `for link in &new_links`, no grouping"
+    effect: "Each channel is its own PipeWire link and is evaluated independently. Reads as broken."
+    evidence: "event log shows exact pairs: 18:45:17 monitor DENIED x2, 18:45:19 x2, 18:45:22 x2"
+    fix_shape: "coalesce new links by (app node, device category) within a poll before deciding/notifying"
+    mode: execute
+    est_minutes: 60
+
+  b4_dead_rules_in_config:
+    severity: medium
+    what: "Three of the 8 live rules can never match anything."
+    detail:
+      - "app_name = '' — no stream is ever named empty (parse_node falls back to 'unknown')"
+      - "app_name = 'Firefox [pipewire-pulse] (pid:2332)' — ends with ')', so normalize_app_name strips nothing"
+      - "app_name = 'pipewire [pipewire-pulse]' — a self-reference artefact of the dismiss defect"
+    root_cause: "notification bodies render '{app} (pid:{n})' and users paste that string into the rule form"
+    fix_shape: "clean the config AND stop the trap — validate/normalize app_name on SetRule, and stop offering a pasteable pid-bearing label"
+    mode: execute
+    est_minutes: 30
+
+security_gaps:
+  label: "Real holes not listed in README > Known Limitations."
+  g1_grandfathered_links:
+    what: "Links that already exist when the daemon starts are never evaluated."
+    where: "main.rs:158 seeds known_link_ids with every link from the initial capture, then only the diff is processed"
+    effect: "A mic tap active before daemon start survives forever. Also means every daemon restart re-grandfathers everything."
+    fixed_free_by: "d-event-driven-substrate (registry enumeration gives existing objects on connect)"
+
+  g2_blockall_does_not_block:
+    what: "The emergency Block All button does not stop anything already recording."
+    where: "dbus_service.rs block_all() only sets state.block_all = true, which gates NEW links"
+    effect: "Existing allowed links keep flowing. The button implies a panic-stop it does not deliver."
+    note: "link_manager.rs:33 destroy_all_links_to_node() already exists and is never called — it is exactly the missing piece."
+
+  g3_no_persistent_audit:
+    what: "The event log is a 500-entry in-memory ring buffer, lost on every restart."
+    effect: "No forensics. 'Did anything use my mic last Tuesday' is unanswerable."
+
+  g4_timestamps_lack_a_date:
+    what: "AccessEvent.timestamp is '%H:%M:%S' only."
+    where: "stream_tracker.rs:65"
+    effect: "Events are ambiguous past midnight; unusable if g3 is ever fixed."
+
+  g5_camera_bypass:
+    severity: "critical — the camera feature does not function against the real threat"
+    discovered: "2026-08-04, by direct experiment on the live system"
+    what: "Opening /dev/video0 directly via V4L2 is completely invisible to hwprivacy."
+    why: >
+      Firefox and Chrome acquire the camera through V4L2 directly, not through
+      PipeWire. No PipeWire node is created, no link appears, so the link-diff
+      monitoring substrate has nothing to observe.
+    evidence: |
+      ffmpeg -f v4l2 -i /dev/video0 -frames:v 90   (exit 0, 90 frames captured)
+                      events  blocked  pw_links  cam_node_state  v4l2_fds_open
+        before          64      26       10      suspended             0
+        during (x5)     64      26       10      suspended             1
+        after           64      26       10      suspended             0
+      hwprivacy camera events logged: 0.  journal over the window: no entries.
+      The PipeWire camera node (id=68, Video/Source) never left `suspended` —
+      PipeWire was not involved at any point.
+    fixable_in_pipewire_layer: false
+    note: "No amount of polish, event-driven rework, or classification work reaches a process that never talks to PipeWire. Requires eBPF LSM, AppArmor, or device-node ACLs."
+    also: "/dev/video1 exists alongside /dev/video0 (typically the UVC metadata node of the same device). Any device-node rule must cover the whole set."
+
+  g6_alsa_bypass:
+    severity: "high — microphone protection covers the common path, not the threat"
+    discovered: "2026-08-04, same method"
+    what: "Opening the mic directly via ALSA (hw:0,0 -> /dev/snd/pcmC0D0c) is equally invisible."
+    evidence: |
+      ffmpeg -f alsa -i hw:0,0 -t 3    (exit 0, 3s of real microphone audio captured)
+                      events  blocked  pw_links  snd_pcm_fds_open
+        before          64      26       10             1
+        during (x5)     64      26       10             2
+        after           64      26       10             1
+      journal over the window: no entries.
+    consequence: >
+      The Phase-1 parecord validation proved that the PIPEWIRE PATH is guarded.
+      It did not prove the microphone is guarded. Both statements were conflated.
+
+  honest_coverage_2026_08_04:
+    playback_monitor: "REAL and unique. There is no straightforward kernel-level way to tap a sink monitor, so PipeWire is genuinely the correct layer. This feature holds up."
+    microphone: "PARTIAL. Blocks apps that route through PipeWire (most desktop apps). Misses anyone who calls ALSA directly."
+    camera: "NONE in practice. Only sees the minority of apps that route camera through PipeWire's Video/Source."
+    accurate_one_liner: "hwprivacy guards the PipeWire path, well. It is not a hardware permission manager."
+
+  verification_harness:
+    purpose: "Reusable acceptance test for any enforcement layer, present or future."
+    method: >
+      Snapshot (hwprivacy event count, blocked count, pw-dump link count, open
+      fds on the device node) before / during / after a direct-access attempt.
+      An enforcement layer that works must either make the open() fail or make
+      the event count move.
+    camera: "ffmpeg -hide_banner -f v4l2 -i /dev/video0 -frames:v 90 -f null -"
+    microphone: "ffmpeg -hide_banner -f alsa -i hw:0,0 -t 3 -f null -"
+    pass_criterion_for_kernel_layer: "both commands must fail with EPERM for a denied app"
+    caution: "the camera test lights the webcam LED; the mic test records real audio (discarded to null). Ask before running either."
+
+kernel_layer:
+  label: "eBPF LSM enforcement (hwprivacy-lsm). Plan: ~/.claude/plans/curried-swinging-scone.md"
+  phase_1_result:
+    date: "2026-08-04 23:09"
+    status: "VALIDATED — attached on first try, no verifier rejection"
+    what_ran: "sudo hwprivacy-lsm --summarize, observe-only, denies nothing"
+    observed: |
+      OPENS  ROLE    DEVICE              EXE
+      10     CAMERA  /dev/video0         /usr/lib/firefox-esr/firefox-esr
+      3      CAMERA  /dev/video1         /usr/lib/firefox-esr/firefox-esr
+      1      MIC     /dev/snd/pcmC0D0c   /usr/bin/pipewire
+    simultaneous_pipewire_layer_log: |
+      23:09:13  Firefox [pipewire-pulse]  microphone  ASKED
+      23:09:13  Firefox [pipewire-pulse]  microphone  ASKED
+      23:09:16  Firefox [pipewire-pulse]  microphone  STREAM_DENIED
+      23:09:19  Firefox [pipewire-pulse]  microphone  STREAM_DENIED
+      camera events: 0
+    proves:
+      - "g5_camera_bypass confirmed from BOTH sides in the same 7-second window: 13 kernel-visible camera opens, 0 PipeWire events."
+      - "The two layers are complementary, not redundant. For the microphone the kernel sees only /usr/bin/pipewire holding the device and cannot tell which app is behind it; PipeWire sees 'Firefox wants the mic' but is blind to the camera. Neither alone is sufficient."
+      - "Exe-inode identity works: resolved /usr/lib/firefox-esr/firefox-esr, NOT the /usr/bin/firefox shell script."
+      - "Identity is discriminating: firefox-esr is ino=30287776, the Developer Edition in $HOME is ino=1310763. Allowing one does not allow the other. The PipeWire layer calls both 'Firefox'."
+  new_requirement_for_phase_2:
+    finding: "One camera session produced 13 opens in a single second (10 on /dev/video0, 3 on /dev/video1)."
+    consequence: >
+      Denying without coalescing would emit 13 EPERMs and 13 notifications.
+      This is the same defect as b3_duplicate_prompts in the PipeWire layer.
+      Phase 2 must dedupe by (exe key, device major) with a cooldown from the
+      start rather than reproduce it.
+  known_policy_keys:
+    note: "(dev, ino) pairs as Phase 2 will store them. Package upgrades change the inode — see the staleness mitigation in the plan."
+    firefox_esr: "dev=66306 ino=30287776  /usr/lib/firefox-esr/firefox-esr"
+    firefox_dev_edition: "dev=66306 ino=1310763   /home/perieteanu/firefox-developer/firefox-bin"
+    pipewire: "dev=66306 ino=30017535  /usr/bin/pipewire"
+  still_unobserved:
+    - "Discord, Zoom, Telegram, OBS, cheese, and the Firefox Developer Edition have not yet been seen touching either device."
+    - "Not a blocker: default-deny plus a notification surfaces each new consumer the first time it appears. That IS the discovery mechanism."
+  outstanding_measurement:
+    what: "Cost of the LSM hook, which fires on EVERY open() system-wide."
+    why_it_matters: "Costin explicitly rejected the PipeWire layer's 1.2% idle CPU. This number decides whether the architecture is acceptable at all."
+    how: "Time an open()-heavy benchmark with and without the program attached, e.g. 200k open/close of /dev/null."
+    status: "NOT YET MEASURED — do not claim it is cheap until it is."
+
+next_up:
+  label: "Ordered. Do not start item 2 before item 1 is settled."
+  steps:
+  - id: settle-posture
+    what: "Decide deny-by-default vs ask-by-default, then make README, config default, and code agree."
+    why: "README and the live config currently contradict each other. Every other fix depends on which one is true."
+    ref: "DECISIONS.yaml d-posture-unsettled"
+    mode: decide
+    est_minutes: 20
+
+  - id: fix-blockers
+    what: "b1, b2, b3, b4 in that order."
+    why: "These are the entire reason daily use failed. Cheap, local, no architecture change."
+    mode: execute
+    est_minutes: 155
+
+  - id: pure-function-tests
+    what: "First tests in the workspace: normalize_app_name, Permission/DeviceCategory round-trip, classify_link against captured pw-dump fixtures."
+    why: "classify_link and normalize_app_name hold the whole security decision and have zero coverage. Fixtures also make b2/b3 regressions catchable."
+    mode: execute
+    est_minutes: 90
+
+  - id: event-driven-substrate
+    what: "Replace pw-dump polling with pipewire-rs registry callbacks."
+    why: "One change removes the 1.2% idle CPU, the ~500ms race window, and g1 simultaneously."
+    scope_note: "policy_engine, config, D-Bus and all three frontends stay untouched — the decoupling already exists."
+    risk: "largest single change in the project's life; do it after tests exist, not before"
+    ref: "DECISIONS.yaml d-event-driven-substrate"
+    mode: decide
+    est_minutes: 480
+
+  - id: git-init
+    what: "git init + .gitignore target/ before any of the above."
+    why: "3.2 GB repo with no version control and a running service pointed at target/release/. There is currently no way to undo a bad edit."
+    mode: execute
+    est_minutes: 10
+
+deferred:
+  - id: emit-missing-signals
+    what: "Actually emit AccessAttempt and StreamEvent; switch TUI/GUI from polling to subscribing."
+    why_deferred: "Cosmetic until the substrate change lands; the polling frontends work."
+
+  - id: while-in-use-lifecycle
+    what: "Revoke when the app's PipeWire client disconnects. Currently while_in_use == allow."
+    why_deferred: "Needs client-disconnect events — free once event-driven monitoring exists."
+
+  - id: per-device-rules
+    what: "Distinguish built-in mic from USB mic. Rules are per CATEGORY today, not per device."
+
+  - id: gui-inline-editing
+    what: "Dropdowns on the rules tab and allow/deny buttons on the streams tab."
+    note: "GUI can add and remove rules; it cannot edit one in place. TUI can."
+
+  - id: persistent-audit-log
+    what: "Write events to a file. Fixes g3. Requires g4 first."
+
+  - id: profiles
+    what: "Meeting mode / Privacy mode / Recording mode, quick-switch from the tray."
+
+  - id: tray-in-use-indicator
+    what: "Android-style green dot when mic or camera is live."
+
+  - id: deb-build
+    what: "Run dpkg-buildpackage end to end, test install/uninstall on clean Debian 13."
+    note: "debian/ is complete but has never been exercised. control descriptions are boilerplate that never mention PipeWire."
+
+  - id: man-pages
+    what: "One per binary. Required for any Debian ITP."
+
+  - id: wireplumber-lua-hook
+    what: "Block links before creation via WirePlumber's policy chain. Zero race, zero data ever flows."
+    why_deferred: "Strictly better than pipewire-rs on latency, but couples to WirePlumber version churn. v3."
+
+debt:
+  hardcoded_values_that_should_be_config:
+    - "DISMISS_COOLDOWN_SECS = 60 (stream_tracker.rs:8)"
+    - "event ring buffer size 500 (stream_tracker.rs:79)"
+    - "notification timeouts 5000 / 60000 ms (notification.rs:49, :101)"
+    - "device rescan window: every 5s for the first 120s (main.rs:153-154)"
+    - "device discovery retry: 5 attempts, 2s apart (main.rs:91-107)"
+    - "GUI auto-refresh 2s (window.rs:328); TUI tick 1s (app.rs:116)"
+    - "frontends request a fixed last-50 events"
+  dead_code:
+    - "link_manager.rs destroy_all_links_to_node() — defined, never called (see g2)"
+    - "config.rs rules_map() — defined, never called"
+    - "stream_tracker.rs while_in_use_streams — written, never read"
+    - "stream_tracker.rs record_dismiss()/is_in_cooldown() — unreachable via b1"
+    - "PwLink.output_port / input_port — parsed, never read (compiler warns)"
+    - "AccessAction::RevokedOnDisconnect — variant never constructed"
+  compiler_warnings: 5
+  clippy: "not installed for this toolchain — `cargo clippy` returns 'no such command'"
+
+open_questions:
+  label: "Need Costin's answer. Blocking the fixes they belong to."
+  q-posture:
+    question: "deny-by-default or ask-by-default?"
+    blocks: "everything — see next_up > settle-posture"
+    context: "README says deny-all, live config says ask. Costin's 2026-08-04 steer ('full privacy direction') points at deny."
+    ref: "DECISIONS.yaml d-posture-unsettled"
+
+  q-dismiss-semantics:
+    question: "When the user dismisses a rule prompt without choosing, what should happen?"
+    blocks: "b1_dismiss_writes_deny — the fix is trivial once this is answered"
+    options:
+      a: "block this attempt, save nothing, 60s cooldown, ask again later (what README documents)"
+      b: "block this attempt, save nothing, never ask again this session (quieter, still no permanent rule)"
+      c: "treat dismiss as deny and save it permanently (current behaviour, almost certainly unintended)"
+    note: "the cooldown machinery for option (a) already exists and is simply unreachable"
+    ref: "DECISIONS.yaml d-dismiss-defect"
+
+  q-blockall-semantics:
+    question: "Should Block All tear down links already flowing, or only gate new ones?"
+    blocks: "g2_blockall_does_not_block"
+    note: "destroy_all_links_to_node() already exists unused if the answer is 'tear down'"
+
+  q-unknown-app-policy:
+    question: "What should happen to a stream whose app cannot be identified (labelled 'unknown')?"
+    context: "parse_node falls back to the literal string 'unknown', which is then matched as if it were an app name — so all unidentifiable apps share one rule."
+    note: "surfaced while writing these docs; not yet in blockers because no live misbehaviour has been attributed to it"
+
+if_revisiting_cold:
+  - "Read MISSION.yaml, then this file's blockers section. That is the whole story."
+  - "Check the daemon is alive: `systemctl --user status hwprivacy` and `hwprivacy-ctl status`."
+  - "Look at ~/.config/hwprivacy/config.toml — dead rules there are the fingerprint of b1/b4."
+  - "`journalctl --user -u hwprivacy --since today` — the defects are visible in the logs, not just the code."
+  - "Remember the daemon runs from target/release/. `cargo build --release` swaps the binary under a live service."
+  - "Do not trust README's 'What Has Been Implemented' on BEHAVIOUR. It is accurate on scope and wrong on dismiss handling and on the D-Bus signals."

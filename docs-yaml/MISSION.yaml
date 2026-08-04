@@ -1,0 +1,85 @@
+# Why this project exists.
+# Read this first when reopening the repo after a long gap.
+---
+mission:
+  primary: >
+    Give the Linux desktop the hardware permission model Android has had for
+    a decade: no native application touches the microphone, the camera, or the
+    playback monitor without an explicit, remembered decision by the user.
+
+  problem_statement: >
+    Flatpak and Snap apps are gated by XDG Portals. Native .deb applications
+    (Firefox, Telegram, Chromium, anything apt-installed) bypass all of it —
+    any process running as your user can connect to PipeWire and take the mic,
+    the camera, or record what is currently playing through the speakers, with
+    no prompt, no indicator, and no log. There is no permission layer at all.
+
+  approach: >
+    Operate at the PipeWire graph level rather than per-application, so the
+    control applies regardless of packaging format. PipeWire is the single
+    chokepoint every audio and video device flows through on a modern Linux
+    desktop; policing its links polices everything.
+
+  distinguishing_feature: >
+    Playback-monitor protection. Most privacy tooling thinks about mic and
+    camera. This also blocks the eavesdrop case: an app tapping a sink's
+    monitor source to record what YOU are listening to. Detected by link
+    direction (Audio/Sink -> Stream/Input/Audio is a tap; the reverse is
+    normal playback and is never touched).
+
+posture:
+  intended: "deny-by-default, explicit allowlist"
+  as_shipped_2026_08_04: "ask-by-default (policy.default_action = ask)"
+  note: >
+    README has always said 'Default policy: deny all'. The live config says
+    'ask'. This contradiction is unresolved and is the single most important
+    thing to settle before further work — see DECISIONS.yaml d-posture-unsettled.
+
+constraints:
+  - "Target: Debian 13 (Trixie), PipeWire + WirePlumber, KDE Plasma and GNOME."
+  - "No root. Daemon runs as a systemd *user* service, in the user's session."
+  - "No hardcoded policy — everything lives in ~/.config/hwprivacy/config.toml."
+  - "Idle cost must be negligible. 1.2% of a core (measured 2026-08-04) is NOT acceptable."
+  - "Debian-packageable: MSRV pinned to what Debian 13 ships (rustc 1.85)."
+
+explicit_non_goals:
+  - "Defending against a hostile process running as the same user. See threat_model below."
+  - "Replacing XDG Portals for sandboxed apps — this covers the native gap."
+  - "Per-website visibility inside a browser. PipeWire cannot see it."
+  - "A Qt/KDE-native frontend. GTK4 is accepted even on Plasma."
+
+threat_model:
+  scope_correction_2026_08_04: >
+    MEASURED, not assumed. hwprivacy observes the PipeWire graph, so it can
+    only see applications that use PipeWire. Direct device-node access —
+    V4L2 on /dev/video*, ALSA on /dev/snd/* — is completely invisible to it.
+    Both were demonstrated on the live system; see
+    ROADMAP.yaml > security_gaps > g5_camera_bypass and g6_alsa_bypass.
+  defends_against:
+    - "Silent monitor taps (recording your playback). Real and unique — PipeWire is genuinely the right layer for this."
+    - "Careless PipeWire-routed microphone access, which is how most desktop apps take the mic."
+    - "Not knowing. The event log and notifications make PipeWire-path access visible."
+  does_not_defend_against:
+    - "Direct V4L2 camera access — i.e. how Firefox and Chrome actually use the camera. Coverage here is effectively nil."
+    - "Direct ALSA microphone capture. Trivially available to any process."
+    - "A process running as your user: it can `systemctl --user stop hwprivacy`."
+    - "An app that re-creates the link faster than enforcement notices."
+    - "Name spoofing: identity is the PipeWire `application.name` property, which the app declares about itself."
+  honest_framing: >
+    'Guards the PipeWire path, well.' NOT 'a hardware permission manager'.
+    Any wording stronger than this — including the current README — overstates
+    what the code does.
+  what_would_fix_it: >
+    Only a layer below PipeWire: eBPF LSM on security_file_open, AppArmor
+    profiles, or device-node ACLs. This machine already has BPF LSM active
+    (`bpf` present in /sys/kernel/security/lsm, CONFIG_BPF_LSM=y,
+    CONFIG_DEBUG_INFO_BTF=y, kernel 6.12) with no boot-parameter change needed.
+
+motivation_context:
+  reopened: "2026-08-04"
+  user_note: >
+    Costin returned to the project not remembering it was feature-complete,
+    and reported having tried to use it without success. Both are explained:
+    it IS complete, and it misbehaved for four concrete reasons documented in
+    ROADMAP.yaml > blockers. The docs were right about scope and wrong about
+    behaviour.

@@ -1,0 +1,16 @@
+[package]
+name = "hwprivacy-ctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hwprivacy-ctl"
+path = "src/main.rs"
+
+[dependencies]
+hwprivacy-common = { path = "../hwprivacy-common" }
+zbus = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

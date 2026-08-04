@@ -1,0 +1,98 @@
+# Format, vocabulary, and house rules specific to hwprivacy.
+# Read before editing config handling, notifications, or anything that names an app.
+---
+permission_vocabulary:
+  canonical_strings: ["allow", "ask_each", "while_in_use", "ask", "deny"]
+  serde: "snake_case, both directions (Display + FromStr agree with the TOML encoding)"
+  semantics:
+    allow:        "every stream from this app is auto-allowed"
+    ask_each:     "prompt for EVERY new stream — the browser-tab answer"
+    while_in_use: "INTENDED: allowed while the app's PipeWire client lives. ACTUAL: identical to `allow` — nothing revokes."
+    ask:          "prompt once, save a permanent rule"
+    deny:         "always destroy the link, notify instantly"
+  parse_rule: "case-insensitive on input, always lowercase on output"
+
+device_vocabulary:
+  canonical_strings: ["microphone", "camera", "monitor"]
+  accepted_aliases: {microphone: "mic", camera: "cam", monitor: "mon"}
+  monitor_means: >
+    A playback sink's monitor source — i.e. recording what is coming OUT of
+    your speakers. It does NOT mean a display/screen. The GUI add-rule field
+    placeholder says 'camera/microphone/screen/...' which is wrong; 'screen'
+    is not a valid category.
+
+app_naming:
+  identity_source: "PipeWire application.name, with fallbacks — see ARCHITECTURE.yaml > app_identity_resolution"
+  rule_key: "config.rs normalize_app_name(): lowercase, strip ONE trailing ' [...]' iff the string ends with ']'"
+  write_rules_as: "the bare lowercase app name — `firefox`, `obs`, `telegram-desktop`"
+  never_write_rules_as:
+    - "anything containing '(pid:NNNN)' — the pid is not stripped, the rule is dead on arrival"
+    - "the full notification body text"
+    - "an empty string"
+  rationale: >
+    Normalization is deliberately narrow. It exists to make the pulse-bridge
+    variant 'OBS [pipewire-pulse]' match a rule written as 'obs'. It is not a
+    general fuzzy matcher and will not save you from a pasted label.
+
+config_file:
+  path: "~/.config/hwprivacy/config.toml"
+  owner: "the daemon"
+  format: "TOML — [policy], [devices], and a [[rules]] array"
+  rule_shape: "{app_name, microphone, camera, monitor} — every rule carries all three categories"
+  default_for_unset_category: "deny  (serde default = default_deny)"
+  hand_editing:
+    allowed: "yes, but stop the daemon first"
+    warning: >
+      Config::save() rewrites the whole file with toml::to_string_pretty.
+      Comments and manual ordering are LOST on the next rule change. Never put
+      documentation inside config.toml — put it here.
+  no_hardcoding_rule: >
+    Global house rule applies: any tunable belongs in config.toml, not in a
+    Rust const. Current violations are listed in ROADMAP.yaml > debt.
+
+notifications:
+  stage_1: "instant 'BLOCKED: {app} -> {device}' — Urgency::Critical, Transient, 5s auto-dismiss, no actions"
+  stage_2: "'Set rule for {app} -> {device}' — Resident, 60s timeout, action buttons"
+  action_ids_permanent: ["allow", "ask_each", "while_in_use", "deny"]
+  action_ids_per_stream: ["allow_stream", "deny_stream"]
+  body_markup: "freedesktop HTML subset — <b>, <i>, <u> only"
+  dismiss_contract:
+    documented: "no rule saved + 60s cooldown before re-prompting"
+    actual: "a permanent `deny` rule is written — see DECISIONS.yaml d-dismiss-defect"
+
+logging:
+  framework: "tracing + tracing_subscriber::fmt, level from RUST_LOG (unit sets RUST_LOG=info)"
+  read_with: "journalctl --user -u hwprivacy -f"
+  event_ring_buffer: "500 entries, in memory, lost on restart. There is no persistent audit log."
+  event_timestamp: "chrono::Local, '%H:%M:%S' — time only, no date. Useless past midnight."
+
+code_style:
+  edition: "2021"
+  msrv: "whatever Debian 13 ships (rustc 1.85). Do not adopt newer language features or bump pinned crates without checking."
+  error_handling: "anyhow in binaries; the daemon never panics on PipeWire failure — it warns and continues"
+  async: "tokio multi-thread; blocking notify-rust calls go through spawn_blocking"
+  locking: "one Arc<RwLock<DaemonState>>. Drop the read guard before awaiting anything that needs the write guard."
+  formatting: "cargo fmt defaults"
+  lint: "cargo check is clean. clippy is NOT installed for this toolchain (`cargo clippy` -> no such command)."
+
+testing:
+  current: "none — zero #[test] in the workspace"
+  when_added_start_with:
+    - "normalize_app_name() — table-driven, including the '(pid:N)' trap case"
+    - "Permission / DeviceCategory FromStr <-> Display round-trip"
+    - "classify_link() against captured pw-dump JSON fixtures (mic capture, monitor tap, plain playback)"
+    - "Config TOML round-trip with a missing category field (must default to deny)"
+  rationale: "classify_link and normalize_app_name are pure functions holding the entire security decision. They are the cheapest possible tests and do not exist."
+
+repo_hygiene:
+  version_control: "NONE — this is not a git repository as of 2026-08-04"
+  size: "3.2 GB, almost entirely target/"
+  when_git_is_added: "gitignore target/ first, before the initial commit"
+  log_md: "append-only, global format: DD-MM-YYYY HH:MM | DDD | hw | [TYPE] desc"
+  short_name: "hw  (as registered in project-tracker projects.yaml)"
+
+credit:
+  rule: >
+    Standing global preference: if this is published or treated as a portfolio
+    item, add the discreet collaborator line to README Credits and keep the
+    Co-Authored-By trailer. Costin is author of record.

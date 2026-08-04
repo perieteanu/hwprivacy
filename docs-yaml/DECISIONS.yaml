@@ -1,0 +1,212 @@
+# Architectural decisions. Append, never rewrite. Supersede by linking ids.
+# Entries dated 2026-03/04 are RECONSTRUCTED from code + PLAN.md, not from a
+# contemporaneous record — they are marked reconstructed: true.
+---
+decisions:
+  - id: d-pipewire-graph-level
+    date: "2026-03-27"
+    reconstructed: true
+    title: "Enforce at the PipeWire graph level, not per-application"
+    context: >
+      XDG Portals only gate sandboxed apps. Native .deb apps have no permission
+      layer at all. Hooking individual applications does not scale and breaks
+      on every update.
+    decision: "Police PipeWire links. Every audio/video device flows through PipeWire, so one chokepoint covers all packaging formats."
+    consequences:
+      - "Works for Firefox, Telegram, Chromium, OBS, anything — no per-app work."
+      - "Identity is limited to what PipeWire exposes (see d-identity-by-pw-name)."
+      - "Cannot see inside a browser: one client, many tabs (answered by d-two-layer-model)."
+    scope_correction_2026_08_04:
+      finding: >
+        The premise 'every audio/video device flows through PipeWire' is FALSE
+        and was never tested. Demonstrated by experiment: direct V4L2 camera
+        access and direct ALSA microphone capture are both entirely invisible.
+      corrected_claim: "Covers all packaging formats THAT USE PIPEWIRE — a much smaller claim than the original."
+      what_survives: >
+        The decision is still right for the playback-monitor feature, where
+        PipeWire is genuinely the only sensible layer. It is wrong as a
+        universal chokepoint argument.
+      ref: "ROADMAP.yaml > security_gaps > g5_camera_bypass, g6_alsa_bypass"
+
+  - id: d-poll-pw-dump-v1
+    date: "2026-03-27"
+    reconstructed: true
+    title: "v1 monitoring substrate: poll `pw-dump` as a subprocess"
+    context: >
+      pipewire-rs native bindings were judged too much surface for a first
+      version. pw-dump emits the whole graph as JSON and is trivially parseable.
+    decision: "Poll pw-dump every poll_interval_ms (default 500), diff link IDs, act on new links."
+    accepted_costs_at_the_time:
+      - "~500ms race window where audio can flow before the link is destroyed."
+      - "Continuous subprocess + JSON parse overhead."
+    measured_reality_2026_08_04:
+      - "272 KB JSON per call, 2 calls/sec, 1.2% of a core at idle, 20.7 MB RSS."
+      - "Costin's verdict: 'the price of 1.2% of a core is very generous. i wouldnt pay such a price.'"
+    status: "SUPERSEDED IN INTENT by d-event-driven-substrate. Still the shipped code."
+
+  - id: d-two-layer-model
+    date: "2026-03-27"
+    reconstructed: true
+    title: "Two-layer permission model to solve the browser problem"
+    context: >
+      A browser is a mini OS: one 'Firefox' PipeWire client serves dozens of
+      tabs. An app-level allow would grant every tab forever.
+    decision: >
+      Layer 1 = per-app rule. Layer 2 = per-stream gating via the `ask_each`
+      permission, which prompts on every new PipeWire node (each tab requesting
+      mic/camera creates its own node).
+    consequences:
+      - "Browsers get real per-tab gating without browser integration."
+      - "Requires one-shot grants keyed on a stream identifier — see d-oneshot-keyed-on-node-id."
+
+  - id: d-monitor-tap-by-link-direction
+    date: "2026-03-27"
+    reconstructed: true
+    title: "Detect playback eavesdropping by link direction, not by node naming"
+    context: >
+      Recording what the speakers are playing is the least-defended privacy
+      hole on Linux, and monitor sources are not consistently named.
+    decision: >
+      Register every Audio/Sink as a Monitor-category protected device, then
+      treat 'Audio/Sink (output) -> Stream/Input/Audio (input)' as a tap.
+      Normal playback is the opposite direction and is never touched.
+    rationale: "Direction is structural. Naming is not — some setups expose an explicit *.monitor node, some do not."
+    validation: "Tested live during Phase 1: parecord captured 0 bytes (44-byte empty WAV) while Firefox playback kept running."
+
+  - id: d-identity-by-pw-name
+    date: "2026-03-27"
+    reconstructed: true
+    superseded_scope: "partially, by d-identity-proc-enrichment"
+    title: "App identity = PipeWire application.name"
+    decision: "Match rules against the application.name property reported by PipeWire."
+    known_weakness: "A hostile app can set this property to anything. Accepted for v1 — see MISSION.yaml threat_model."
+
+  - id: d-identity-proc-enrichment
+    date: "2026-04-06"
+    title: "Enrich identity from /proc, and annotate with the cgroup unit"
+    context: >
+      pipewire-pulse bridge clients carry thin node-level identity; many nodes
+      reported pid:0 because only the string form of the pid prop was handled.
+    decision: >
+      Fall back node props -> owning client props; prefer server-attested
+      pipewire.sec.pid; accept the pid as JSON number OR string; add
+      /proc/<pid>/exe and /proc/<pid>/cgroup as identity fallbacks; append the
+      cgroup unit as a ' [unit]' annotation on the label.
+    consequences:
+      - "Labels became e.g. 'Firefox [pipewire-pulse]'."
+      - "Forced d-normalize-strips-bracket-suffix so rules stay writable as 'firefox'."
+      - "Notification bodies still render '(pid:N)' separately, which normalization does NOT strip — this is the dead-rule trap."
+
+  - id: d-normalize-strips-bracket-suffix
+    date: "2026-04-07"
+    title: "Rule matching normalizes: lowercase + strip one trailing ' [...]'"
+    decision: "normalize_app_name() strips a trailing bracketed annotation only when the string ends with ']', then lowercases."
+    rationale: "Lets the binary name `obs`, the PipeWire name `OBS`, and the bridge variant `OBS [pipewire-pulse]` share one rule."
+    deliberate_limit: "Narrow by design. Not a fuzzy matcher."
+    unintended_consequence: >
+      A rule pasted from a notification body ends with ')' not ']', so nothing
+      is stripped and the rule can never match. One such rule
+      ('Firefox [pipewire-pulse] (pid:2332)') sits dead in the live config.
+
+  - id: d-oneshot-keyed-on-node-id
+    date: "2026-03-27"
+    reconstructed: true
+    title: "One-shot ask_each grants are keyed on the PipeWire node id"
+    decision: "StreamTracker.one_shot_allowed: Vec<u32> of approved node ids; evaluate() short-circuits to Allow on a hit."
+    defect_found_2026_08_04:
+      - "The Vec is never pruned — a grant lives for the daemon's whole lifetime."
+      - "PipeWire recycles node ids, so an unrelated later stream inherits the grant."
+      - "Live evidence: an `ask_each` Firefox mic stream logged ALLOWED with no prompt."
+    verdict: "This is a correctness AND security bug, not a tuning issue. Grants must expire when the node disappears."
+
+  - id: d-clients-are-viewers
+    date: "2026-03-27"
+    reconstructed: true
+    title: "Only the daemon enforces; ctl/tui/gui are pure D-Bus viewers"
+    decision: "All policy state lives in the daemon. Frontends hold no authority and no cache of record."
+    consequences:
+      - "Any frontend can be killed without weakening enforcement."
+      - "Three frontends stayed cheap to build (196 / 498 / 598 LOC)."
+      - "Frontends poll, because the interesting signals are never emitted — see d-signals-declared-not-emitted."
+
+  - id: d-signals-declared-not-emitted
+    date: "2026-03-27"
+    reconstructed: true
+    title: "AccessAttempt and StreamEvent were specified but never wired up"
+    status: "UNRESOLVED DEFECT, recorded here because README documents them as working API"
+    reality: "Only RuleChanged is emitted (from SetRule/RemoveRule). TUI polls at 1s, GUI at 2s."
+    cost: "Every frontend does 5 D-Bus round-trips per tick against a lock the monitoring loop also wants."
+
+  - id: d-user-service-not-system
+    date: "2026-03-27"
+    reconstructed: true
+    title: "systemd USER service on the session bus, never root"
+    decision: "Daemon runs as the user, registers org.hwprivacy.Daemon on the session bus, with D-Bus activation as a fallback start path."
+    rationale:
+      - "PipeWire is per-session; a system daemon would be talking to the wrong graph."
+      - "No privilege escalation, no setuid, no polkit."
+    accepted_cost: >
+      A process running as the same user can stop the daemon. This caps the
+      threat model permanently — it is a property of the design, not a bug.
+
+  - id: d-dismiss-defect
+    date: "2026-08-04"
+    title: "Notification dismiss writes a permanent deny (defect, recorded not decided)"
+    context: >
+      notification.rs ends with `perm.or(Some(Permission::Deny))`, so
+      ask_user_permission() can never return None. The `None =>` cooldown arm
+      in main.rs is unreachable, and record_dismiss()/is_in_cooldown() are dead.
+    evidence: |
+      journalctl, 2026-08-04 18:47:04:
+        INFO notification: Notification dismissed — no rule saved, will ask again later
+        INFO hwprivacy_daemon: User set rule: pipewire [pipewire-pulse] → Monitor = deny
+    impact: >
+      Every prompt the user ignored silently became a permanent deny rule. This
+      is the primary reason the app 'did not work properly' in daily use — the
+      config drifted into decisions the user never made.
+    decision_needed: "Choose the intended dismiss semantics — see ROADMAP.yaml > open_questions q-dismiss-semantics."
+
+  - id: d-posture-unsettled
+    date: "2026-08-04"
+    title: "OPEN: deny-by-default vs ask-by-default"
+    context: >
+      README states 'Default policy: deny all'. The live config ships
+      policy.default_action = 'ask'. The code honours the config. Combined with
+      d-dismiss-defect, the effective behaviour was 'prompt, then deny whatever
+      you ignored' — the worst of both.
+    options:
+      deny_by_default:
+        pro: "matches the stated mission; silent; nothing leaks while you are away from the keyboard"
+        con: "apps break with no explanation until an allow rule is added by hand"
+      ask_by_default:
+        pro: "discoverable; the prompt teaches you what is asking"
+        con: "prompt fatigue; every unanswered prompt is a decision deferred"
+    status: "MUST BE SETTLED before further work. Costin's 2026-08-04 direction was 'steer the app in the initial full privacy direction', which points at deny-by-default."
+
+  - id: d-event-driven-substrate
+    date: "2026-08-04"
+    title: "DIRECTION SET: replace polling with an event-driven PipeWire substrate"
+    context: >
+      Three separate complaints turned out to be one root cause. Polling
+      pw-dump produces (a) 1.2% idle CPU, (b) the ~500ms race window, and
+      (c) the grandfathering hole where links already present when the daemon
+      starts are seeded into known_link_ids and never evaluated.
+    decision: >
+      Move to pipewire-rs native bindings with registry global add/remove
+      callbacks. Keep policy_engine, config, D-Bus, and all three frontends
+      unchanged — the policy layer is already decoupled from the monitoring
+      layer, which is what makes this swap affordable.
+    why_this_fixes_all_three:
+      - "idle cost: no subprocess, no periodic 272 KB parse — cost approaches zero when nothing happens"
+      - "race window: notification arrives on link creation instead of up to 500ms later"
+      - "grandfathering: connecting to the registry enumerates EXISTING objects, so startup evaluation is free rather than an extra pass"
+    rejected_alternative_1:
+      what: "raise poll_interval_ms"
+      why_rejected: "already a config knob, needs no code — but it buys CPU by widening the race window. Wrong trade for a security tool."
+    rejected_alternative_2:
+      what: "WirePlumber Lua policy hook"
+      why_rejected_for_now: >
+        Genuinely better (blocks BEFORE the link exists, so zero data ever
+        flows) but couples the project to WirePlumber's policy chain and its
+        version churn. Keep as the v2/v3 goal after pipewire-rs lands.
+    status: "decided in direction, not yet implemented. No code written as of 2026-08-04."
