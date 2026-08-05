@@ -176,6 +176,42 @@ kernel_layer:
       - "The two layers are complementary, not redundant. For the microphone the kernel sees only /usr/bin/pipewire holding the device and cannot tell which app is behind it; PipeWire sees 'Firefox wants the mic' but is blind to the camera. Neither alone is sufficient."
       - "Exe-inode identity works: resolved /usr/lib/firefox-esr/firefox-esr, NOT the /usr/bin/firefox shell script."
       - "Identity is discriminating: firefox-esr is ino=30287776, the Developer Edition in $HOME is ino=1310763. Allowing one does not allow the other. The PipeWire layer calls both 'Firefox'."
+  phase_2_result:
+    date: "2026-08-05"
+    status: "PASSED — kernel camera enforcement works end to end"
+    test: "~/projects/claude-run/hwprivacy-camera-enforce-test-20260805.sh"
+    phases:
+      baseline: "camera reachable with nothing attached — PASS"
+      deny: "enforcing with an empty allowlist, ffmpeg got EPERM and it was reported — PASS"
+      allow: "ffmpeg allowlisted by inode, camera reachable — PASS"
+      restore: "detached, camera reachable again — PASS"
+    policy_key_agreement: |
+      USERSPACE  dev=271581186  ino=30027059  perms=0x01  /usr/bin/ffmpeg
+      KERNEL     dev=271581186  ino=30027059  perms=0x01
+    two_failures_before_it_passed:
+      - >
+        policy.rs inserted the glibc st_dev (66306) where the eBPF program reads
+        the kernel's own s_dev (271581186 = major 259 << 20 | minor 2). Every
+        policy lookup missed, so default-deny denied the allowlisted binary too.
+        Neither side errors — it presents as 'enforcement works, allowlist does
+        not'. This is the SAME hazard already documented for i_rdev and already
+        covered by a regression test, repeated in a different field. Fix: all
+        dev_t conversion now lives in device_index::glibc_to_kernel_dev().
+      - >
+        The second run tested a STALE BINARY. `cargo test` builds a separate
+        cfg(test) harness and does not refresh target/debug/hwprivacy-lsm; 30
+        passing unit tests said nothing about the binary being executed. Fix:
+        the acceptance script now runs cargo build itself and prints the
+        binary's mtime.
+    tooling_added_as_a_result:
+      "--dump-policy": "reads the policy map back out of the kernel and prints it beside what userspace intended, so a key mismatch is a 30-second diagnosis instead of a hypothesis"
+    still_unproven:
+      coalescing: >
+        ffmpeg opens the camera once, so there was no burst to collapse and
+        'lines reporting suppression: 0'. Coalescing is implemented but has
+        never actually fired. Firefox's 13-open burst is the only thing that
+        exercises it — see the firefox end-to-end test.
+
   new_requirement_for_phase_2:
     finding: "One camera session produced 13 opens in a single second (10 on /dev/video0, 3 on /dev/video1)."
     consequence: >
