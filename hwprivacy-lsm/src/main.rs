@@ -60,9 +60,47 @@ struct Cli {
     #[arg(long)]
     summarize: bool,
 
-    /// Exit after this many reported events (0 = run until interrupted).
+    /// Exit after this many reported events (0 = no event limit).
     #[arg(long, default_value = "0")]
     max_events: u64,
+
+    /// Exit automatically after this many seconds (0 = no time limit).
+    #[arg(long, default_value = "0")]
+    duration: u64,
+}
+
+impl Cli {
+    /// One plain sentence saying exactly how this run terminates.
+    ///
+    /// House rule: a test must announce up front whether it stops on its own
+    /// or waits for a specific human action. Leaving the operator guessing
+    /// whether something is still working is its own kind of bug.
+    fn exit_condition(&self) -> String {
+        match (self.duration, self.max_events) {
+            (0, 0) => "press Ctrl-C. Nothing else stops it — no timer, no event limit.".into(),
+            (d, 0) => format!("automatically after {d}s, or Ctrl-C sooner."),
+            (0, m) => format!("automatically after {m} reported event(s), or Ctrl-C sooner."),
+            (d, m) => format!("after {d}s or {m} event(s), whichever comes first — or Ctrl-C sooner."),
+        }
+    }
+}
+
+/// Why the observation loop stopped, so the closing line can say so.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StopReason {
+    Interrupted,
+    DurationElapsed,
+    EventLimit,
+}
+
+impl StopReason {
+    fn describe(self) -> &'static str {
+        match self {
+            StopReason::Interrupted => "interrupted by Ctrl-C",
+            StopReason::DurationElapsed => "time limit reached",
+            StopReason::EventLimit => "event limit reached",
+        }
+    }
 }
 
 /// One row of the --summarize table.
@@ -111,7 +149,9 @@ fn main() -> Result<()> {
             eprintln!("hwprivacy-lsm: showing CAMERA and MIC only — pass --all for playback/control");
         }
         eprintln!("hwprivacy-lsm: OBSERVE ONLY — nothing will be denied");
-        eprintln!("hwprivacy-lsm: Ctrl-C to detach\n");
+        eprintln!();
+        eprintln!("  HOW THIS ENDS: {}", cli.exit_condition());
+        eprintln!();
         if !cli.summarize {
             eprintln!(
                 "{:<8}  {:<7}  {:<18}  {:<16}  {:<7}  {}",
@@ -199,6 +239,9 @@ fn main() -> Result<()> {
     }
     let ring = builder.build().context("failed to build the ring buffer")?;
 
+    let started = std::time::Instant::now();
+    let mut stop_reason = StopReason::Interrupted;
+
     while running.load(Ordering::SeqCst) {
         // Errors here are almost always EINTR from our own signal handler.
         if let Err(e) = ring.poll(Duration::from_millis(200)) {
@@ -208,6 +251,11 @@ fn main() -> Result<()> {
             eprintln!("hwprivacy-lsm: ring buffer poll failed: {e}");
         }
         if cli.max_events > 0 && reported.load(Ordering::SeqCst) >= cli.max_events {
+            stop_reason = StopReason::EventLimit;
+            break;
+        }
+        if cli.duration > 0 && started.elapsed().as_secs() >= cli.duration {
+            stop_reason = StopReason::DurationElapsed;
             break;
         }
     }
@@ -218,10 +266,12 @@ fn main() -> Result<()> {
 
     if !cli.json {
         eprintln!(
-            "\nhwprivacy-lsm: detaching. {} event(s) reported. \
-             Device access is now unmonitored again.",
+            "\nhwprivacy-lsm: stopped ({}) after {}s. {} event(s) reported.",
+            stop_reason.describe(),
+            started.elapsed().as_secs(),
             reported.load(Ordering::SeqCst)
         );
+        eprintln!("hwprivacy-lsm: detached — device access is now unmonitored again.");
     }
 
     Ok(())
@@ -335,4 +385,75 @@ where
         libc::signal(libc::SIGTERM, trampoline as libc::sighandler_t);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cli(duration: u64, max_events: u64) -> Cli {
+        Cli {
+            all: false,
+            json: false,
+            summarize: false,
+            max_events,
+            duration,
+        }
+    }
+
+    /// House rule: a run must state up front whether it stops by itself or
+    /// waits for a specific human action. These assertions are the contract.
+    #[test]
+    fn default_run_says_it_ends_only_on_ctrl_c() {
+        let s = cli(0, 0).exit_condition();
+        assert!(s.contains("Ctrl-C"), "must name the required action: {s}");
+        assert!(
+            s.contains("Nothing else stops it"),
+            "must be explicit that it will not self-terminate: {s}"
+        );
+    }
+
+    #[test]
+    fn timed_run_states_the_time() {
+        let s = cli(120, 0).exit_condition();
+        assert!(s.contains("120s"), "must state the duration: {s}");
+        assert!(s.contains("Ctrl-C"), "must still offer the manual exit: {s}");
+    }
+
+    #[test]
+    fn event_limited_run_states_the_count() {
+        let s = cli(0, 50).exit_condition();
+        assert!(s.contains("50"), "must state the event count: {s}");
+        assert!(s.contains("Ctrl-C"), "must still offer the manual exit: {s}");
+    }
+
+    #[test]
+    fn both_limits_says_whichever_comes_first() {
+        let s = cli(120, 50).exit_condition();
+        assert!(s.contains("120s") && s.contains("50"), "must state both: {s}");
+        assert!(s.contains("whichever"), "must resolve the ambiguity: {s}");
+    }
+
+    #[test]
+    fn every_mode_names_a_concrete_stopping_condition() {
+        for (d, m) in [(0, 0), (30, 0), (0, 5), (30, 5)] {
+            let s = cli(d, m).exit_condition();
+            assert!(!s.is_empty());
+            assert!(
+                s.contains("Ctrl-C"),
+                "every mode must tell the operator how to stop early: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn stop_reasons_are_all_describable() {
+        for r in [
+            StopReason::Interrupted,
+            StopReason::DurationElapsed,
+            StopReason::EventLimit,
+        ] {
+            assert!(!r.describe().is_empty());
+        }
+    }
 }
