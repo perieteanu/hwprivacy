@@ -14,6 +14,7 @@
 //! `exec` inside a script — so the observer's reported exe path is the source
 //! of truth for what to put in this file.
 
+use crate::device_index::glibc_to_kernel_dev;
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
@@ -47,12 +48,17 @@ impl PolicyKey {
     }
 
     /// Resolve an executable path to its policy key.
+    ///
+    /// `md.dev()` is glibc-encoded; the kernel compares against
+    /// `inode->i_sb->s_dev`, which is not the same number. Converting is not
+    /// optional — see [`glibc_to_kernel_dev`] for what happens when it is
+    /// skipped (it was, and the allowlist silently matched nothing).
     pub fn from_path(path: &Path) -> Result<Self> {
         let md = std::fs::metadata(path)
             .with_context(|| format!("cannot stat {}", path.display()))?;
         Ok(PolicyKey {
             exe_ino: md.ino(),
-            exe_dev: md.dev() as u32,
+            exe_dev: glibc_to_kernel_dev(md.dev()),
         })
     }
 }
@@ -197,6 +203,33 @@ mod tests {
         let k = p.entries[0].key;
         assert!(k.exe_ino > 0, "inode should be non-zero");
         assert!(k.exe_dev > 0, "device should be non-zero");
+    }
+
+    /// Regression test for the Phase 2 acceptance failure: the key handed to
+    /// the kernel must be in the KERNEL's dev_t encoding, not glibc's. Getting
+    /// this wrong does not error — every lookup simply misses, so under
+    /// default-deny an allowlisted binary stays denied.
+    #[test]
+    fn key_uses_the_kernel_dev_encoding_not_the_glibc_one() {
+        use std::os::unix::fs::MetadataExt;
+
+        let path = Path::new("/usr/bin/true");
+        let md = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let key = PolicyKey::from_path(path).expect("should resolve");
+
+        assert_eq!(
+            key.exe_dev,
+            glibc_to_kernel_dev(md.dev()),
+            "must be the converted value"
+        );
+        assert_ne!(
+            key.exe_dev,
+            md.dev() as u32,
+            "must NOT be the raw st_dev — that is the bug this test exists for"
+        );
     }
 
     #[test]

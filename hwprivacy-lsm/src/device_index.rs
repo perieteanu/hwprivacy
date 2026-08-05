@@ -177,6 +177,31 @@ pub fn kernel_minor(rdev: u64) -> u32 {
     (rdev & 0xF_FFFF) as u32
 }
 
+/// Convert a **glibc** device number — anything that came out of `stat()`,
+/// i.e. `MetadataExt::dev()` or `::rdev()` — into the **kernel's** internal
+/// `dev_t` encoding, which is what an eBPF program reads from
+/// `inode->i_sb->s_dev` or `inode->i_rdev`.
+///
+/// # This function exists because the mistake has been made twice
+///
+/// Passing a raw `st_dev` to the kernel does not fail loudly. It produces a
+/// number that is simply never equal to the one the kernel computes, so hash
+/// lookups miss forever:
+///
+/// ```text
+/// /usr/bin/ffmpeg   st_dev = 66306        (glibc: major 259, minor 2)
+///                   s_dev  = 271581186    (kernel: 259 << 20 | 2)
+/// ```
+///
+/// Under default-deny that reads as "enforcement works, the allowlist does
+/// not" — which is exactly how it presented in the Phase 2 acceptance test.
+///
+/// **Every** conversion between the two encodings belongs in this module. Do
+/// not call `libc::major`/`libc::minor` or hand-roll the shift elsewhere.
+pub fn glibc_to_kernel_dev(dev: u64) -> u32 {
+    (libc::major(dev) << 20) | libc::minor(dev)
+}
+
 /// Classify by node name. ALSA encodes the role in the filename far more
 /// reliably than in the minor number:
 ///   pcmC0D0c -> capture      pcmC0D0p -> playback
@@ -233,6 +258,42 @@ mod tests {
             81,
             "if these ever agree this test is no longer proving anything"
         );
+    }
+
+    /// The Phase 2 bug, pinned down. `policy.rs` inserted a raw `st_dev` into
+    /// the kernel's policy map; every lookup missed, so an allowlisted binary
+    /// was still denied while enforcement looked like it was working.
+    #[test]
+    fn glibc_st_dev_must_be_converted_before_the_kernel_sees_it() {
+        let md = match std::fs::metadata("/usr/bin/true") {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let raw = md.dev();
+        let converted = glibc_to_kernel_dev(raw);
+
+        assert_ne!(
+            raw as u32, converted,
+            "if these are equal this test proves nothing — pick a file on a \
+             filesystem whose major exceeds 255"
+        );
+        assert_eq!(
+            converted,
+            (libc::major(raw) << 20) | libc::minor(raw),
+            "conversion must be major<<20 | minor"
+        );
+        assert_eq!(kernel_major(converted as u64), libc::major(raw));
+        assert_eq!(kernel_minor(converted as u64), libc::minor(raw));
+    }
+
+    #[test]
+    fn conversion_round_trips_through_the_kernel_decoders() {
+        for (maj, min) in [(259u32, 2u32), (8, 1), (81, 0), (116, 9), (0, 0)] {
+            let glibc = ((maj as u64 & 0xfff) << 8) | (min as u64 & 0xff);
+            let k = glibc_to_kernel_dev(glibc);
+            assert_eq!(kernel_major(k as u64), maj, "major {maj}:{min}");
+            assert_eq!(kernel_minor(k as u64), min, "minor {maj}:{min}");
+        }
     }
 
     #[test]
