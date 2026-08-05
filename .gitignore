@@ -1,5 +1,9 @@
-# Rust build artifacts — ~3.2 GB of this tree
+# Rust build artifacts. Since hwprivacy-lsm joined the workspace, ALL crates
+# build into this one shared directory — hwprivacy-lsm/target/ no longer exists
+# and must not come back, or scripts pointing at the old path silently run a
+# frozen binary. That happened on 2026-08-05.
 target/
+hwprivacy-lsm/target/
 
 # Generated from the RUNNING kernel's BTF by the Phase 0 toolchain script.
 # Machine- and kernel-specific, 2.6 MB, regenerate with:
