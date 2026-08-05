@@ -212,6 +212,37 @@ kernel_layer:
         never actually fired. Firefox's 13-open burst is the only thing that
         exercises it — see the firefox end-to-end test.
 
+  phase_2_firefox_end_to_end:
+    date: "2026-08-05 10:39"
+    status: "PASSED against a real application"
+    test: "~/projects/claude-run/hwprivacy-firefox-enforce-test-20260805.sh"
+    phase_a_deny: |
+      10:39:47  DENIED  CAMERA  /dev/video0  VideoCapture  3271  /usr/lib/firefox-esr/firefox-esr
+      WhatsApp Web showed: "Camera or microphone not found — You can't make a
+      call because it looks like your computer doesn't have a camera or
+      microphone."
+    phase_b_allow: |
+      10:40:43  allow   CAMERA  /dev/video0  VideoCapture  3271  /usr/lib/firefox-esr/firefox-esr
+      Call proceeded to "Ringing..." with live camera preview.
+    proves:
+      - "The kernel denial reaches the application as a real failure, not a silent black frame."
+      - "Retry after allowing is ONE CLICK in the already-running browser. Same pid 3271 across both phases — no tab reload, no Firefox restart."
+      - "Policy key agreement confirmed by --dump-policy: dev=271581186 ino=30287776 on both sides."
+      - "Identity discrimination is live: only /usr/lib/firefox-esr/firefox-esr was allowed; the Developer Edition in $HOME stayed denied. The PipeWire layer calls both 'Firefox'."
+    finding_getusermedia_is_all_or_nothing:
+      what: "WhatsApp reported 'camera or MICROPHONE not found' although only the camera was ever denied."
+      why: "getUserMedia({audio: true, video: true}) fails as a unit. Denying video kills the audio path with it."
+      consequence: >
+        A camera denial can silently break an AUDIO call. Phase 3 notification
+        wording must say so, e.g. 'camera blocked for X — this may also stop the
+        call audio', or it will be mistaken for a microphone bug later.
+    defect_found_and_fixed_same_session:
+      what: "Coalescing worked (13 opens -> 1 event) but the suppressed count was never surfaced."
+      why: "The kernel attaches the count to the NEXT emitted event; a burst that happens once never gets one. Both phases printed 'no suppression reported' while 12 denials sat stranded in the map."
+      severity: "not a security hole — every open was still denied — but the log under-reported denials 13:1"
+      fix: "userspace flushes stale coalescing entries every 500ms and on exit, reports 'burst closed: N further open(s)', and clears the counter while preserving last_ns"
+      status: "fixed, NOT yet re-verified against Firefox"
+
   new_requirement_for_phase_2:
     finding: "One camera session produced 13 opens in a single second (10 on /dev/video0, 3 on /dev/video1)."
     consequence: >
