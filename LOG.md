@@ -31,3 +31,11 @@
 05-08-2026 19:35 | Wed | hw | [fix] D-Bus activation raced systemd — daemon crash-looped 32x; now delegates via SystemdService=
 05-08-2026 19:45 | Wed | hw | [note] Phase 3 acceptance criteria written before the test script; C2-C4 need human eyes
 05-08-2026 19:47 | Wed | hw | [defer] Phase 3 unproven — script not written; Phases 4 (systemd) and 5 (audio backstop) not started
+05-08-2026 20:32 | Wed | hw | [fix] third stale-binary mechanism: workspace fold moved target dir; guard now compares mtimes
+05-08-2026 20:40 | Wed | hw | [note] Phase 3 run 1: 8/4 — A2 waited 3s against a 10s reconnect loop, cascading into B1/D1/B4
+05-08-2026 20:45 | Wed | hw | [fix] burst summaries were printed but never sent to the daemon; kernel now records the verdict too
+05-08-2026 20:46 | Wed | hw | [fix] burst summary carries pid 0 so it counts but does not fire a second notification
+05-08-2026 20:52 | Wed | hw | [note] Phase 3 run 2: 11/2 — connection, policy, gaps, enforcement, event flow, restore all pass
+05-08-2026 20:56 | Wed | hw | [note] C5 unverifiable as written: Firefox is allowlisted so its burst is not denied; needs a denied burster
+05-08-2026 20:57 | Wed | hw | [note] D1 unresolved — call failed although firefox-esr was allowlisted; two untested hypotheses recorded
+05-08-2026 20:58 | Wed | hw | [defer] Phase 3 substantially proven; burst counting and D1 still open. Phases 4-5 not started

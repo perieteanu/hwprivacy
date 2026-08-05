@@ -251,6 +251,44 @@ kernel_layer:
       - "c4 is visual too: whether a notification actually appeared, and whether its wording reads right."
       - "Nothing here tests the audio path. Audio is Phase 5 and is deliberately untouched."
 
+  phase_3_result_2026_08_05:
+    status: "11 of 13 automated checks pass. Both failures are TEST bugs, but one hides an unverified feature."
+    passing: "A1 A2 A3 A4 B3 B4 C1 C2 C3 C4 D2 D3 E2 — connection, reconnect, policy push, gap reporting, unresolved reporting, enforcement, event flow into the daemon, restore, non-interference"
+    b1_false_failure:
+      verdict: "TEST BUG. The policy WAS pushed."
+      evidence: "Same run reported 'Allowed binaries: 1', 'Camera enforced: yes', and B4's 'UNUSABLE entries: 1' — none of which can appear unless SetPolicy was processed."
+      cause: >
+        The check waited for 'Connected: yes', which fires on the Hello reply,
+        then immediately grepped for the policy line, which lands a moment
+        later on SetPolicy. Part 1 shows 'Allowed binaries: 0' and Part 2 shows
+        1 — the race is visible in the transcript.
+      note: "Third time in this project a test waited for the wrong condition. Wait for the thing being asserted, not a proxy that happens to be nearby."
+    c5_still_unverified:
+      verdict: "TEST DESIGN FLAW. The burst-count fix has never actually been exercised."
+      what_happened: >
+        Part 2 asks for a call that 'should FAIL', but the daemon had already
+        pushed the allowlist by then, so Firefox was ALLOWED. The burst was
+        coalesced and reported correctly — 'burst closed: 12 further open(s) by
+        firefox-esr' — but with denied=false, so it rightly did not count
+        toward blocked attempts. The only denied app was ffmpeg, which opens
+        the camera once and never bursts.
+      why_it_cannot_pass_as_written: "C5 needs an app that is BOTH denied AND bursting. ffmpeg bursts never; Firefox is allowlisted."
+      fix_required: >
+        Temporarily set firefox camera = deny in config.toml for the deny
+        phase, restart the daemon, then restore — the same pattern Part 4
+        already uses safely for its bogus entry.
+    d1_unclear:
+      what: "Costin reported the call did not work even after Firefox was allowlisted."
+      but: "Allowed binaries: 1 and the burst shows firefox-esr opening the camera 13 times without denial."
+      hypotheses_not_yet_tested:
+        - "The helper is restarted between the deny and allow steps; for up to 10s until the daemon reconnects it enforces an EMPTY allowlist. A click in that window is denied."
+        - "The open-fd gap: Firefox may hold state from the earlier attempt."
+      status: "UNRESOLVED. Needs a focused test, not a guess."
+    c4_scored_wrong_twice:
+      what: "Costin answered 'no' to whether the notification mentioned call audio, while his own pasted text contained the sentence verbatim."
+      cause: "He pasted TWO notifications — the kernel one (which has the caveat) and the old PipeWire mic prompt (which does not, correctly). The question did not distinguish them."
+      lesson: "When asking a human to verify wording, say WHICH notification, not just the wording."
+
   phase_4_continuous_operation_and_audit:
     status: "RESHAPED 2026-08-05 by an explicit requirement from Costin. Not started."
     requirement_verbatim: >

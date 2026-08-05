@@ -1,4 +1,4 @@
-# HANDOFF — 2026-08-05 19:45
+# HANDOFF — 2026-08-05 21:00
 
 Read this first, then `CLAUDE.md`, then `docs-yaml/ROADMAP.yaml`.
 
@@ -16,7 +16,7 @@ sufficient alone.
 |---|---|---|
 | 1 | observe-only eBPF LSM | **validated live** |
 | 2 | camera enforcement | **PROVEN** — acceptance 5/5, denied live against Firefox/WhatsApp |
-| 3 | daemon integration | **code-complete, UNPROVEN** — no test has been run |
+| 3 | daemon integration | **substantially proven** — 11/13 checks pass. Two gaps, both listed below |
 | 4 | systemd unit for the helper | not started |
 | 5 | audio backstop | agreed in principle, not started |
 
@@ -46,23 +46,32 @@ systemctl --user restart hwprivacy
 
 ---
 
-## Pick up here
+## Pick up here — two open items, in this order
 
-**Phase 3's acceptance criteria are written; its test script is not.**
-See `docs-yaml/ROADMAP.yaml > kernel_layer > phase_3_acceptance_criteria` —
-groups A (connection), B (policy push), C (event flow), D (enforcement
-regression), E (non-interference).
+Test script: `~/projects/claude-run/hwprivacy-phase3-test-20260805.sh`
+Criteria and full result: `docs-yaml/ROADMAP.yaml > kernel_layer >
+phase_3_acceptance_criteria` and `> phase_3_result_2026_08_05`.
 
-Write the script **against those criteria**, not the other way round. Costin's
-rule, 2026-08-05: *"we need to establish first the tests for this phase"*.
+**1. C5 — burst counting is still UNVERIFIED, and the test cannot verify it.**
+Part 2 asks for a call that "should fail", but the daemon pushes the allowlist
+on connect, so Firefox is *allowed* and its 13-open burst is not a denial. The
+only denied app, ffmpeg, opens once and never bursts. **Fix the test**:
+temporarily set `firefox camera = "deny"` in config.toml for the deny phase and
+restore afterwards — the same pattern Part 4 already uses safely.
 
-It is a **test + sudo** script, so it needs the three-line banner and PASTE
-markers — see the global rule in `~/.claude/CLAUDE.md`.
+**2. D1 — unresolved.** The call did not work even though `firefox-esr` was
+allowlisted and the kernel shows it opening the camera 13 times without denial.
+Two untested hypotheses, both plausible:
+  - the helper is restarted between the deny and allow steps, and for up to 10 s
+    until the daemon reconnects it enforces an EMPTY allowlist
+  - the open-fd gap (below) leaving Firefox in a stale state
 
-Three criteria (C2, C3, C4) are **visual** and cannot be asserted by a script:
-the TUI panel, the GUI tab, and whether a notification actually appeared with
-readable wording. Those need Costin's eyes, and the script must say so rather
-than pretend to cover them.
+Do not guess between them. Test one at a time.
+
+**What is already proven:** connection, reconnect without restarting the
+daemon, policy push, gap reporting, unresolved-entry reporting, enforcement,
+kernel events reaching `hwprivacy-ctl`/TUI/GUI, notifications with the right
+wording, restore on detach, and no interference with the PipeWire layer.
 
 ---
 
@@ -136,3 +145,12 @@ Hook cost: **+13.75 ns/open**, 95 % CI `[+7.3, +20.2]`, 1.88 % of a 733 ns
   its claims to distrust.
 - **Per-event cost unmeasured** — what one camera/mic event costs the observer
   (`/proc` resolution, printing). Only the hot path was measured.
+- **Enforcement cannot revoke an ALREADY-OPEN fd.** Costin saw live camera
+  video while enforcement was on, because Firefox had opened the device earlier
+  and kept the descriptor. The LSM hook fires on `open()`, not on reads. This
+  is the same class as the PipeWire layer's g1/g2 and is a real limitation, not
+  a bug — but "I enabled blocking and still saw video" is exactly how someone
+  concludes the tool does not work, so it must be stated plainly wherever the
+  camera feature is described. Closing it would mean hooking
+  `security_file_permission` (intercepting every read, not every open) or
+  revoking on policy change. That is a design step, not a patch.
