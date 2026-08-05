@@ -20,7 +20,7 @@ sufficient alone.
 | 4 | systemd unit for the helper | not started |
 | 5 | audio backstop | agreed in principle, not started |
 
-`git`: 12 commits, clean tree. **60 tests** — there were zero on 2026-08-04.
+`git`: 24 commits, clean tree. **63 tests** — there were zero on 2026-08-04.
 
 ---
 
@@ -134,7 +134,8 @@ Hook cost: **+13.75 ns/open**, 95 % CI `[+7.3, +20.2]`, 1.88 % of a 733 ns
 
 ## Deliberately NOT done
 
-- **Phase 3 has never been run.** Code exists; no evidence it works.
+- **C5 (burst counting) and D1** — see "Pick up here". Everything else in
+  Phase 3 is proven.
 - **Phases 4 and 5** — no code.
 - **PipeWire-layer defects b1–b4** — untouched. Dismissing a prompt on the
   plain `ask` path still writes a permanent `deny` rule. This is why kernel
