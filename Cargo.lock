@@ -1197,6 +1197,7 @@ dependencies = [
  "chrono",
  "clap 4.6.0",
  "hwprivacy-common",
+ "hwprivacy-proto",
  "notify-rust",
  "serde",
  "serde_json",

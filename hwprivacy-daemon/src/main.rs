@@ -1,6 +1,7 @@
 mod dbus_service;
 mod device_discovery;
 mod link_manager;
+mod lsm_client;
 mod notification;
 mod pipewire_monitor;
 mod policy_engine;
@@ -58,9 +59,21 @@ Environment=RUST_LOG=info
 WantedBy=default.target
 "#;
 
+/// D-Bus activation delegates to systemd instead of forking its own process.
+///
+/// `Exec=DAEMON_PATH` looks right and is a trap: D-Bus then starts a SECOND
+/// daemon that grabs the bus name, and the systemd unit crash-loops forever
+/// with "name already taken on the bus". Observed 2026-08-05 with the restart
+/// counter at 32 — and it only became possible once the Exec path was
+/// corrected, since a broken path had been failing harmlessly.
+///
+/// `SystemdService=` makes D-Bus ask systemd to start the unit, so there is
+/// exactly one way for the daemon to come up. `Exec=` must still be present
+/// for the file to be valid, hence /bin/false.
 const DBUS_SERVICE: &str = r#"[D-BUS Service]
 Name=org.hwprivacy.Daemon
-Exec=DAEMON_PATH
+Exec=/bin/false
+SystemdService=hwprivacy.service
 "#;
 
 #[tokio::main]
@@ -126,6 +139,15 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     info!("HWPrivacy daemon running on session D-Bus");
+
+    // Kernel (eBPF LSM) layer client. Independent of the PipeWire loop: if the
+    // helper is absent this task retries quietly forever and nothing else is
+    // affected.
+    let lsm_state = state.clone();
+    let lsm_socket = std::env::var("HWPRIVACY_LSM_SOCKET").ok();
+    tokio::spawn(async move {
+        lsm_client::run(lsm_state, lsm_socket).await;
+    });
 
     // Start monitoring loop
     let monitor_state = state.clone();
@@ -455,8 +477,7 @@ fn install_service() -> anyhow::Result<()> {
     let dbus_dir = dbus_services_dir();
     std::fs::create_dir_all(&dbus_dir)?;
     let dbus_path = dbus_dir.join("org.hwprivacy.Daemon.service");
-    let dbus_svc = DBUS_SERVICE.replace("DAEMON_PATH", &exe);
-    std::fs::write(&dbus_path, &dbus_svc)?;
+    std::fs::write(&dbus_path, DBUS_SERVICE)?;
     println!("Installed: {}", dbus_path.display());
 
     // Create default config if it doesn't exist

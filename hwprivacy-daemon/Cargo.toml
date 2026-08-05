@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 hwprivacy-common = { path = "../hwprivacy-common" }
+hwprivacy-proto = { path = "../hwprivacy-proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

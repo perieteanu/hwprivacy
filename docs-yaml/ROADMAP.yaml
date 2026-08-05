@@ -205,7 +205,33 @@ kernel_layer:
         binary's mtime.
     tooling_added_as_a_result:
       "--dump-policy": "reads the policy map back out of the kernel and prints it beside what userspace intended, so a key mismatch is a 30-second diagnosis instead of a hypothesis"
-    still_unproven:
+    phase_5_audio_backstop:
+    status: "AGREED IN PRINCIPLE 2026-08-05, not started. Comes after Phase 3."
+    question_asked: "Should exe_path also gate the microphone at the kernel layer?"
+    answer: >
+      Yes, but NOT as per-app mic policy — that is impossible here and saying
+      otherwise would oversell it. Measured: /dev/snd/pcmC0D0c is opened by
+      /usr/bin/pipewire, so the kernel sees the audio server and cannot tell
+      which application is behind it. Per-app mic identity exists only in the
+      PipeWire layer.
+    what_is_achievable: >
+      A BACKSTOP: only the audio server may open a CAPTURE device. That closes
+      g6_alsa_bypass (ffmpeg -f alsa currently records freely) without claiming
+      an attribution the kernel cannot make.
+    design:
+      - "New BPF map of ALSA capture minors, populated by userspace from DeviceIndex, which already classifies pcmC*D*c by name."
+      - "eBPF enforces major 116 only when the minor is in that set — playback and mixer-control nodes are untouched."
+      - "Allowlist holds /usr/bin/pipewire (and wireplumber/pipewire-pulse if they open devices directly — must be measured, not assumed)."
+      - "PERM_AUDIO already exists in hwprivacy-proto and is never set. This is what it is for."
+    risk: >
+      Larger blast radius than the camera. Direct-ALSA applications exist —
+      music production tools, JACK setups, some games. Restricting to capture
+      minors shrinks it, but this needs an observe-only pass first to find out
+      what actually opens capture devices on this machine before anything is
+      denied.
+    do_not: "Do not fold this into Phase 3. One variable at a time — Costin's rule, and it has already paid off twice."
+
+  still_unproven:
       coalescing: >
         ffmpeg opens the camera once, so there was no burst to collapse and
         'lines reporting suppression: 0'. Coalescing is implemented but has

@@ -57,6 +57,56 @@ pub async fn notify_blocked(
     .ok();
 }
 
+/// Kernel-layer denial notification. Informational only — no action buttons.
+///
+/// Deliberately NOT routed through [`ask_user_permission`]: that path carries
+/// defect b1, where dismissing the prompt writes a permanent `deny` rule. A new
+/// event source wired into it would inherit that bug on day one. Kernel camera
+/// policy is edited in `config.toml` until b1 is fixed.
+///
+/// `detail` carries the consequence, not just the fact. For a camera denial it
+/// warns that a video call may also lose its audio — measured 2026-08-05, when
+/// WhatsApp reported "camera or microphone not found" although only the camera
+/// was ever denied. `getUserMedia({audio, video})` fails as a unit.
+pub async fn notify_kernel_denial(
+    app_name: &str,
+    pid: u32,
+    device: DeviceCategory,
+    device_path: &str,
+    detail: &str,
+) {
+    let summary = format!("BLOCKED (kernel): {} → {}", app_name, device_label(device));
+    let body = format!(
+        "<b>{}</b> (pid:{}) was denied <b>{}</b>\n\
+         Device: {}\n\
+         <i>{}</i>",
+        app_name,
+        pid,
+        device_label(device),
+        device_path,
+        detail
+    );
+    let icon = device_icon(device);
+
+    tokio::task::spawn_blocking(move || {
+        let result = Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .icon(icon)
+            .urgency(Urgency::Critical)
+            .hint(Hint::Category("device.error".to_string()))
+            .hint(Hint::Transient(true))
+            .timeout(8000)
+            .show();
+
+        if let Err(e) = result {
+            warn!("Failed to send kernel denial notification: {}", e);
+        }
+    })
+    .await
+    .ok();
+}
+
 /// Stage 2: Action notification — asks user to set a permanent rule.
 /// Returns the user's chosen permission. Blocks until user responds or timeout.
 pub async fn ask_user_permission(

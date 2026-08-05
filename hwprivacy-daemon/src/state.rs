@@ -1,5 +1,6 @@
 use hwprivacy_common::device::ProtectedDevice;
 use hwprivacy_common::Config;
+use crate::lsm_client::KernelLayerState;
 use crate::stream_tracker::StreamTracker;
 use std::collections::HashSet;
 
@@ -15,6 +16,9 @@ pub struct DaemonState {
     pub known_link_ids: HashSet<u32>,
     /// Emergency block-all mode
     pub block_all: bool,
+    /// What we know about the kernel (eBPF LSM) layer. Absent/disconnected is
+    /// normal — it is an addition, never a dependency.
+    pub kernel: KernelLayerState,
 }
 
 impl DaemonState {
@@ -25,6 +29,7 @@ impl DaemonState {
             tracker: StreamTracker::new(),
             known_link_ids: HashSet::new(),
             block_all: false,
+            kernel: KernelLayerState::default(),
         }
     }
 }

@@ -79,6 +79,40 @@ async fn main() -> anyhow::Result<()> {
             println!("  Active rules:     {}", rules);
             println!("  Blocked attempts: {}", blocked);
             println!("  Active streams:   {}", streams);
+
+            // Kernel layer. Reported separately and always — "not connected"
+            // is real information, not an absence worth hiding.
+            match proxy.get_kernel_status().await {
+                Ok((connected, enforcing, allowed, unresolved, err)) => {
+                    println!();
+                    println!("Kernel layer (eBPF LSM)");
+                    if connected {
+                        println!("  Connected:        yes");
+                        println!(
+                            "  Camera enforced:  {}",
+                            if enforcing { "yes — non-allowlisted apps get EPERM" } else { "no (observing)" }
+                        );
+                        println!("  Allowed binaries: {}", allowed);
+                        if unresolved > 0 {
+                            println!(
+                                "  UNUSABLE entries: {}  <- those apps are being denied the camera",
+                                unresolved
+                            );
+                        }
+                    } else {
+                        println!("  Connected:        no");
+                        println!("  Camera enforced:  no — direct /dev/video* access is NOT blocked");
+                    }
+                    if !err.is_empty() {
+                        println!("  Last error:       {}", err);
+                    }
+                }
+                Err(_) => {
+                    println!();
+                    println!("Kernel layer (eBPF LSM)");
+                    println!("  Connected:        unknown — daemon predates this feature");
+                }
+            }
         }
 
         Commands::Devices => {

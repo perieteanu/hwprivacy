@@ -117,6 +117,25 @@ impl HwPrivacyService {
         )
     }
 
+    /// Kernel (eBPF LSM) layer status: (connected, enforcing_camera,
+    /// allowed_executables, unresolved_entries, last_error).
+    ///
+    /// A NEW method rather than a change to GetStatus, whose signature three
+    /// frontends already depend on. Additive keeps ctl/tui/gui working
+    /// untouched — which was the whole point of routing kernel events through
+    /// the existing StreamTracker.
+    async fn get_kernel_status(&self) -> (bool, bool, u32, u32, String) {
+        let state = self.state.read().await;
+        let k = &state.kernel;
+        (
+            k.connected,
+            k.enforcing_camera,
+            k.allowed_exes,
+            k.unresolved.len() as u32,
+            k.last_error.clone().unwrap_or_default(),
+        )
+    }
+
     async fn get_events(&self, last_n: u32) -> Vec<(String, String, String, String)> {
         let state = self.state.read().await;
         state

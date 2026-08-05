@@ -30,6 +30,10 @@ pub trait HwPrivacy {
     /// Get recent events: (timestamp, app_name, device_category, action)
     fn get_events(&self, last_n: u32) -> zbus::Result<Vec<(String, String, String, String)>>;
 
+    /// Kernel (eBPF LSM) layer status:
+    /// (connected, enforcing_camera, allowed_exes, unresolved, last_error)
+    fn get_kernel_status(&self) -> zbus::Result<(bool, bool, u32, u32, String)>;
+
     /// Emergency: deny everything immediately
     fn block_all(&self) -> zbus::Result<bool>;
 
