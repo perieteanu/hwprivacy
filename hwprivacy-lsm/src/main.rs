@@ -101,6 +101,16 @@ struct Cli {
     /// again — one camera session is 13 opens.
     #[arg(long, default_value = "2000")]
     coalesce_ms: u64,
+
+    /// Read the policy map back out of the kernel and print it, then continue.
+    ///
+    /// Exists because a policy-key mismatch is invisible: userspace writes a
+    /// valid key, the kernel reads a valid key, and they are simply never
+    /// equal. Under default-deny that presents as "enforcement works, the
+    /// allowlist does not", which is indistinguishable from a policy mistake
+    /// unless you can see both numbers.
+    #[arg(long)]
+    dump_policy: bool,
 }
 
 impl Cli {
@@ -216,6 +226,10 @@ fn main() -> Result<()> {
         .config_map
         .update(&0u32.to_ne_bytes(), &cfg, MapFlags::ANY)
         .context("failed to write the config map")?;
+
+    if cli.dump_policy {
+        dump_policy_map(&skel.maps.policy, &pol)?;
+    }
 
     skel.attach()
         .context("failed to attach to the security_file_open LSM hook")?;
@@ -383,6 +397,59 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Read the policy map back out of the kernel and print what it actually
+/// holds, next to what userspace intended.
+///
+/// The two can disagree without either side erroring — that is precisely how
+/// the Phase 2 acceptance test failed, twice. Showing both numbers turns a
+/// hypothesis into a thirty-second diagnosis.
+fn dump_policy_map(map: &libbpf_rs::Map, pol: &Policy) -> Result<()> {
+    eprintln!("hwprivacy-lsm: --- policy as USERSPACE resolved it ---");
+    if pol.entries.is_empty() {
+        eprintln!("hwprivacy-lsm:   (empty)");
+    }
+    for e in &pol.entries {
+        eprintln!(
+            "hwprivacy-lsm:   dev={:<12} ino={:<12} perms=0x{:02x}  {}",
+            e.key.exe_dev,
+            e.key.exe_ino,
+            e.perms,
+            e.path.display()
+        );
+    }
+
+    eprintln!("hwprivacy-lsm: --- policy as the KERNEL now holds it ---");
+    let mut n = 0usize;
+    for key in map.keys() {
+        if key.len() < 12 {
+            eprintln!("hwprivacy-lsm:   <short key: {} bytes>", key.len());
+            continue;
+        }
+        let ino = u64::from_ne_bytes(key[0..8].try_into().unwrap());
+        let dev = u32::from_ne_bytes(key[8..12].try_into().unwrap());
+        let perms = match map.lookup(&key, MapFlags::ANY)? {
+            Some(v) if v.len() >= 4 => u32::from_ne_bytes(v[0..4].try_into().unwrap()),
+            _ => 0,
+        };
+        eprintln!("hwprivacy-lsm:   dev={dev:<12} ino={ino:<12} perms=0x{perms:02x}");
+        n += 1;
+    }
+    if n == 0 {
+        eprintln!("hwprivacy-lsm:   (empty — under --enforce EVERYTHING is denied)");
+    }
+
+    if n != pol.entries.len() {
+        eprintln!(
+            "hwprivacy-lsm: NOTE {} intended vs {} in the kernel (duplicates merge, \
+             so a smaller number here can be correct)",
+            pol.entries.len(),
+            n
+        );
+    }
+    eprintln!("hwprivacy-lsm: ---");
+    Ok(())
+}
+
 /// Fail early and legibly rather than deep inside libbpf.
 fn preflight() -> Result<()> {
     let lsm = std::fs::read_to_string("/sys/kernel/security/lsm")
@@ -525,6 +592,7 @@ mod tests {
             allow: Vec::new(),
             policy_file: None,
             coalesce_ms: 2000,
+            dump_policy: false,
         }
     }
 
