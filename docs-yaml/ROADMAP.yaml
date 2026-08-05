@@ -302,8 +302,40 @@ kernel_layer:
         reboots, so its records aggregate correctly over long windows. This
         makes b4 (pid-bearing labels) worse the longer the window gets.
 
+    fail2ban_shaped_reporting:
+      status: "PROPOSED 2026-08-05 by Costin. Fits Phase 4's reporting half."
+      what_transfers: >
+        Fail2ban's useful idea is not banning, it is that FREQUENCY IS SIGNAL.
+        One denial is noise; fifty in an hour is an application persistently
+        trying. A flat event log cannot express that difference; an
+        offender table can.
+      mapping:
+        jail: "device class — camera / mic / monitor"
+        filter: "NOT NEEDED. Our events are already typed. Fail2ban parses text with regexes only because it has no other channel."
+        maxretry_findtime: "N denials within M minutes marks an app persistent rather than incidental"
+        client_status: "`hwprivacy-ctl offenders` — who has been trying, how often, since when"
+        ban_database: "persistent per-executable counters that survive restart"
+      what_does_NOT_transfer:
+        ban: >
+          There is nothing to ban. Fail2ban blocks an attacker who is otherwise
+          getting through; we already deny by default, so a repeat offender is
+          already blocked on every attempt. Escalating to a ban is meaningless
+          here — the escalation must be INFORMATIONAL.
+      the_direction_fail2ban_has_no_analogue_for:
+        what: "Repeat denials of an app the user WANTS to work."
+        example: "'Signal denied the camera 12 times' means add an exe_path, not that Signal is hostile."
+        why_it_matters: >
+          This turns the audit log into the discovery loop for building the
+          allowlist. Arguably more valuable day-to-day than catching hostile
+          apps, and it is the reverse of what fail2ban is for.
+      trap_to_avoid: >
+        Do not scrape our own text output with regexes. Fail2ban does that
+        because it has no typed channel; we do. Aggregating over structured
+        events keeps the display format out of the security logic.
+
     explicitly_not:
       - "Do not build a database. The journal already solves storage, rotation and retention — verified above, 36 days retained."
+      - "Do not reimplement fail2ban's log-scraping. See fail2ban_shaped_reporting > trap_to_avoid."
       - "Do not invent a log format before checking what journalctl -o json already gives."
 
   phase_5_audio_backstop:
