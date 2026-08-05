@@ -27,6 +27,7 @@
 mod device_index;
 mod event;
 mod policy;
+mod socket;
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
@@ -35,7 +36,8 @@ use device_index::{DeviceIndex, DeviceRole};
 use event::{monotonic_ns, CoalesceEntry, DevEvent};
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, MapFlags, RingBufferBuilder};
-use policy::Policy;
+use hwprivacy_proto::{AccessEvent, PolicyEntry, Reply, Request, UnresolvedEntry, PROTO_VERSION};
+use policy::{Policy, PolicyKey};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::path::PathBuf;
@@ -56,7 +58,9 @@ use devices_skel::DevicesSkelBuilder;
     long_about = "Reports every open() of a video4linux or ALSA device node, seen \
                   from inside the kernel — including the direct V4L2 and ALSA \
                   access that the PipeWire layer is structurally blind to.\n\n\
-                  Phase 1 denies nothing. Requires root to load the eBPF program."
+                  Observes by default. --enforce denies /dev/video* to any \
+                  executable not on the allowlist; audio is never denied here. \
+                  Requires root to load the eBPF program."
 )]
 struct Cli {
     /// Show playback and mixer-control opens too. Off by default: these fire
@@ -111,6 +115,17 @@ struct Cli {
     /// unless you can see both numbers.
     #[arg(long)]
     dump_policy: bool,
+
+    /// Serve the control socket so hwprivacy-daemon can push policy and
+    /// receive events. Without this the helper is standalone and talks to
+    /// nobody.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<PathBuf>,
+
+    /// Group that owns the socket, so the unprivileged daemon can connect.
+    /// Defaults to $SUDO_USER (the human who ran this under sudo).
+    #[arg(long, value_name = "GROUP")]
+    socket_group: Option<String>,
 }
 
 impl Cli {
@@ -131,19 +146,30 @@ impl Cli {
 
     /// Where the results show up — and, just as importantly, where they do NOT.
     ///
-    /// This tool is standalone: it has no D-Bus connection, no socket, and no
-    /// notification code. The hwprivacy daemon, the tray icon and the GUI have
-    /// never heard of it. Saying so prevents watching the wrong surface.
+    /// This answer CHANGES with `--socket`. Without it the tool is standalone
+    /// and the terminal is the only surface. With it, events are also pushed to
+    /// `hwprivacy-daemon`, which owns the event log and notifications — so the
+    /// tray and `hwprivacy-ctl` start showing camera events for the first time.
+    /// Saying which of the two is in force prevents watching the wrong thing.
     fn results_location(&self) -> String {
         let base = if self.json {
             "this terminal, one JSON object per line on stdout"
         } else {
             "this terminal, as the table below"
         };
-        format!(
-            "{base}. NOT in the tray icon, NOT as a desktop notification, \
-             NOT in hwprivacy-ctl/tui/gui — those are the separate PipeWire layer."
-        )
+        match &self.socket {
+            None => format!(
+                "{base}. NOT in the tray icon, NOT as a desktop notification, \
+                 NOT in hwprivacy-ctl/tui/gui — those are the separate PipeWire \
+                 layer, and nothing here is connected to them."
+            ),
+            Some(p) => format!(
+                "{base} — AND pushed to hwprivacy-daemon over {}. If the daemon \
+                 is connected, camera events also reach the tray, notifications \
+                 and hwprivacy-ctl/tui/gui.",
+                p.display()
+            ),
+        }
     }
 
     /// What the operator should hand back afterwards.
@@ -320,6 +346,29 @@ fn main() -> Result<()> {
     let seen_exe: Arc<Mutex<HashMap<(u32, u64), String>>> = Arc::new(Mutex::new(HashMap::new()));
     let tallies: Arc<Mutex<HashMap<(u64, u32, u32), Tally>>> = Arc::new(Mutex::new(HashMap::new()));
 
+    // Control socket, if asked for. Started AFTER the program is attached and
+    // policy is loaded, so a client can never observe a half-configured kernel.
+    let server = match &cli.socket {
+        Some(path) => {
+            let group = cli
+                .socket_group
+                .clone()
+                .or_else(|| std::env::var("SUDO_USER").ok())
+                .context(
+                    "cannot determine the socket group: pass --socket-group, \
+                     or run under sudo so SUDO_USER is set",
+                )?;
+            let s = socket::serve(path, &group)?;
+            eprintln!(
+                "hwprivacy-lsm: serving {} (mode 0660, group {})",
+                s.path.display(),
+                group
+            );
+            Some(s)
+        }
+        None => None,
+    };
+
     let mut builder = RingBufferBuilder::new();
     {
         let cli_all = cli.all;
@@ -329,6 +378,7 @@ fn main() -> Result<()> {
         let index = index.clone();
         let tallies = tallies.clone();
         let seen_exe = seen_exe.clone();
+        let to_daemon = server.as_ref().map(|s| s.events.clone());
 
         builder
             .add(&skel.maps.events, move |data: &[u8]| {
@@ -371,6 +421,21 @@ fn main() -> Result<()> {
                     .unwrap()
                     .insert((e.exe_dev, e.exe_ino), exe.clone());
 
+                // Forward to the daemon, which owns config, the event log and
+                // notifications. Send failures mean nobody is connected — that
+                // is normal, not an error.
+                if let Some(tx) = &to_daemon {
+                    let _ = tx.send(Reply::Event(AccessEvent {
+                        ts_unix: Local::now().timestamp(),
+                        exe: exe.clone(),
+                        pid: e.tgid,
+                        device: device.clone(),
+                        role: role.label().to_string(),
+                        denied: e.denied,
+                        additional_opens: e.suppressed,
+                    }));
+                }
+
                 if cli_sum {
                     let now = Local::now().format("%H:%M:%S").to_string();
                     let mut t = tallies.lock().unwrap();
@@ -403,6 +468,7 @@ fn main() -> Result<()> {
     let mut last_flush = std::time::Instant::now();
     let coalesce_ns = cli.coalesce_ms * 1_000_000;
     let accounted = Arc::new(AtomicU64::new(0));
+    let mut enforcing = cli.enforce;
 
     while running.load(Ordering::SeqCst) {
         // Errors here are almost always EINTR from our own signal handler.
@@ -419,6 +485,21 @@ fn main() -> Result<()> {
         if cli.duration > 0 && started.elapsed().as_secs() >= cli.duration {
             stop_reason = StopReason::DurationElapsed;
             break;
+        }
+
+        // Answer anything the daemon asked for. Only this thread touches the
+        // BPF maps, so all kernel mutation is serialised here.
+        if let Some(srv) = &server {
+            while let Ok((req, rep_tx)) = srv.requests.try_recv() {
+                let rep = handle_request(
+                    &skel.maps.policy,
+                    &skel.maps.config_map,
+                    req,
+                    &mut enforcing,
+                    coalesce_ns,
+                );
+                let _ = rep_tx.send(rep);
+            }
         }
 
         // Report bursts that have gone quiet. Cheap: the map holds one entry
@@ -464,6 +545,151 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Answer one request from the daemon.
+///
+/// Runs on the main thread, which is the only thing that touches the BPF maps —
+/// all kernel mutation is serialised here by construction rather than by lock.
+fn handle_request(
+    policy_map: &libbpf_rs::Map,
+    config_map: &libbpf_rs::Map,
+    req: Request,
+    enforcing: &mut bool,
+    coalesce_ns: u64,
+) -> Reply {
+    match req {
+        Request::Hello { .. } => Reply::Hello {
+            version: PROTO_VERSION,
+            enforcing_camera: *enforcing,
+        },
+
+        Request::Ping => Reply::Pong,
+
+        Request::SetPolicy {
+            entries,
+            enforce_camera,
+        } => match replace_policy(policy_map, &entries) {
+            Ok((applied, unresolved)) => {
+                if let Err(e) = write_config(config_map, enforce_camera, coalesce_ns) {
+                    return Reply::Error {
+                        message: format!("policy written but enforcement flag failed: {e:#}"),
+                    };
+                }
+                *enforcing = enforce_camera;
+                eprintln!(
+                    "hwprivacy-lsm: policy set by daemon — {} allowed, {} unusable, \
+                     enforcement {}",
+                    applied,
+                    unresolved.len(),
+                    if enforce_camera { "ON" } else { "OFF" }
+                );
+                Reply::PolicyApplied {
+                    applied,
+                    unresolved,
+                }
+            }
+            Err(e) => Reply::Error {
+                message: format!("{e:#}"),
+            },
+        },
+
+        Request::GetPolicy => match read_policy(policy_map) {
+            Ok(entries) => Reply::Policy { entries },
+            Err(e) => Reply::Error {
+                message: format!("{e:#}"),
+            },
+        },
+    }
+}
+
+/// Replace the kernel allowlist wholesale.
+///
+/// Full replacement, never a delta: a delta protocol makes "what does the
+/// kernel actually hold?" unanswerable, and that question has already cost a
+/// debugging cycle on this project.
+///
+/// Order matters. New entries are written BEFORE stale ones are removed, so
+/// there is no instant where a still-authorised application would be denied.
+fn replace_policy(
+    map: &libbpf_rs::Map,
+    entries: &[PolicyEntry],
+) -> Result<(usize, Vec<UnresolvedEntry>)> {
+    let mut wanted: HashMap<[u8; 16], u32> = HashMap::new();
+    let mut unresolved = Vec::new();
+
+    for e in entries {
+        let path = std::path::Path::new(&e.exe);
+        if !path.is_absolute() {
+            unresolved.push(UnresolvedEntry {
+                exe: e.exe.clone(),
+                reason: "not an absolute path".into(),
+            });
+            continue;
+        }
+        match PolicyKey::from_path(path) {
+            Ok(k) => {
+                *wanted.entry(k.to_bytes()).or_insert(0) |= e.perms;
+            }
+            Err(err) => unresolved.push(UnresolvedEntry {
+                exe: e.exe.clone(),
+                reason: format!("{err:#}"),
+            }),
+        }
+    }
+
+    // 1. add/update
+    for (key, perms) in &wanted {
+        map.update(key, &perms.to_ne_bytes(), MapFlags::ANY)
+            .context("failed to write a policy entry")?;
+    }
+
+    // 2. remove anything no longer wanted
+    let stale: Vec<Vec<u8>> = map
+        .keys()
+        .filter(|k| {
+            k.len() != 16 || !wanted.contains_key(&<[u8; 16]>::try_from(k.as_slice()).unwrap())
+        })
+        .collect();
+    for k in stale {
+        let _ = map.delete(&k);
+    }
+
+    Ok((wanted.len(), unresolved))
+}
+
+/// Read the allowlist back out of the kernel, for diagnostics.
+///
+/// Paths cannot be recovered from inodes, so entries come back as
+/// `<dev=..,ino=..>`. Answering "what does the kernel hold" honestly beats
+/// echoing back what we believe we sent.
+fn read_policy(map: &libbpf_rs::Map) -> Result<Vec<PolicyEntry>> {
+    let mut out = Vec::new();
+    for key in map.keys() {
+        if key.len() < 12 {
+            continue;
+        }
+        let ino = u64::from_ne_bytes(key[0..8].try_into().unwrap());
+        let dev = u32::from_ne_bytes(key[8..12].try_into().unwrap());
+        let perms = match map.lookup(&key, MapFlags::ANY)? {
+            Some(v) if v.len() >= 4 => u32::from_ne_bytes(v[0..4].try_into().unwrap()),
+            _ => 0,
+        };
+        out.push(PolicyEntry {
+            exe: format!("<dev={dev} ino={ino}>"),
+            perms,
+        });
+    }
+    Ok(out)
+}
+
+/// `struct config { u32 enforce_camera; u32 _pad; u64 coalesce_ns; }`
+fn write_config(map: &libbpf_rs::Map, enforce_camera: bool, coalesce_ns: u64) -> Result<()> {
+    let mut cfg = [0u8; 16];
+    cfg[0..4].copy_from_slice(&(enforce_camera as u32).to_ne_bytes());
+    cfg[8..16].copy_from_slice(&coalesce_ns.to_ne_bytes());
+    map.update(&0u32.to_ne_bytes(), &cfg, MapFlags::ANY)
+        .context("failed to write the config map")
 }
 
 /// Report bursts that have gone quiet, then clear their counters.
@@ -738,6 +964,8 @@ mod tests {
             policy_file: None,
             coalesce_ms: 2000,
             dump_policy: false,
+            socket: None,
+            socket_group: None,
         }
     }
 
@@ -798,6 +1026,23 @@ mod tests {
                 "must explicitly rule out {absent}, or the wrong surface gets watched: {s}"
             );
         }
+    }
+
+    /// With a socket the answer flips: events DO reach the tray and ctl. Saying
+    /// "not in the tray" while pushing events to the daemon would be a lie the
+    /// operator acts on.
+    #[test]
+    fn results_location_changes_when_a_socket_is_served() {
+        let mut c = cli(0, 0);
+        c.socket = Some(PathBuf::from("/run/hwprivacy/lsm.sock"));
+        let s = c.results_location();
+
+        assert!(s.contains("/run/hwprivacy/lsm.sock"), "must name the socket: {s}");
+        assert!(s.contains("hwprivacy-daemon"), "must say who receives them: {s}");
+        assert!(
+            !s.contains("NOT in the tray"),
+            "must not still claim the tray is excluded once events are forwarded: {s}"
+        );
     }
 
     #[test]

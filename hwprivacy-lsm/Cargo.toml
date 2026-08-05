@@ -1,25 +1,23 @@
 [package]
 name = "hwprivacy-lsm"
-version = "0.1.0"
-edition = "2021"
-license = "GPL-3.0-or-later"
-authors = ["perieteanu"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
 description = "Kernel-level camera access enforcement for hwprivacy, via eBPF LSM"
 
-# Deliberately its own workspace during Phase 1.
-#
-# The parent tree's `cargo build --release --workspace` builds the daemon that
-# is currently RUNNING as a systemd service. Adding this crate as a member
-# before the eBPF toolchain (clang, libbpf-dev, bpftool) is installed would
-# break that build. This crate joins the parent workspace once Phase 1
-# compiles — see docs-yaml/ROADMAP.yaml.
-[workspace]
-
+# NOTE: building this crate requires the eBPF toolchain (clang, libbpf-dev,
+# bpftool) and a generated src/bpf/vmlinux.h. Since it is now a workspace
+# member, `cargo build --workspace` — which also builds the daemon running as a
+# service — will fail without them. build.rs says so explicitly; the fix is
+# ~/projects/claude-run/hwprivacy-ebpf-toolchain-20260804.sh
 [[bin]]
 name = "hwprivacy-lsm"
 path = "src/main.rs"
 
 [dependencies]
+hwprivacy-proto = { path = "../hwprivacy-proto" }
+serde_json = { workspace = true }
 libbpf-rs = "0.27"          # MSRV 1.82; local rustc is 1.85
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }

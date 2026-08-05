@@ -1,10 +1,12 @@
 [workspace]
 members = [
     "hwprivacy-common",
+    "hwprivacy-proto",
     "hwprivacy-daemon",
     "hwprivacy-ctl",
     "hwprivacy-tui",
     "hwprivacy-gui",
+    "hwprivacy-lsm",
 ]
 resolver = "2"
 

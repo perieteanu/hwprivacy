@@ -1,0 +1,16 @@
+[package]
+name = "hwprivacy-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Wire protocol between the root eBPF helper and the user daemon"
+
+# Deliberately minimal dependencies.
+#
+# One side of this protocol runs as ROOT. hwprivacy-common would work as a home
+# for these types, but it pulls in zbus and toml, and linking a D-Bus stack into
+# a root process to share two structs is a bad trade. serde only.
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
