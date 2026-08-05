@@ -116,15 +116,42 @@ struct Cli {
 impl Cli {
     /// One plain sentence saying exactly how this run terminates.
     ///
-    /// House rule: a test must announce up front whether it stops on its own
-    /// or waits for a specific human action. Leaving the operator guessing
-    /// whether something is still working is its own kind of bug.
+    /// House rule (global): a run announces three things before doing any work
+    /// — how it ends, where its results appear, and what to hand back. Leaving
+    /// the operator guessing about any of the three has already cost a run
+    /// each. See also [`Cli::results_location`] and [`Cli::what_to_do`].
     fn exit_condition(&self) -> String {
         match (self.duration, self.max_events) {
             (0, 0) => "press Ctrl-C. Nothing else stops it — no timer, no event limit.".into(),
             (d, 0) => format!("automatically after {d}s, or Ctrl-C sooner."),
             (0, m) => format!("automatically after {m} reported event(s), or Ctrl-C sooner."),
             (d, m) => format!("after {d}s or {m} event(s), whichever comes first — or Ctrl-C sooner."),
+        }
+    }
+
+    /// Where the results show up — and, just as importantly, where they do NOT.
+    ///
+    /// This tool is standalone: it has no D-Bus connection, no socket, and no
+    /// notification code. The hwprivacy daemon, the tray icon and the GUI have
+    /// never heard of it. Saying so prevents watching the wrong surface.
+    fn results_location(&self) -> String {
+        let base = if self.json {
+            "this terminal, one JSON object per line on stdout"
+        } else {
+            "this terminal, as the table below"
+        };
+        format!(
+            "{base}. NOT in the tray icon, NOT as a desktop notification, \
+             NOT in hwprivacy-ctl/tui/gui — those are the separate PipeWire layer."
+        )
+    }
+
+    /// What the operator should hand back afterwards.
+    fn what_to_do(&self) -> String {
+        if self.summarize {
+            "copy the summary table printed at exit into the Claude chat.".into()
+        } else {
+            "copy the lines below (or the whole terminal) into the Claude chat.".into()
         }
     }
 }
@@ -266,7 +293,11 @@ fn main() -> Result<()> {
         }
         eprintln!("hwprivacy-lsm: coalescing repeat opens within {} ms", cli.coalesce_ms);
         eprintln!();
-        eprintln!("  HOW THIS ENDS: {}", cli.exit_condition());
+        eprintln!("  ─────────────────────────────────────────────────────────────");
+        eprintln!("  HOW THIS ENDS:   {}", cli.exit_condition());
+        eprintln!("  RESULTS APPEAR:  {}", cli.results_location());
+        eprintln!("  WHAT TO DO:      {}", cli.what_to_do());
+        eprintln!("  ─────────────────────────────────────────────────────────────");
         eprintln!();
         if !cli.summarize {
             eprintln!(
@@ -752,6 +783,43 @@ mod tests {
                 s.contains("Ctrl-C"),
                 "every mode must tell the operator how to stop early: {s}"
             );
+        }
+    }
+
+    /// The global three-part contract: how it ends, where results appear, what
+    /// to hand back. Each of these was a real confusion that cost a run.
+    #[test]
+    fn results_location_names_the_terminal_and_rules_out_the_other_surfaces() {
+        let s = cli(0, 0).results_location();
+        assert!(s.contains("terminal"), "must name where to look: {s}");
+        for absent in ["tray", "notification", "hwprivacy-ctl"] {
+            assert!(
+                s.contains(absent),
+                "must explicitly rule out {absent}, or the wrong surface gets watched: {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn what_to_do_tells_the_operator_to_hand_results_back() {
+        for summarize in [false, true] {
+            let mut c = cli(0, 0);
+            c.summarize = summarize;
+            let s = c.what_to_do();
+            assert!(s.contains("Claude"), "must say where it goes: {s}");
+            assert!(s.contains("copy"), "must name the action: {s}");
+        }
+    }
+
+    #[test]
+    fn the_full_contract_is_three_non_empty_parts() {
+        let c = cli(0, 0);
+        for (name, part) in [
+            ("HOW THIS ENDS", c.exit_condition()),
+            ("RESULTS APPEAR", c.results_location()),
+            ("WHAT TO DO", c.what_to_do()),
+        ] {
+            assert!(part.len() > 20, "{name} is too thin to be useful: {part}");
         }
     }
 
