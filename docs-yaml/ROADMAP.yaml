@@ -251,6 +251,61 @@ kernel_layer:
       - "c4 is visual too: whether a notification actually appeared, and whether its wording reads right."
       - "Nothing here tests the audio path. Audio is Phase 5 and is deliberately untouched."
 
+  phase_4_continuous_operation_and_audit:
+    status: "RESHAPED 2026-08-05 by an explicit requirement from Costin. Not started."
+    requirement_verbatim: >
+      "i expect a long time usage with some logs that you'll visit later (after
+      few days etc) and have a better grasp of who tried to connect etc"
+    the_gap_this_exposes:
+      what: "Nothing survives a restart today, so that review is currently impossible."
+      detail:
+        - "The daemon's event log is a 500-entry IN-MEMORY ring buffer (g3). Lost on every restart, and it is what hwprivacy-ctl log reads."
+        - "Kernel events are folded into that same ring buffer, so they are equally volatile."
+        - "hwprivacy-lsm prints to a terminal. Close the terminal and the record is gone."
+        - "Event timestamps are '%H:%M:%S' with NO DATE (g4) — ambiguous the moment a log spans midnight, useless across days."
+      verdict: >
+        Phase 4 was scoped as 'add a systemd unit'. That is not enough. The unit
+        is what makes the helper RUN continuously; persistence is what makes the
+        running worth anything.
+    approach:
+      primary: >
+        Let the systemd journal be the audit store. A helper running as a
+        service has its stdout captured automatically, with real timestamps,
+        rotation and retention already solved. Zero new storage code, and
+        `journalctl` is a better query tool than anything worth writing here.
+      structured: >
+        Run the helper with --json so the journal holds one NDJSON object per
+        event — greppable AND machine-readable later, rather than a table that
+        has to be re-parsed.
+      queries_it_should_make_possible:
+        - "journalctl -u hwprivacy-lsm --since '3 days ago' | grep DENIED"
+        - "who touched the camera at all this week, and how many times"
+        - "which binaries appeared that are NOT in the allowlist — the discovery loop for new consumers"
+      also_needed:
+        - "Fix g4: put a full date on daemon event timestamps, or the in-memory log stays unreadable across days even while it lives."
+        - "Consider a periodic --summarize digest, so a week of events collapses to a per-consumer table rather than thousands of lines."
+    verified_2026_08_05:
+      journal_is_persistent: "/var/log/journal exists; hwprivacy entries retained from 30 June to 5 August — 36 days, with no configuration needed."
+      the_query_already_works: |
+        journalctl --user -u hwprivacy --since "3 days ago" \
+          | grep -oE 'Event: .* → (Microphone|Camera|Monitor) → [A-Z_]+'
+      what_it_surfaced: >
+        AnyDesk was denied the playback monitor 4 times. A remote-desktop tool
+        attempting to tap what the speakers were playing, caught by the one
+        PipeWire feature that genuinely works — and only visible by reading the
+        log days later, which is precisely the use case Costin described.
+      an_argument_for_the_kernel_layer_as_the_audit_source: >
+        The same query shows 'Firefox (pid:2332)' and 'Firefox (pid:2275)' as
+        two separate consumers, because PipeWire-layer labels embed a pid that
+        changes on every restart. Over 36 days that fragments into noise. The
+        kernel layer keys on exe_path, which is stable across restarts and
+        reboots, so its records aggregate correctly over long windows. This
+        makes b4 (pid-bearing labels) worse the longer the window gets.
+
+    explicitly_not:
+      - "Do not build a database. The journal already solves storage, rotation and retention — verified above, 36 days retained."
+      - "Do not invent a log format before checking what journalctl -o json already gives."
+
   phase_5_audio_backstop:
     status: "AGREED IN PRINCIPLE 2026-08-05, not started. Comes after Phase 3."
     question_asked: "Should exe_path also gate the microphone at the kernel layer?"
