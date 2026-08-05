@@ -205,7 +205,53 @@ kernel_layer:
         binary's mtime.
     tooling_added_as_a_result:
       "--dump-policy": "reads the policy map back out of the kernel and prints it beside what userspace intended, so a key mismatch is a 30-second diagnosis instead of a hypothesis"
-    phase_5_audio_backstop:
+    phase_3_acceptance_criteria:
+    status: "DEFINED 2026-08-05, not yet run. Written BEFORE the test script, deliberately."
+    why_defined_first: >
+      Costin: "we need to establish first the tests for this phase". Writing the
+      criteria before the script stops the script from quietly becoming the
+      definition of success — which is how a test ends up asserting whatever the
+      code happens to do.
+    what_phase_3_claims: >
+      The daemon connects to the kernel helper, pushes the allowlist from
+      config.toml, and surfaces kernel camera events through the EXISTING
+      frontends with no frontend changes.
+
+    a_connection:
+      a1: "helper stopped -> hwprivacy-ctl status says 'Connected: no'   [ALREADY VERIFIED 2026-08-05]"
+      a2: "helper started with --socket -> ctl says 'Connected: yes' and names the enforcement state"
+      a3: "kill the helper -> ctl returns to 'Connected: no' within ~10s, daemon does NOT crash"
+      a4: "restart the helper -> daemon reconnects by itself, WITHOUT restarting the daemon"
+
+    b_policy_push:
+      b1: "the helper reports applying exactly the exe_path entries from config.toml that have camera = allow"
+      b2: "--dump-policy shows firefox-esr's (dev, ino) present in the kernel map"
+      b3: "a rule with camera = allow but NO exe_path is logged as a gap, not silently skipped"
+      b4: "a rule with a bogus exe_path is reported unresolved AND counted in ctl status — under default-deny that app is being denied and must not be invisible"
+
+    c_event_flow:
+      note: "This is the actual point of Phase 3 — everything else is plumbing."
+      c1: "a denied camera open appears in `hwprivacy-ctl log`"
+      c2: "the same event appears in the TUI Events panel"
+      c3: "the same event appears in the GUI Events tab"
+      c4: "a desktop notification appears, informational only (NO action buttons), and its text warns that call audio may also stop"
+      c5: "blocked-attempts in ctl status rises by the TOTAL opens (13 for a Firefox session), not by 1 — the coalesced burst must not under-count"
+
+    d_enforcement_regression:
+      d1: "firefox-esr, allowlisted via config.toml, CAN use the camera"
+      d2: "a binary that is not allowlisted (ffmpeg) is denied"
+      d3: "stopping the helper restores camera access immediately"
+
+    e_non_interference:
+      e1: "the PipeWire layer keeps working — mic/monitor events still logged as before"
+      e2: "daemon NRestarts stays 0 — no repeat of the D-Bus bus-name crash loop"
+
+    known_gaps_this_test_will_NOT_cover:
+      - "The GUI/TUI checks (c2, c3) are visual and cannot be asserted by a script — they need Costin's eyes."
+      - "c4 is visual too: whether a notification actually appeared, and whether its wording reads right."
+      - "Nothing here tests the audio path. Audio is Phase 5 and is deliberately untouched."
+
+  phase_5_audio_backstop:
     status: "AGREED IN PRINCIPLE 2026-08-05, not started. Comes after Phase 3."
     question_asked: "Should exe_path also gate the microphone at the kernel layer?"
     answer: >
