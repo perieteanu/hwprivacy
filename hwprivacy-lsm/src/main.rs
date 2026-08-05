@@ -507,7 +507,13 @@ fn main() -> Result<()> {
         if last_flush.elapsed() >= Duration::from_millis(500) {
             last_flush = std::time::Instant::now();
             let seen = seen_exe.lock().unwrap().clone();
-            match flush_stale_bursts(&skel.maps.coalesce, coalesce_ns, &seen, cli.json) {
+            match flush_stale_bursts(
+                &skel.maps.coalesce,
+                coalesce_ns,
+                &seen,
+                cli.json,
+                server.as_ref().map(|s| &s.events),
+            ) {
                 Ok(n) => accounted.fetch_add(n, Ordering::SeqCst),
                 Err(e) => {
                     eprintln!("hwprivacy-lsm: burst flush failed: {e:#}");
@@ -521,7 +527,13 @@ fn main() -> Result<()> {
     // accounted for, otherwise the closing count under-reports.
     {
         let seen = seen_exe.lock().unwrap().clone();
-        if let Ok(n) = flush_stale_bursts(&skel.maps.coalesce, 0, &seen, cli.json) {
+        if let Ok(n) = flush_stale_bursts(
+            &skel.maps.coalesce,
+            0,
+            &seen,
+            cli.json,
+            server.as_ref().map(|s| &s.events),
+        ) {
             accounted.fetch_add(n, Ordering::SeqCst);
         }
     }
@@ -706,6 +718,7 @@ fn flush_stale_bursts(
     window_ns: u64,
     seen_exe: &HashMap<(u32, u64), String>,
     json: bool,
+    to_daemon: Option<&std::sync::mpsc::Sender<Reply>>,
 ) -> Result<u64> {
     let now = monotonic_ns();
     let mut pending: Vec<CoalesceEntry> = Vec::new();
@@ -753,6 +766,29 @@ fn flush_stale_bursts(
                 e.suppressed,
                 who,
             );
+        }
+
+        // Send it to the daemon as well, not just this terminal.
+        //
+        // This is the C5 failure from the Phase 3 test: the helper printed
+        // "burst closed: 12 further open(s)" perfectly, to its own stdout, and
+        // the daemon's blocked-attempts counter still rose by 1. A summary
+        // nobody receives is not accounting.
+        if let Some(tx) = to_daemon {
+            let _ = tx.send(Reply::Event(AccessEvent {
+                ts_unix: Local::now().timestamp(),
+                exe_path: who.clone(),
+                pid: 0, // the burst spans opens; no single pid owns it
+                device: if e.dev_major == device_index::V4L2_MAJOR {
+                    "/dev/video*".to_string()
+                } else {
+                    "/dev/snd/*".to_string()
+                },
+                role: kind.to_string(),
+                denied: e.denied,
+                // The whole point: the opens this summary stands for.
+                additional_opens: e.suppressed,
+            }));
         }
 
         // Clear the counter but KEEP last_ns — restarting the window here would

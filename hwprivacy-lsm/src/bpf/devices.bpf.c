@@ -80,7 +80,13 @@ struct coalesce_key {
 struct coalesce_val {
 	__u64 last_ns;
 	__u32 suppressed;
-	__u32 _pad;
+	/* Verdict this burst received. Every open in a burst is the same
+	 * executable hitting the same device class, so they share a verdict.
+	 * Recorded here because userspace flushes stale bursts LATER and has no
+	 * other way to know whether the swallowed opens were denied — without it
+	 * a burst of 13 denials reports as 1. Occupies what used to be padding,
+	 * so the struct size is unchanged. */
+	__u32 denied;
 };
 
 // Runtime configuration, updatable from userspace without reloading the
@@ -215,9 +221,11 @@ int BPF_PROG(hwp_file_open, struct file *file, int ret)
 		suppressed = cv->suppressed;
 		cv->suppressed = 0;
 		cv->last_ns = now;
+		cv->denied = denied;
 	} else {
 		struct coalesce_val nv = {};
 		nv.last_ns = now;
+		nv.denied = denied;
 		bpf_map_update_elem(&coalesce, &ck, &nv, BPF_ANY);
 	}
 

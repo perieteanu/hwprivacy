@@ -237,6 +237,19 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
         return;
     }
 
+    // A burst SUMMARY carries pid 0: it is the accounting for opens already
+    // reported, not a fresh access. Notifying here would fire a second popup
+    // for the same camera session and defeat the coalescing this summary
+    // exists to support. It still counts toward blocked_count above — the
+    // number must be right even though the notification must not repeat.
+    if ev.pid == 0 {
+        info!(
+            "Kernel layer: {} further denied open(s) by {} (burst summary, no notification)",
+            ev.additional_opens, app
+        );
+        return;
+    }
+
     info!(
         "Kernel layer DENIED {} -> {} ({}), {} open(s) total",
         app,
@@ -302,6 +315,28 @@ mod tests {
         assert_eq!(short_name("<dev=66306 ino=30027059>"), "<dev=66306 ino=30027059>");
         assert_eq!(short_name("noslashes"), "noslashes");
         assert_eq!(short_name("/trailing/"), "/trailing/");
+    }
+
+    /// A burst summary must be counted but must NOT notify — otherwise one
+    /// camera session produces two popups, which is the defect coalescing
+    /// exists to prevent.
+    #[test]
+    fn a_burst_summary_is_identified_by_pid_zero() {
+        let summary = AccessEvent {
+            ts_unix: 0,
+            exe_path: "/usr/lib/firefox-esr/firefox-esr".into(),
+            pid: 0,
+            device: "/dev/video*".into(),
+            role: "CAMERA".into(),
+            denied: true,
+            additional_opens: 12,
+        };
+        assert_eq!(summary.pid, 0, "summaries are marked with pid 0");
+        assert!(summary.is_burst());
+        assert_eq!(summary.total_opens(), 13);
+
+        let real = AccessEvent { pid: 3271, additional_opens: 0, ..summary };
+        assert_ne!(real.pid, 0, "a real access has a real pid and DOES notify");
     }
 
     #[test]

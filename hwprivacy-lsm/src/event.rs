@@ -123,11 +123,14 @@ pub struct CoalesceEntry {
     pub dev_major: u32,
     pub last_ns: u64,
     pub suppressed: u32,
+    /// Verdict the burst received. Without this a flushed burst cannot say
+    /// whether its swallowed opens were denied, and 13 denials report as 1.
+    pub denied: bool,
 }
 
 impl CoalesceEntry {
     /// `struct coalesce_key { u64 exe_ino; u32 exe_dev; u32 dev_major; }`
-    /// `struct coalesce_val { u64 last_ns; u32 suppressed; u32 _pad; }`
+    /// `struct coalesce_val { u64 last_ns; u32 suppressed; u32 denied; }`
     pub fn parse(key: &[u8], val: &[u8]) -> Option<Self> {
         if key.len() < 16 || val.len() < 12 {
             return None;
@@ -138,15 +141,18 @@ impl CoalesceEntry {
             dev_major: u32::from_ne_bytes(key[12..16].try_into().ok()?),
             last_ns: u64::from_ne_bytes(val[0..8].try_into().ok()?),
             suppressed: u32::from_ne_bytes(val[8..12].try_into().ok()?),
+            denied: val.len() >= 16 && u32::from_ne_bytes(val[12..16].try_into().ok()?) != 0,
         })
     }
 
-    /// Value bytes with the suppressed counter cleared, preserving `last_ns`.
-    /// Used to mark a burst as reported without disturbing the window.
+    /// Value bytes with the suppressed counter cleared, preserving `last_ns`
+    /// AND the verdict. Used to mark a burst as reported without disturbing
+    /// the window or forgetting what the burst was.
     pub fn cleared_value(&self) -> [u8; 16] {
         let mut v = [0u8; 16];
         v[0..8].copy_from_slice(&self.last_ns.to_ne_bytes());
-        // suppressed and _pad stay zero
+        // suppressed stays zero
+        v[12..16].copy_from_slice(&(self.denied as u32).to_ne_bytes());
         v
     }
 
@@ -269,6 +275,18 @@ mod tests {
         assert_eq!(e.suppressed, 0, "suppressed must not pick up the denied flag");
     }
 
+    fn coalesce_bytes_denied(ino: u64, dev: u32, major: u32, last_ns: u64, sup: u32, denied: u32) -> (Vec<u8>, Vec<u8>) {
+        let mut k = Vec::new();
+        k.extend_from_slice(&ino.to_ne_bytes());
+        k.extend_from_slice(&dev.to_ne_bytes());
+        k.extend_from_slice(&major.to_ne_bytes());
+        let mut v = Vec::new();
+        v.extend_from_slice(&last_ns.to_ne_bytes());
+        v.extend_from_slice(&sup.to_ne_bytes());
+        v.extend_from_slice(&denied.to_ne_bytes());
+        (k, v)
+    }
+
     fn coalesce_bytes(ino: u64, dev: u32, major: u32, last_ns: u64, sup: u32) -> (Vec<u8>, Vec<u8>) {
         let mut k = Vec::new();
         k.extend_from_slice(&ino.to_ne_bytes());
@@ -277,7 +295,7 @@ mod tests {
         let mut v = Vec::new();
         v.extend_from_slice(&last_ns.to_ne_bytes());
         v.extend_from_slice(&sup.to_ne_bytes());
-        v.extend_from_slice(&0u32.to_ne_bytes()); // _pad
+        v.extend_from_slice(&0u32.to_ne_bytes()); // denied = false
         (k, v)
     }
 
@@ -305,6 +323,28 @@ mod tests {
         let (k2, v2) = coalesce_bytes(1, 2, 81, 1_000_000_000, 0);
         let quiet = CoalesceEntry::parse(&k2, &v2).unwrap();
         assert!(!quiet.is_stale(9_999_999_999, window));
+    }
+
+    /// A flushed burst must remember whether it was denied, or 13 denials
+    /// report as 1. This is the C5 failure from the Phase 3 test.
+    #[test]
+    fn a_burst_carries_its_verdict() {
+        let (k, v) = coalesce_bytes_denied(1, 2, 81, 1_000, 12, 1);
+        let e = CoalesceEntry::parse(&k, &v).unwrap();
+        assert!(e.denied, "a denied burst must report as denied");
+        assert_eq!(e.suppressed, 12);
+
+        let (k2, v2) = coalesce_bytes_denied(1, 2, 81, 1_000, 3, 0);
+        assert!(!CoalesceEntry::parse(&k2, &v2).unwrap().denied);
+    }
+
+    #[test]
+    fn clearing_preserves_the_verdict_as_well_as_the_window() {
+        let (k, v) = coalesce_bytes_denied(1, 2, 81, 1_234, 12, 1);
+        let e = CoalesceEntry::parse(&k, &v).unwrap();
+        let back = CoalesceEntry::parse(&k, &e.cleared_value()).unwrap();
+        assert_eq!(back.suppressed, 0);
+        assert!(back.denied, "clearing the counter must not forget the verdict");
     }
 
     #[test]
