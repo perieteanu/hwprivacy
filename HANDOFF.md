@@ -89,13 +89,16 @@ sudo ./target/debug/hwprivacy-lsm --summarize
 
 Three things are queued, in this order:
 
-1. **Measure the LSM hook's cost.** It fires on *every* `open()` system-wide.
-   Unmeasured. Costin rejected the PipeWire layer's 1.2 % idle burn, so this
-   number can invalidate the architecture — do it before building more.
-   Method: time ~200k `open`/`close` of `/dev/null` with and without the
-   program attached.
+1. ~~Measure the LSM hook's cost.~~ **DONE 2026-08-05 — the architecture passes.**
+   `+13.75 ns/open` mean, 95 % CI `[+7.3, +20.2]`, 9/10 cycles positive,
+   sign test p = 0.021. That is **1.88 % of a 733 ns `open()`** — i.e.
+   0.0014 % of a core at 1 000 opens/sec, 0.0138 % at 10 000, and **0 % at
+   idle**. The PipeWire layer burns 1.2 % constantly; at heavy load that is
+   ~87× more, and at idle the ratio is infinite. Detail and the two false
+   starts: `docs-yaml/ROADMAP.yaml > kernel_layer > hook_overhead_measured`.
 2. **Phase 2 — camera enforcement.** Policy hash map keyed on
    `(exe_dev, exe_ino)`, `-EPERM` on miss, default-deny, `--observe` retained.
+   Must coalesce: one camera session is 13 opens.
 3. **Phase 3 — integration.** NDJSON over `/run/hwprivacy/lsm.sock`,
    `AppRule.exe` in config, `lsm_client.rs` in the daemon. All three frontends
    then display kernel blocks with **zero** frontend changes.

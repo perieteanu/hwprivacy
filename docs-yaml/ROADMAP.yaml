@@ -191,11 +191,54 @@ kernel_layer:
   still_unobserved:
     - "Discord, Zoom, Telegram, OBS, cheese, and the Firefox Developer Edition have not yet been seen touching either device."
     - "Not a blocker: default-deny plus a notification surfaces each new consumer the first time it appears. That IS the discovery mechanism."
-  outstanding_measurement:
+  hook_overhead_measured:
+    date: "2026-08-05"
+    status: "MEASURED — the architecture passes on cost"
     what: "Cost of the LSM hook, which fires on EVERY open() system-wide."
-    why_it_matters: "Costin explicitly rejected the PipeWire layer's 1.2% idle CPU. This number decides whether the architecture is acceptable at all."
-    how: "Time an open()-heavy benchmark with and without the program attached, e.g. 200k open/close of /dev/null."
-    status: "NOT YET MEASURED — do not claim it is cheap until it is."
+    why_it_mattered: "Costin rejected the PipeWire layer's 1.2% idle CPU. This number decided whether the kernel layer was acceptable at all."
+    method: >
+      Paired/interleaved A-B design, 10 cycles. Each cycle measures baseline
+      and attached back-to-back and computes that cycle's delta, so slow
+      machine drift cancels. Minimum-of-5 within each run (noise is one-sided,
+      it only adds). Pinned to one CPU with taskset. Benchmark opens /dev/null
+      (major 1), i.e. the common case the program inspects and rejects.
+      Script: ~/projects/claude-run/hwprivacy-lsm-overhead-v2-20260805.sh
+    result:
+      overhead_mean_ns: 13.75
+      overhead_median_ns: 15.4
+      ci95_ns: "[+7.3, +20.2] — excludes zero"
+      consistency: "9/10 cycles positive, sign test p = 0.021"
+      relative: "1.88% of a 733 ns open()"
+      contamination: "clean run, 0 camera/mic events fired"
+    cost_at_rate:
+      "100/sec": "0.00014% of one core"
+      "1,000/sec": "0.0014% of one core"
+      "10,000/sec (heavy build)": "0.0138% of one core"
+      "100,000/sec (unrealistic)": "0.1375% of one core"
+      idle: "0.0000% — the hook does not run when nothing opens a file"
+    verdict: >
+      Acceptable. At a realistic heavy load the PipeWire polling layer is ~87x
+      more expensive, and at idle the ratio is infinite: 1.2% of a core burns
+      constantly whether or not anything happens, while this bills per syscall
+      and is free when the machine is quiet. This is the structural difference,
+      not just a smaller number.
+    two_false_starts_worth_remembering:
+      - >
+        v1 used a blocked design (all baseline runs, then all attached runs).
+        Machine drift of 206 ns accumulated between blocks while the effect was
+        ~15 ns. It reported +166 ns / +19.9%, which was mostly drift. A mic
+        event fired mid-run made it worse: each event makes the observer
+        resolve /proc and print, which is USERSPACE work competing with the
+        benchmark, not hook cost. v2 now counts such events and flags the run.
+      - >
+        v2's first verdict rule compared range (max-min) against the median and
+        called this perfectly good run 'inconclusive'. Range is dominated by the
+        single most extreme value and grows with sample size, so one noisy cycle
+        vetoed nine consistent ones. Replaced with a t-based confidence interval
+        plus a sign test.
+    still_unmeasured:
+      what: "Cost of the INTERESTING path — what one camera/mic event costs (ringbuf drain, /proc resolution, printing)."
+      why_lower_priority: "Events are rare (a handful per day) vs opens (millions). Matters for Phase 2 notification behaviour, not for system-wide overhead."
 
 next_up:
   label: "Ordered. Do not start item 2 before item 1 is settled."
