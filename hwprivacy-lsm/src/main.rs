@@ -1,21 +1,32 @@
-//! hwprivacy-lsm — kernel-level hardware access observer (Phase 1).
+//! hwprivacy-lsm — kernel-level hardware access control.
 //!
-//! Loads an eBPF LSM program on `security_file_open` and reports every open()
-//! of a video4linux or ALSA device node.
+//! Loads an eBPF LSM program on `security_file_open` and reports — and, with
+//! `--enforce`, denies — opens of video4linux and ALSA device nodes.
 //!
-//! Phase 1 is OBSERVE ONLY. The eBPF program returns the incoming LSM verdict
-//! unchanged and cannot deny anything. Its purpose is twofold: prove that BPF
-//! LSM attaches and that CO-RE struct reads work on this kernel, and — just as
-//! importantly — find out which executables actually touch the camera and
-//! microphone on this machine, since that is the input to writing any policy
-//! at all.
+//! # Scope
 //!
-//! The program is never pinned. When this process exits the program is
-//! detached and the kernel returns to its normal behaviour. That is the
-//! escape hatch, and it is deliberate.
+//! * **Camera** (major 81) is enforced under `--enforce`: any executable not on
+//!   the allowlist gets `-EPERM`. Default posture is deny.
+//! * **Audio** (major 116) is observe-only and is never denied here. The kernel
+//!   sees only `/usr/bin/pipewire` holding the microphone and cannot tell which
+//!   application is behind it — that identity lives in the PipeWire layer.
+//!   Audio enforcement is a separate feature.
+//!
+//! # Safety
+//!
+//! Enforcement is off unless explicitly requested, and the program is **never
+//! pinned**: when this process exits the kernel detaches it and device access
+//! returns to normal. Killing it is the escape hatch, and that is deliberate.
+//!
+//! # Identity
+//!
+//! Policy keys on `(exe_dev, exe_ino)` — the inode of the calling task's
+//! executable. A process cannot lie about which binary it exec'd. `comm` is
+//! useless for this: Firefox's camera thread reports `VideoCapture`.
 
 mod device_index;
 mod event;
+mod policy;
 
 use anyhow::{bail, Context, Result};
 use chrono::Local;
@@ -23,9 +34,11 @@ use clap::Parser;
 use device_index::{DeviceIndex, DeviceRole};
 use event::DevEvent;
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::RingBufferBuilder;
+use libbpf_rs::{MapCore, MapFlags, RingBufferBuilder};
+use policy::Policy;
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -67,6 +80,27 @@ struct Cli {
     /// Exit automatically after this many seconds (0 = no time limit).
     #[arg(long, default_value = "0")]
     duration: u64,
+
+    /// ENFORCE camera policy: deny /dev/video* to any executable not on the
+    /// allowlist. Without this flag nothing is ever denied.
+    #[arg(long)]
+    enforce: bool,
+
+    /// Allow an executable to use the camera. Repeatable. Must be the REAL
+    /// binary, not a wrapper script — `/usr/lib/firefox-esr/firefox-esr`, not
+    /// `/usr/bin/firefox`.
+    #[arg(long, value_name = "EXE")]
+    allow: Vec<PathBuf>,
+
+    /// Read the camera allowlist from a file (one executable path per line).
+    #[arg(long, value_name = "FILE")]
+    policy_file: Option<PathBuf>,
+
+    /// Coalescing window in milliseconds. Repeat opens by the same executable
+    /// on the same device class inside this window are counted, not reported
+    /// again — one camera session is 13 opens.
+    #[arg(long, default_value = "2000")]
+    coalesce_ms: u64,
 }
 
 impl Cli {
@@ -107,6 +141,10 @@ impl StopReason {
 #[derive(Default)]
 struct Tally {
     count: u64,
+    /// Opens swallowed by kernel-side coalescing. `count` alone understates
+    /// real activity by ~13x for a camera session.
+    suppressed: u64,
+    denied: u64,
     exe: String,
     device: String,
     role: &'static str,
@@ -139,6 +177,46 @@ fn main() -> Result<()> {
          or BPF LSM is unavailable on this kernel",
     )?;
 
+    // ---------------------- policy, loaded BEFORE attaching ----------------
+    // Order matters: the program must never be live with enforcement on and an
+    // empty allowlist, or every camera open on the machine is denied for the
+    // window between attach and map population.
+    let mut pol = Policy::default();
+    if let Some(f) = &cli.policy_file {
+        pol = Policy::from_file(f)?;
+    }
+    for p in &cli.allow {
+        pol.allow_path(p);
+    }
+
+    for (path, why) in &pol.unresolved {
+        eprintln!("hwprivacy-lsm: WARNING unusable allowlist entry {}: {}", path.display(), why);
+    }
+    if cli.enforce && !pol.unresolved.is_empty() {
+        eprintln!(
+            "hwprivacy-lsm: {} allowlist entr(ies) could not be resolved. Under \
+             --enforce those applications WILL be denied the camera.",
+            pol.unresolved.len()
+        );
+    }
+
+    let map = pol.to_map();
+    for (key, perms) in &map {
+        skel.maps
+            .policy
+            .update(&key.to_bytes(), &perms.to_ne_bytes(), MapFlags::ANY)
+            .context("failed to write a policy map entry")?;
+    }
+
+    // struct config { u32 enforce_camera; u32 _pad; u64 coalesce_ns; }
+    let mut cfg = [0u8; 16];
+    cfg[0..4].copy_from_slice(&(cli.enforce as u32).to_ne_bytes());
+    cfg[8..16].copy_from_slice(&(cli.coalesce_ms * 1_000_000).to_ne_bytes());
+    skel.maps
+        .config_map
+        .update(&0u32.to_ne_bytes(), &cfg, MapFlags::ANY)
+        .context("failed to write the config map")?;
+
     skel.attach()
         .context("failed to attach to the security_file_open LSM hook")?;
 
@@ -148,14 +226,38 @@ fn main() -> Result<()> {
         if !cli.all {
             eprintln!("hwprivacy-lsm: showing CAMERA and MIC only — pass --all for playback/control");
         }
-        eprintln!("hwprivacy-lsm: OBSERVE ONLY — nothing will be denied");
+        if cli.enforce {
+            eprintln!(
+                "hwprivacy-lsm: ENFORCING camera — /dev/video* denied (-EPERM) to \
+                 anything not on the allowlist"
+            );
+            eprintln!("hwprivacy-lsm: audio is NOT enforced; it stays observe-only");
+            if map.is_empty() {
+                eprintln!(
+                    "hwprivacy-lsm: !! allowlist is EMPTY — every application will be \
+                     denied the camera"
+                );
+            } else {
+                eprintln!("hwprivacy-lsm: camera allowed for {} executable(s):", map.len());
+                for e in &pol.entries {
+                    eprintln!("hwprivacy-lsm:   {}", e.path.display());
+                }
+            }
+            eprintln!(
+                "hwprivacy-lsm: the program is NOT pinned — stopping this process \
+                 restores normal access immediately"
+            );
+        } else {
+            eprintln!("hwprivacy-lsm: OBSERVE ONLY — nothing will be denied (pass --enforce to gate the camera)");
+        }
+        eprintln!("hwprivacy-lsm: coalescing repeat opens within {} ms", cli.coalesce_ms);
         eprintln!();
         eprintln!("  HOW THIS ENDS: {}", cli.exit_condition());
         eprintln!();
         if !cli.summarize {
             eprintln!(
-                "{:<8}  {:<7}  {:<18}  {:<16}  {:<7}  {}",
-                "TIME", "ROLE", "DEVICE", "COMM", "PID", "EXE"
+                "{:<8}  {:<8}  {:<7}  {:<18}  {:<15}  {:<7}  {}",
+                "TIME", "VERDICT", "ROLE", "DEVICE", "COMM", "PID", "EXE"
             );
         }
     }
@@ -229,6 +331,10 @@ fn main() -> Result<()> {
                             ..Default::default()
                         });
                     entry.count += 1;
+                    entry.suppressed += e.suppressed as u64;
+                    if e.denied {
+                        entry.denied += 1;
+                    }
                     entry.last_seen = now;
                 } else {
                     print_event(&e, &device, role, &exe, cli_json);
@@ -319,14 +425,24 @@ fn print_event(e: &DevEvent, device: &str, role: DeviceRole, exe: &str, json: bo
             e.denied,
         );
     } else {
+        // The suppressed count is the honest bit: it says "this is one line
+        // standing in for N opens", so a quiet display is never mistaken for
+        // a quiet system.
+        let burst = if e.suppressed > 0 {
+            format!("  (+{} more suppressed)", e.suppressed)
+        } else {
+            String::new()
+        };
         println!(
-            "{:<8}  {:<7}  {:<18}  {:<16}  {:<7}  {}",
+            "{:<8}  {:<8}  {:<7}  {:<18}  {:<15}  {:<7}  {}{}",
             Local::now().format("%H:%M:%S"),
+            if e.denied { "DENIED" } else { "allow" },
             role.label(),
             device,
             e.comm,
             e.tgid,
             exe,
+            burst,
         );
     }
 }
@@ -342,13 +458,20 @@ fn print_summary(tallies: &HashMap<(u64, u32, u32), Tally>) {
 
     eprintln!("\n=== observed consumers ===");
     eprintln!(
-        "{:<7}  {:<7}  {:<18}  {:<9}  {}",
-        "OPENS", "ROLE", "DEVICE", "WINDOW", "EXE"
+        "{:<7}  {:<7}  {:<7}  {:<7}  {:<18}  {:<9}  {}",
+        "EVENTS", "OPENS", "DENIED", "ROLE", "DEVICE", "WINDOW", "EXE"
     );
     for t in rows {
         eprintln!(
-            "{:<7}  {:<7}  {:<18}  {}-{}  {}",
-            t.count, t.role, t.device, t.first_seen, t.last_seen, t.exe
+            "{:<7}  {:<7}  {:<7}  {:<7}  {:<18}  {}-{}  {}",
+            t.count,
+            t.count + t.suppressed,
+            t.denied,
+            t.role,
+            t.device,
+            t.first_seen,
+            t.last_seen,
+            t.exe
         );
     }
     eprintln!(
@@ -398,6 +521,10 @@ mod tests {
             summarize: false,
             max_events,
             duration,
+            enforce: false,
+            allow: Vec::new(),
+            policy_file: None,
+            coalesce_ms: 2000,
         }
     }
 
