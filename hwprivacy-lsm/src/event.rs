@@ -109,6 +109,65 @@ impl DevEvent {
     }
 }
 
+/// A pending coalescing entry, read back out of the kernel's `coalesce` map.
+///
+/// Exists because the kernel attaches a burst's suppressed count to the NEXT
+/// emitted event — and for a burst that happens once and never repeats, that
+/// event never arrives. Measured 2026-08-05: a Firefox camera session is 13
+/// opens, one was reported, twelve were counted into a map entry nobody read.
+/// Userspace therefore flushes stale entries itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoalesceEntry {
+    pub exe_ino: u64,
+    pub exe_dev: u32,
+    pub dev_major: u32,
+    pub last_ns: u64,
+    pub suppressed: u32,
+}
+
+impl CoalesceEntry {
+    /// `struct coalesce_key { u64 exe_ino; u32 exe_dev; u32 dev_major; }`
+    /// `struct coalesce_val { u64 last_ns; u32 suppressed; u32 _pad; }`
+    pub fn parse(key: &[u8], val: &[u8]) -> Option<Self> {
+        if key.len() < 16 || val.len() < 12 {
+            return None;
+        }
+        Some(CoalesceEntry {
+            exe_ino: u64::from_ne_bytes(key[0..8].try_into().ok()?),
+            exe_dev: u32::from_ne_bytes(key[8..12].try_into().ok()?),
+            dev_major: u32::from_ne_bytes(key[12..16].try_into().ok()?),
+            last_ns: u64::from_ne_bytes(val[0..8].try_into().ok()?),
+            suppressed: u32::from_ne_bytes(val[8..12].try_into().ok()?),
+        })
+    }
+
+    /// Value bytes with the suppressed counter cleared, preserving `last_ns`.
+    /// Used to mark a burst as reported without disturbing the window.
+    pub fn cleared_value(&self) -> [u8; 16] {
+        let mut v = [0u8; 16];
+        v[0..8].copy_from_slice(&self.last_ns.to_ne_bytes());
+        // suppressed and _pad stay zero
+        v
+    }
+
+    /// Whether this burst has gone quiet and can be reported.
+    pub fn is_stale(&self, now_ns: u64, window_ns: u64) -> bool {
+        self.suppressed > 0 && now_ns.saturating_sub(self.last_ns) > window_ns
+    }
+}
+
+/// CLOCK_MONOTONIC in nanoseconds — the same clock `bpf_ktime_get_ns()` uses,
+/// so timestamps from the kernel map are directly comparable.
+pub fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: clock_gettime with a valid clock id and an owned timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64) * 1_000_000_000 + (ts.tv_nsec as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +267,71 @@ mod tests {
         let e = DevEvent::parse(&denied_single).unwrap();
         assert!(e.denied);
         assert_eq!(e.suppressed, 0, "suppressed must not pick up the denied flag");
+    }
+
+    fn coalesce_bytes(ino: u64, dev: u32, major: u32, last_ns: u64, sup: u32) -> (Vec<u8>, Vec<u8>) {
+        let mut k = Vec::new();
+        k.extend_from_slice(&ino.to_ne_bytes());
+        k.extend_from_slice(&dev.to_ne_bytes());
+        k.extend_from_slice(&major.to_ne_bytes());
+        let mut v = Vec::new();
+        v.extend_from_slice(&last_ns.to_ne_bytes());
+        v.extend_from_slice(&sup.to_ne_bytes());
+        v.extend_from_slice(&0u32.to_ne_bytes()); // _pad
+        (k, v)
+    }
+
+    #[test]
+    fn parses_a_pending_coalesce_entry() {
+        let (k, v) = coalesce_bytes(30287776, 271581186, 81, 1_000_000_000, 12);
+        let e = CoalesceEntry::parse(&k, &v).expect("should parse");
+        assert_eq!(e.exe_ino, 30287776);
+        assert_eq!(e.exe_dev, 271581186);
+        assert_eq!(e.dev_major, 81);
+        assert_eq!(e.last_ns, 1_000_000_000);
+        assert_eq!(e.suppressed, 12);
+    }
+
+    #[test]
+    fn a_burst_is_stale_only_after_the_window_and_only_if_it_suppressed_anything() {
+        let (k, v) = coalesce_bytes(1, 2, 81, 1_000_000_000, 12);
+        let e = CoalesceEntry::parse(&k, &v).unwrap();
+        let window = 2_000_000_000u64; // 2s
+
+        assert!(!e.is_stale(1_500_000_000, window), "still inside the window");
+        assert!(e.is_stale(3_500_000_000, window), "window has passed");
+
+        // Nothing suppressed => nothing to report, regardless of age.
+        let (k2, v2) = coalesce_bytes(1, 2, 81, 1_000_000_000, 0);
+        let quiet = CoalesceEntry::parse(&k2, &v2).unwrap();
+        assert!(!quiet.is_stale(9_999_999_999, window));
+    }
+
+    #[test]
+    fn clearing_preserves_the_window_timestamp() {
+        // Resetting the counter must not restart the coalescing window, or a
+        // long burst would re-notify every time it is flushed.
+        let (k, v) = coalesce_bytes(1, 2, 81, 1_234_567_890, 12);
+        let e = CoalesceEntry::parse(&k, &v).unwrap();
+        let cleared = e.cleared_value();
+        let back = CoalesceEntry::parse(&k, &cleared).unwrap();
+        assert_eq!(back.last_ns, 1_234_567_890);
+        assert_eq!(back.suppressed, 0);
+    }
+
+    #[test]
+    fn rejects_short_coalesce_buffers() {
+        let (k, v) = coalesce_bytes(1, 2, 81, 0, 0);
+        assert!(CoalesceEntry::parse(&k[..15], &v).is_none());
+        assert!(CoalesceEntry::parse(&k, &v[..11]).is_none());
+    }
+
+    #[test]
+    fn monotonic_clock_advances_and_is_nonzero() {
+        let a = monotonic_ns();
+        assert!(a > 0);
+        let b = monotonic_ns();
+        assert!(b >= a, "CLOCK_MONOTONIC must never go backwards");
     }
 
     #[test]

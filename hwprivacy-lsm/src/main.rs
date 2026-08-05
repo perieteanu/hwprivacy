@@ -32,7 +32,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Local;
 use clap::Parser;
 use device_index::{DeviceIndex, DeviceRole};
-use event::DevEvent;
+use event::{monotonic_ns, CoalesceEntry, DevEvent};
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
 use libbpf_rs::{MapCore, MapFlags, RingBufferBuilder};
 use policy::Policy;
@@ -284,6 +284,9 @@ fn main() -> Result<()> {
 
     let reported = Arc::new(AtomicU64::new(0));
     let index = Arc::new(Mutex::new(DeviceIndex::new()));
+    // (exe_dev, exe_ino) -> path, so a burst summary can name the binary even
+    // after the process has exited.
+    let seen_exe: Arc<Mutex<HashMap<(u32, u64), String>>> = Arc::new(Mutex::new(HashMap::new()));
     let tallies: Arc<Mutex<HashMap<(u64, u32, u32), Tally>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let mut builder = RingBufferBuilder::new();
@@ -294,6 +297,7 @@ fn main() -> Result<()> {
         let reported = reported.clone();
         let index = index.clone();
         let tallies = tallies.clone();
+        let seen_exe = seen_exe.clone();
 
         builder
             .add(&skel.maps.events, move |data: &[u8]| {
@@ -331,6 +335,10 @@ fn main() -> Result<()> {
                 let exe = e
                     .resolve_exe()
                     .unwrap_or_else(|| format!("<exited:{}>", e.comm));
+                seen_exe
+                    .lock()
+                    .unwrap()
+                    .insert((e.exe_dev, e.exe_ino), exe.clone());
 
                 if cli_sum {
                     let now = Local::now().format("%H:%M:%S").to_string();
@@ -361,6 +369,9 @@ fn main() -> Result<()> {
 
     let started = std::time::Instant::now();
     let mut stop_reason = StopReason::Interrupted;
+    let mut last_flush = std::time::Instant::now();
+    let coalesce_ns = cli.coalesce_ms * 1_000_000;
+    let accounted = Arc::new(AtomicU64::new(0));
 
     while running.load(Ordering::SeqCst) {
         // Errors here are almost always EINTR from our own signal handler.
@@ -378,6 +389,29 @@ fn main() -> Result<()> {
             stop_reason = StopReason::DurationElapsed;
             break;
         }
+
+        // Report bursts that have gone quiet. Cheap: the map holds one entry
+        // per (executable, device class) that has been active.
+        if last_flush.elapsed() >= Duration::from_millis(500) {
+            last_flush = std::time::Instant::now();
+            let seen = seen_exe.lock().unwrap().clone();
+            match flush_stale_bursts(&skel.maps.coalesce, coalesce_ns, &seen, cli.json) {
+                Ok(n) => accounted.fetch_add(n, Ordering::SeqCst),
+                Err(e) => {
+                    eprintln!("hwprivacy-lsm: burst flush failed: {e:#}");
+                    0
+                }
+            };
+        }
+    }
+
+    // Final flush: a burst that ended moments before exit must still be
+    // accounted for, otherwise the closing count under-reports.
+    {
+        let seen = seen_exe.lock().unwrap().clone();
+        if let Ok(n) = flush_stale_bursts(&skel.maps.coalesce, 0, &seen, cli.json) {
+            accounted.fetch_add(n, Ordering::SeqCst);
+        }
     }
 
     if cli.summarize {
@@ -385,16 +419,96 @@ fn main() -> Result<()> {
     }
 
     if !cli.json {
+        let ev = reported.load(Ordering::SeqCst);
+        let extra = accounted.load(Ordering::SeqCst);
         eprintln!(
-            "\nhwprivacy-lsm: stopped ({}) after {}s. {} event(s) reported.",
+            "\nhwprivacy-lsm: stopped ({}) after {}s. {} event(s) reported, \
+             covering {} device open(s).",
             stop_reason.describe(),
             started.elapsed().as_secs(),
-            reported.load(Ordering::SeqCst)
+            ev,
+            ev + extra
         );
         eprintln!("hwprivacy-lsm: detached — device access is now unmonitored again.");
     }
 
     Ok(())
+}
+
+/// Report bursts that have gone quiet, then clear their counters.
+///
+/// The kernel attaches a burst's suppressed count to the NEXT emitted event.
+/// A burst that happens once never gets a next event, so the count is stranded
+/// in the map. Measured 2026-08-05: a Firefox camera session produced 13 opens,
+/// exactly one was reported, and the other twelve were invisible — a security
+/// log claiming "1 denied" when 13 were denied.
+///
+/// Returns how many opens were newly accounted for.
+fn flush_stale_bursts(
+    map: &libbpf_rs::Map,
+    window_ns: u64,
+    seen_exe: &HashMap<(u32, u64), String>,
+    json: bool,
+) -> Result<u64> {
+    let now = monotonic_ns();
+    let mut pending: Vec<CoalesceEntry> = Vec::new();
+
+    for key in map.keys() {
+        let Some(val) = map.lookup(&key, MapFlags::ANY)? else {
+            continue;
+        };
+        if let Some(e) = CoalesceEntry::parse(&key, &val) {
+            if e.is_stale(now, window_ns) {
+                pending.push(e);
+            }
+        }
+    }
+
+    let mut total = 0u64;
+    for e in &pending {
+        total += e.suppressed as u64;
+        let who = seen_exe
+            .get(&(e.exe_dev, e.exe_ino))
+            .cloned()
+            .unwrap_or_else(|| format!("<dev={} ino={}>", e.exe_dev, e.exe_ino));
+        let kind = if e.dev_major == device_index::V4L2_MAJOR {
+            "CAMERA"
+        } else {
+            "AUDIO"
+        };
+
+        if json {
+            println!(
+                r#"{{"ts":"{}","kind":"burst_summary","role":"{}","exe":"{}","exe_dev":{},"exe_ino":{},"additional_opens":{}}}"#,
+                Local::now().to_rfc3339(),
+                kind,
+                escape(&who),
+                e.exe_dev,
+                e.exe_ino,
+                e.suppressed,
+            );
+        } else {
+            println!(
+                "{:<8}  {:<8}  {:<7}  burst closed: {} further open(s) by {}",
+                Local::now().format("%H:%M:%S"),
+                "(burst)",
+                kind,
+                e.suppressed,
+                who,
+            );
+        }
+
+        // Clear the counter but KEEP last_ns — restarting the window here would
+        // make a long burst re-notify on every flush.
+        let mut k = [0u8; 16];
+        k[0..8].copy_from_slice(&e.exe_ino.to_ne_bytes());
+        k[8..12].copy_from_slice(&e.exe_dev.to_ne_bytes());
+        k[12..16].copy_from_slice(&e.dev_major.to_ne_bytes());
+        map.update(&k, &e.cleared_value(), MapFlags::EXIST)
+            .context("failed to clear a coalescing counter")?;
+    }
+
+    Ok(total)
 }
 
 /// Read the policy map back out of the kernel and print what it actually
