@@ -149,6 +149,8 @@ Costin's last instruction was "none of them yet" — he stopped to wrap up.
 - **README.md is uncorrected.** It still presents camera as protected and
   documents D-Bus signals that are never emitted. `CLAUDE.md` lists exactly
   which of its claims to distrust.
-- **No git.** 3.2 GB, no version control, no undo. `.gitignore target/` before
-  any first commit.
 - The LSM hook cost, `.deb` packaging, portability, and audio enforcement.
+
+**Now done (was listed here, corrected 2026-08-05):** git exists — 2 commits,
+`.git` is 864 KB against a 4.1 GB tree, `target/` and the machine-specific
+`vmlinux.h` ignored.
