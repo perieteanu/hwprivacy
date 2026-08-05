@@ -427,7 +427,7 @@ fn main() -> Result<()> {
                 if let Some(tx) = &to_daemon {
                     let _ = tx.send(Reply::Event(AccessEvent {
                         ts_unix: Local::now().timestamp(),
-                        exe: exe.clone(),
+                        exe_path: exe.clone(),
                         pid: e.tgid,
                         device: device.clone(),
                         role: role.label().to_string(),
@@ -619,10 +619,10 @@ fn replace_policy(
     let mut unresolved = Vec::new();
 
     for e in entries {
-        let path = std::path::Path::new(&e.exe);
+        let path = std::path::Path::new(&e.exe_path);
         if !path.is_absolute() {
             unresolved.push(UnresolvedEntry {
-                exe: e.exe.clone(),
+                exe_path: e.exe_path.clone(),
                 reason: "not an absolute path".into(),
             });
             continue;
@@ -632,7 +632,7 @@ fn replace_policy(
                 *wanted.entry(k.to_bytes()).or_insert(0) |= e.perms;
             }
             Err(err) => unresolved.push(UnresolvedEntry {
-                exe: e.exe.clone(),
+                exe_path: e.exe_path.clone(),
                 reason: format!("{err:#}"),
             }),
         }
@@ -676,7 +676,7 @@ fn read_policy(map: &libbpf_rs::Map) -> Result<Vec<PolicyEntry>> {
             _ => 0,
         };
         out.push(PolicyEntry {
-            exe: format!("<dev={dev} ino={ino}>"),
+            exe_path: format!("<dev={dev} ino={ino}>"),
             perms,
         });
     }

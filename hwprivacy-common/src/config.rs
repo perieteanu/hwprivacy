@@ -46,6 +46,11 @@ impl std::str::FromStr for Permission {
 }
 
 /// Per-app rule entry in config.
+///
+/// One rule governs both enforcement layers. `app_name` is matched against
+/// PipeWire's self-declared `application.name`; `exe_path` is matched by the
+/// kernel against the calling task's executable inode. They answer different
+/// questions and neither replaces the other — see `docs-yaml/ARCHITECTURE.yaml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppRule {
     pub app_name: String,
@@ -55,6 +60,21 @@ pub struct AppRule {
     pub camera: Permission,
     #[serde(default = "default_deny")]
     pub monitor: Permission,
+
+    /// Absolute path to the REAL executable, for the kernel (eBPF LSM) layer.
+    ///
+    /// Must be the binary that actually opens the device, not a launcher:
+    /// `/usr/lib/firefox-esr/firefox-esr`, never `/usr/bin/firefox` — the
+    /// latter is a shell script on Debian and would never match. Find it with
+    /// `hwprivacy-lsm` in observe mode, which prints the resolved path.
+    ///
+    /// Absent means "this rule is PipeWire-only" — the kernel layer ignores it,
+    /// and under kernel default-deny that application gets no camera.
+    ///
+    /// Named `exe_path` rather than `exe`: on a Linux tool `exe` reads like a
+    /// Windows binary extension, which is exactly how it was first misread.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe_path: Option<String>,
 }
 
 fn default_deny() -> Permission {
@@ -249,6 +269,12 @@ impl Config {
                 microphone: Permission::Deny,
                 camera: Permission::Deny,
                 monitor: Permission::Deny,
+                // A rule created from a PipeWire prompt knows no executable.
+                // The kernel layer therefore ignores it until a path is added
+                // by hand — which is correct: guessing a binary from a
+                // self-declared application.name would be exactly the kind of
+                // silent mismatch this project keeps getting bitten by.
+                exe_path: None,
             };
             rule.set_permission(category, perm);
             self.rules.push(rule);
@@ -287,6 +313,52 @@ impl Config {
     }
 }
 
+impl Config {
+    /// Executable paths this config allows to use the camera at the KERNEL
+    /// layer, as `(exe_path, permission)` pairs.
+    ///
+    /// Only `Permission::Allow` qualifies. The kernel layer is binary — a
+    /// process either may open `/dev/video0` or may not — so the prompting
+    /// levels have no meaning there:
+    ///
+    /// * `ask` / `ask_each` cannot be honoured: an LSM hook returns a verdict
+    ///   in nanoseconds and cannot wait for a human. Treated as deny.
+    /// * `while_in_use` has no kernel equivalent either. Treated as deny.
+    ///
+    /// A rule with no `exe_path` is PipeWire-only and is skipped.
+    pub fn kernel_camera_allowlist(&self) -> Vec<(String, Permission)> {
+        self.rules
+            .iter()
+            .filter(|r| r.camera == Permission::Allow)
+            .filter_map(|r| r.exe_path.clone().map(|p| (p, r.camera)))
+            .collect()
+    }
+
+    /// Rules that ask for camera access but cannot get it at the kernel layer
+    /// because they name no executable, with the reason.
+    ///
+    /// Worth surfacing rather than dropping: under kernel default-deny, a rule
+    /// that reads `camera = "allow"` in config.toml but has no `exe_path`
+    /// silently does nothing, which looks exactly like a broken allowlist.
+    pub fn kernel_camera_gaps(&self) -> Vec<(String, &'static str)> {
+        self.rules
+            .iter()
+            .filter(|r| r.exe_path.is_none())
+            .filter_map(|r| match r.camera {
+                Permission::Allow => Some((
+                    r.app_name.clone(),
+                    "camera = allow but no exe_path — the kernel layer will still deny it",
+                )),
+                Permission::Ask | Permission::AskEach | Permission::WhileInUse => Some((
+                    r.app_name.clone(),
+                    "prompting permissions have no kernel equivalent; treated as deny there",
+                )),
+                Permission::Deny => None,
+            })
+            .collect()
+    }
+}
+
 /// See [`Config::normalized_key`]. Free function so internal callers can use
 /// it without going through `Config`.
 pub fn normalize_app_name(app_name: &str) -> String {
@@ -295,4 +367,122 @@ pub fn normalize_app_name(app_name: &str) -> String {
         _ => app_name,
     };
     trimmed.trim().to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DeviceCategory;
+
+    fn rule(app: &str, cam: Permission, exe: Option<&str>) -> AppRule {
+        AppRule {
+            app_name: app.into(),
+            microphone: Permission::Deny,
+            camera: cam,
+            monitor: Permission::Deny,
+            exe_path: exe.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn normalize_strips_one_bracket_suffix_and_lowercases() {
+        assert_eq!(normalize_app_name("OBS [pipewire-pulse]"), "obs");
+        assert_eq!(normalize_app_name("Firefox"), "firefox");
+        assert_eq!(normalize_app_name("  Spaced  "), "spaced");
+    }
+
+    /// The live config has a rule named `Firefox [pipewire-pulse] (pid:2332)`.
+    /// It ends with ')', not ']', so nothing is stripped and it can never
+    /// match. This is the trap that produced three dead rules.
+    #[test]
+    fn a_pid_suffix_is_not_stripped_and_the_rule_is_dead() {
+        let key = normalize_app_name("Firefox [pipewire-pulse] (pid:2332)");
+        assert_ne!(key, "firefox", "must not accidentally match");
+        assert!(key.contains("pid:2332"), "the pid survives normalization: {key}");
+    }
+
+    #[test]
+    fn only_allow_with_an_exe_path_reaches_the_kernel_layer() {
+        let mut c = Config::default();
+        c.rules = vec![
+            rule("firefox", Permission::Allow, Some("/usr/lib/firefox-esr/firefox-esr")),
+            rule("obs", Permission::Allow, None),                 // no path -> skipped
+            rule("discord", Permission::Deny, Some("/usr/bin/discord")),
+            rule("zoom", Permission::AskEach, Some("/usr/bin/zoom")),
+        ];
+        let allow = c.kernel_camera_allowlist();
+        assert_eq!(allow.len(), 1, "{allow:?}");
+        assert_eq!(allow[0].0, "/usr/lib/firefox-esr/firefox-esr");
+    }
+
+    /// Prompting levels cannot be honoured by an LSM hook — it must answer in
+    /// nanoseconds and cannot wait for a human. They must NOT silently become
+    /// allow.
+    #[test]
+    fn prompting_permissions_never_become_a_kernel_allow() {
+        for p in [Permission::Ask, Permission::AskEach, Permission::WhileInUse] {
+            let mut c = Config::default();
+            c.rules = vec![rule("x", p, Some("/usr/bin/x"))];
+            assert!(
+                c.kernel_camera_allowlist().is_empty(),
+                "{p} must not reach the kernel allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_that_wants_the_camera_but_names_no_binary_is_reported() {
+        let mut c = Config::default();
+        c.rules = vec![rule("obs", Permission::Allow, None)];
+        let gaps = c.kernel_camera_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].1.contains("no exe_path"), "{:?}", gaps[0]);
+    }
+
+    #[test]
+    fn a_plain_deny_rule_is_not_reported_as_a_gap() {
+        let mut c = Config::default();
+        c.rules = vec![rule("spyware", Permission::Deny, None)];
+        assert!(c.kernel_camera_gaps().is_empty(), "deny needs no exe_path");
+    }
+
+    /// Existing configs have no exe_path. They must load unchanged, and must
+    /// not gain a null field when the daemon rewrites the file.
+    #[test]
+    fn configs_without_exe_path_round_trip_cleanly() {
+        let toml_in = r#"
+[[rules]]
+app_name = "firefox"
+microphone = "ask_each"
+camera = "deny"
+monitor = "deny"
+"#;
+        let c: Config = toml::from_str(toml_in).expect("old config must still parse");
+        assert_eq!(c.rules.len(), 1);
+        assert!(c.rules[0].exe_path.is_none());
+
+        let out = toml::to_string_pretty(&c).unwrap();
+        assert!(!out.contains("exe_path"), "must not write a null field:\n{out}");
+    }
+
+    #[test]
+    fn exe_path_survives_a_config_round_trip() {
+        let mut c = Config::default();
+        c.rules = vec![rule("firefox", Permission::Allow, Some("/usr/lib/firefox-esr/firefox-esr"))];
+        let out = toml::to_string_pretty(&c).unwrap();
+        let back: Config = toml::from_str(&out).unwrap();
+        assert_eq!(
+            back.rules[0].exe_path.as_deref(),
+            Some("/usr/lib/firefox-esr/firefox-esr")
+        );
+    }
+
+    #[test]
+    fn get_permission_falls_back_to_the_default_action() {
+        let c = Config::default();
+        assert_eq!(
+            c.get_permission("never-seen", &DeviceCategory::Camera),
+            c.policy.default_action
+        );
+    }
 }

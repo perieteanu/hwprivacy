@@ -45,7 +45,10 @@ pub const PERM_AUDIO: u32 = 1 << 1;
 pub struct PolicyEntry {
     /// Absolute path to the REAL executable. Not a wrapper script:
     /// `/usr/lib/firefox-esr/firefox-esr`, never `/usr/bin/firefox`.
-    pub exe: String,
+    ///
+    /// Named `exe_path`, not `exe`: on a Linux tool `exe` reads like a Windows
+    /// binary extension, which is exactly how it was first misread.
+    pub exe_path: String,
     pub perms: u32,
 }
 
@@ -55,7 +58,7 @@ pub struct PolicyEntry {
 /// costs an application its camera, which is the hardest failure to debug.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnresolvedEntry {
-    pub exe: String,
+    pub exe_path: String,
     pub reason: String,
 }
 
@@ -108,7 +111,7 @@ pub struct AccessEvent {
     pub ts_unix: i64,
     /// Resolved executable path, or a `<dev=..,ino=..>` placeholder if the
     /// process exited before it could be read.
-    pub exe: String,
+    pub exe_path: String,
     pub pid: u32,
     /// e.g. `/dev/video0`.
     pub device: String,
@@ -153,7 +156,7 @@ mod tests {
             },
             Request::SetPolicy {
                 entries: vec![PolicyEntry {
-                    exe: "/usr/lib/firefox-esr/firefox-esr".into(),
+                    exe_path: "/usr/lib/firefox-esr/firefox-esr".into(),
                     perms: PERM_CAMERA,
                 }],
                 enforce_camera: true,
@@ -180,13 +183,13 @@ mod tests {
             Reply::PolicyApplied {
                 applied: 2,
                 unresolved: vec![UnresolvedEntry {
-                    exe: "/nope".into(),
+                    exe_path: "/nope".into(),
                     reason: "cannot stat".into(),
                 }],
             },
             Reply::Event(AccessEvent {
                 ts_unix: 1_770_000_000,
-                exe: "/usr/lib/firefox-esr/firefox-esr".into(),
+                exe_path: "/usr/lib/firefox-esr/firefox-esr".into(),
                 pid: 3271,
                 device: "/dev/video0".into(),
                 role: "CAMERA".into(),
@@ -212,7 +215,7 @@ mod tests {
         let nasty = "/tmp/we\"ird\\path\nwith-newline";
         let msg = Reply::Event(AccessEvent {
             ts_unix: 0,
-            exe: nasty.into(),
+            exe_path: nasty.into(),
             pid: 1,
             device: "/dev/video0".into(),
             role: "CAMERA".into(),
@@ -233,7 +236,7 @@ mod tests {
     fn burst_accounting_is_explicit() {
         let single = AccessEvent {
             ts_unix: 0,
-            exe: "/x".into(),
+            exe_path: "/x".into(),
             pid: 1,
             device: "/dev/video0".into(),
             role: "CAMERA".into(),
