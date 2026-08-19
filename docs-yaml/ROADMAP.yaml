@@ -282,6 +282,57 @@ kernel_layer:
       - "event log: 4 bursts -> 4 rows, not 8"
     regression_guard: "tools/camera-accounting-check, plus 4 unit tests in lsm_client"
 
+  d1_closed_2026_08_19:
+    status: "CLOSED. Proven both directions with the user's own Firefox-ESR, seen on screen."
+    subject: "Firefox-ESR /usr/lib/firefox-esr/firefox-esr, inode 30287776. Agreed as THE test browser."
+    allow_direction:
+      config: 'firefox camera = "allow"'
+      kernel: "denied=False, 13 opens (1 event + burst_summary +12)"
+      observed: "live video in the call"
+    deny_direction:
+      config: 'firefox camera = "deny"  (one line changed, nothing else)'
+      preconditions_verified_first: >
+        Allowed binaries dropped to 0, the helper independently logged
+        'policy set by daemon - 0 allowed', no process held /dev/video*, and a
+        probe confirmed 3/3 denied seconds before the test. So a retained fd
+        and a policy that never landed were BOTH excluded in advance.
+      kernel: "denied=True, 4 opens (1 event + burst_summary +3), same inode 30287776"
+      observed: "WhatsApp: 'Camera or microphone not found'. No video content."
+    why_the_app_blames_the_microphone_too: >
+      getUserMedia({audio, video}) fails as a unit, so a camera-only denial
+      reads to the app as both devices missing. Predicted from the 2026-08-05
+      WhatsApp measurement and reproduced exactly.
+    what_had_made_it_look_broken:
+      - "Retained fd: the hook is on open(), not read. A camera opened BEFORE enforcement starts keeps working. The test harness now refuses to run while anything holds /dev/video*."
+      - "Two Firefox builds: ~/firefox-developer/firefox-bin is inode 1312111 and was never allowlisted, while config.toml reads 'firefox: camera allow'. Calls from Developer Edition are correctly denied and look like a bug."
+      - "PipeWire microphone prompts fire during a video call, duplicated (b3), from the old untrusted layer — easily read as the tool misbehaving."
+
+  reconnect_delay_observed_2026_08_19:
+    severity: medium
+    what: "After a daemon restart the policy push took ~51s, not the ~10s RECONNECT_SECS implies."
+    evidence: "daemon 805082 logged 'connected' at 20:11:39; '1 executable(s) allowed' only at 20:12:30. Seen at least twice."
+    why_it_matters: >
+      For that window the helper keeps enforcing the PREVIOUS policy. Denying
+      longer than expected is harmless; GRANTING later than expected is not —
+      restart the daemon to allow an app and it stays denied for up to a
+      minute with no indication. A plausible contributor to the original D1
+      confusion, where a restart sat between the deny and allow steps.
+    status: "observed, not diagnosed. Do not guess — instrument the connect/push path."
+
+  b1_scope_correction_2026_08_19:
+    finding: >
+      b1 is narrower than every doc states. Dismissing writes a permanent deny
+      only on the PLAIN `ask` path. On `ask_each` the per-stream branch calls
+      grant_one_shot() or logs StreamDenied and NEVER calls config.set_rule().
+    evidence: >
+      Four mic prompts were dismissed during the 2026-08-19 call with firefox
+      microphone = ask_each; config.toml was unchanged, mtime untouched, all 8
+      rules identical.
+    still_dangerous: >
+      default_action = 'ask', so any app WITHOUT a rule is on the writing path.
+      The defect is real; its blast radius is smaller than 'dismissing a
+      notification writes a permanent deny rule' implies.
+
   d1_mechanism_proven_2026_08_19:
     status: "The MECHANISM is proven. Firefox specifically is still untested."
     evidence: >

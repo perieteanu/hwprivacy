@@ -14,7 +14,7 @@ where.
 |---|---|---|
 | 1 | observe-only eBPF LSM | **validated live** |
 | 2 | camera enforcement | **PROVEN** — acceptance 5/5, denied live against Firefox/WhatsApp |
-| 3 | daemon integration | **12/13** — C5 settled 2026-08-19 (defect found + fixed, re-verify pending). D1 mechanism proven |
+| 3 | daemon integration | **13/13 — COMPLETE** (2026-08-19) |
 | 4 | systemd unit for the helper | not started |
 | 5 | audio backstop | agreed in principle, not started |
 
@@ -90,25 +90,25 @@ The event log also shows one row per session again, not two — four bursts
 produced exactly four DENIED rows, where before each session added a second
 row with pid 0. C5 is closed.
 
-### 2. D1 — the MECHANISM is proven; Firefox specifically is not
+### 2. D1 — CLOSED 2026-08-19. Proven both directions, on screen
 
-With Chrome allowlisted by inode (`exe_path = /opt/google/chrome/chrome`):
+Firefox-ESR (inode 30287776), one config line changed between the two runs:
 
-```
-chrome /dev/video1 denied=True    <- before allowlisting
-chrome /dev/video1 denied=True    <- reproduced
-chrome /dev/video1 denied=False   <- after adding the rule
-```
+| | policy | kernel verdict | on screen |
+|---|---|---|---|
+| 20:02 | `camera = "allow"` | `denied=False`, 13 opens | live video |
+| 20:10 | `camera = "deny"` | `denied=True`, 4 opens | "Camera or microphone not found" |
 
-So allowlisting by executable inode works end-to-end, and H1 (the empty-allowlist
-reconnect window) is not a standing bug: reconnect after a daemon restart and the
-policy push that follows it both work — the helper logged `policy set by daemon —
-2 allowed` for the new client.
+Both confounds were excluded **before** the deny run, not argued away after:
+`Allowed binaries` was 0, the helper independently logged `0 allowed`, nothing
+held `/dev/video*`, and a probe confirmed 3/3 denied seconds earlier.
 
-What remains open is **Firefox specifically**, which is a question about
-Firefox's own state, not about whether hwprivacy works. Costin also wants
-headless Firefox and other launchable local software (VLC was mentioned) added
-as test subjects — **discuss before building; do not start this unprompted.**
+Enforcement works. What had made it look broken: a retained fd (the hook is on
+`open()`, not read), two Firefox builds with different inodes where only one is
+allowlisted, and loud duplicated microphone prompts from the old layer during
+any video call.
+
+**Phase 3 is 13/13.**
 
 ### 3. Phase 4 — systemd unit for the helper
 

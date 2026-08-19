@@ -96,3 +96,24 @@ credit:
     Standing global preference: if this is published or treated as a portfolio
     item, add the discreet collaborator line to README Credits and keep the
     Co-Authored-By trailer. Costin is author of record.
+
+test_subjects:
+  browser: >
+    Firefox-ESR (/usr/lib/firefox-esr/firefox-esr, inode 30287776) is THE test
+    browser, agreed 2026-08-19. It is the binary config.toml allowlists.
+  why_this_must_be_stated: >
+    Two Firefox builds run on this machine and they are DIFFERENT POLICY KEYS:
+    ~/firefox-developer/firefox-bin is inode 1312111 and appears in no rule.
+    The kernel keys on the executable's inode, so 'allowlist Firefox' silently
+    means 'allowlist one build of Firefox'. Testing in the wrong window
+    produces a correct denial that reads as a bug. Check via Help > About, or
+    about:support > Application Binary.
+  automated_driver: >
+    Headless Chrome opens the real /dev/video0 through V4L2 with
+    --use-fake-ui-for-media-stream (real device; NOT --use-fake-device). Claude
+    can drive it unattended, as a fresh process each time, so the retained-fd
+    confound cannot occur. Used for accounting checks that need no human.
+  not_yet_agreed: >
+    Headless Firefox and other local software (VLC was raised) as additional
+    subjects. DISCUSS BEFORE BUILDING — Costin asked explicitly not to start
+    this unprompted.

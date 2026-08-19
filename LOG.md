@@ -89,3 +89,9 @@
 19-08-2026 19:55 | Wed | hw | [add] tools/camera-accounting-check — C5 as a repeatable check, no browser and no human
 19-08-2026 19:56 | Wed | hw | [done] C5 CLOSED — fix verified live at 1/5/13/27 opens and with headless Chrome, all exact
 19-08-2026 19:57 | Wed | hw | [done] event log now one row per session, not two; the pid-0 duplicate is gone
+19-08-2026 20:02 | Wed | hw | [done] D1 allow direction: Firefox-ESR camera ALLOWED, 13 opens, live video on screen
+19-08-2026 20:10 | Wed | hw | [done] D1 deny direction: same inode DENIED, 4 opens, no video — WhatsApp reported no camera/mic
+19-08-2026 20:11 | Wed | hw | [done] PHASE 3 COMPLETE 13/13 — both confounds excluded before the run, not argued away after
+19-08-2026 20:12 | Wed | hw | [note] b1 is NARROWER than documented: ask_each never writes config; only the plain ask path does
+19-08-2026 20:12 | Wed | hw | [note] reconnect after daemon restart took ~51s not ~10s — helper enforces the OLD policy meanwhile
+19-08-2026 20:13 | Wed | hw | [decide] Firefox-ESR is THE test browser; firefox-bin is a different inode and not allowlisted
