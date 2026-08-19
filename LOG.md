@@ -87,3 +87,5 @@
 19-08-2026 19:49 | Wed | hw | [fix] PipeWire cooldown path double-counted: log_event already increments blocked_count
 19-08-2026 19:50 | Wed | hw | [add] denied_opens() as the single accounting rule + 4 tests incl. the measured 13-open case
 19-08-2026 19:55 | Wed | hw | [add] tools/camera-accounting-check — C5 as a repeatable check, no browser and no human
+19-08-2026 19:56 | Wed | hw | [done] C5 CLOSED — fix verified live at 1/5/13/27 opens and with headless Chrome, all exact
+19-08-2026 19:57 | Wed | hw | [done] event log now one row per session, not two; the pid-0 duplicate is gone

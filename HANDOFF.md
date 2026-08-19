@@ -54,7 +54,7 @@ Test script: `~/projects/claude-run/hwprivacy-phase3-test-20260805.sh`
 Criteria and full result: `docs-yaml/ROADMAP.yaml > kernel_layer >
 phase_3_acceptance_criteria` and `> phase_3_result_2026_08_05`.
 
-### 1. C5 — SETTLED 2026-08-19. Measured, defect found, fixed, not yet re-verified live
+### 1. C5 — CLOSED 2026-08-19. Measured, defect found, fixed, verified live
 
 Driven with a deterministic 13-open burst from one unprivileged process — no
 browser, no notification, no human as the sensor:
@@ -76,9 +76,19 @@ event log for a session that had only one real access.
 statement of the rule, with tests including the exact 13-open measurement and
 one pinning `log_event`'s hidden side effect.
 
-**Still to do: re-run `tools/camera-accounting-check` against a live helper to
-confirm the fix on the machine, not just in tests.** The measurement was taken
-before the fix; nothing has verified it after.
+**Re-verified live 2026-08-19 19:55**, after the fix, against a running helper:
+
+```
+tools/camera-accounting-check --opens 1   -> kernel 1,  daemon 1   PASS
+tools/camera-accounting-check --opens 5   -> kernel 5,  daemon 5   PASS
+tools/camera-accounting-check --opens 13  -> kernel 13, daemon 13  PASS
+tools/camera-accounting-check --opens 27  -> kernel 27, daemon 27  PASS
+headless Chrome (a real browser)          -> kernel 2,  daemon 2   PASS
+```
+
+The event log also shows one row per session again, not two — four bursts
+produced exactly four DENIED rows, where before each session added a second
+row with pid 0. C5 is closed.
 
 ### 2. D1 — the MECHANISM is proven; Firefox specifically is not
 

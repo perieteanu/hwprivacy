@@ -251,6 +251,53 @@ kernel_layer:
       - "c4 is visual too: whether a notification actually appeared, and whether its wording reads right."
       - "Nothing here tests the audio path. Audio is Phase 5 and is deliberately untouched."
 
+  c5_closed_2026_08_19:
+    status: "CLOSED. Measured, defect found, fixed, and re-verified against a live kernel."
+    why_it_was_unverifiable_before: >
+      The test asked a human to start a video call in a browser that was
+      ALLOWLISTED, so nothing was denied and the counter could not move. It
+      also asserted only `delta >= 10`, which would have passed the very bug it
+      existed to catch.
+    how_it_was_measured: >
+      A deterministic burst from one unprivileged process opening /dev/video0 N
+      times inside the coalescing window. No browser, no notification, no human
+      as the sensor. Two independent sources compared: the helper's own --json
+      output (kernel truth) against Blocked attempts over D-Bus (daemon belief).
+    the_defect: >
+      A burst summary carries pid 0 and accounts for opens the kernel already
+      suppressed. It fell through to log_event(), which increments
+      blocked_count itself for a Denied action, on top of the additional_opens
+      it was reporting. A 13-open denied burst counted as 14. It also wrote a
+      second, pid-0 DENIED row into the user-visible event log for a session
+      with only one real access.
+    measured_before_fix:
+      - "13 opens denied -> kernel reported 13, daemon counted 14"
+      - "reproduced 3x; a constant +1, never proportional"
+    measured_after_fix:
+      - "opens 1 -> kernel 1, daemon 1"
+      - "opens 5 -> kernel 5, daemon 5"
+      - "opens 13 -> kernel 13, daemon 13"
+      - "opens 27 -> kernel 27, daemon 27"
+      - "headless Chrome (real browser) -> kernel 2, daemon 2"
+      - "event log: 4 bursts -> 4 rows, not 8"
+    regression_guard: "tools/camera-accounting-check, plus 4 unit tests in lsm_client"
+
+  d1_mechanism_proven_2026_08_19:
+    status: "The MECHANISM is proven. Firefox specifically is still untested."
+    evidence: >
+      With Chrome allowlisted by inode (exe_path = /opt/google/chrome/chrome):
+      denied before the rule existed, denied again on repeat, allowed after.
+      Allowlisting by executable inode works end-to-end.
+    h1_is_not_a_standing_bug: >
+      Reconnect after a daemon restart works, and so does the policy push that
+      follows it — the helper logged 'policy set by daemon - 2 allowed' for the
+      new client. The earlier 'Connected: no' readings were taken during the
+      10s retry gap, not a fault.
+    still_open: >
+      Firefox itself. That is a question about Firefox's own state, not about
+      whether hwprivacy works. Costin wants more subjects added (headless
+      Firefox, VLC, other launchable local software) — DISCUSS BEFORE BUILDING.
+
   phase_3_result_2026_08_05:
     status: "11 of 13 automated checks pass. Both failures are TEST bugs, but one hides an unverified feature."
     passing: "A1 A2 A3 A4 B3 B4 C1 C2 C3 C4 D2 D3 E2 — connection, reconnect, policy push, gap reporting, unresolved reporting, enforcement, event flow into the daemon, restore, non-interference"
