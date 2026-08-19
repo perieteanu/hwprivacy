@@ -349,7 +349,29 @@ kernel_layer:
 
   b5_helper_stops_accepting_clients:
     severity: critical
-    status: "DIAGNOSED 2026-08-19 22:06. Supersedes the earlier 'reconnect delay' entry, which described the SYMPTOM."
+    status: "FIXED 2026-08-19 22:20, with a regression test proven to fail on the old code. Supersedes the earlier 'reconnect delay' entry, which described the SYMPTOM."
+    root_cause: >
+      handle_connection() spawned a per-connection events thread that parked in
+      recv() on the broadcast channel. That channel's sender is owned by
+      SocketServer and lives as long as the process, so recv() NEVER returns
+      Err. The unconditional events_handle.join() at the end of the function
+      therefore blocked forever, the accept loop never ran again, and the log
+      printed "client disconnected" on the way into the wedge — which is why
+      the logs looked like a clean disconnect rather than a hang.
+    why_it_looked_intermittent: >
+      An incoming camera or mic event unblocked recv(), let the join finish and
+      the accept loop resume. On a quiet system nothing arrived and it hung
+      indefinitely. That is the whole of the "~51 second reconnect delay".
+    fix: >
+      The events thread now polls with recv_timeout and an AtomicBool stop flag,
+      so it exits within 200ms of the connection ending and releases the mutex
+      for the next client. A failed accept() no longer breaks the loop either —
+      one transient error must not turn the socket permanently deaf.
+    regression_test: >
+      socket::tests::a_second_client_is_accepted_after_the_first_disconnects —
+      connects, disconnects, connects twice more. Verified to FAIL (5.07s, read
+      timeout) against the reintroduced bug and pass against the fix. A test
+      that passes on both is worthless, so this was checked rather than assumed.
     what: >
       After its first client disconnects, hwprivacy-lsm does not reliably accept
       the next one. The daemon's connect() succeeds — a unix socket reports

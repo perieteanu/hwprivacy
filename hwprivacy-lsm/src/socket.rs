@@ -88,11 +88,16 @@ pub fn serve(path: &Path, group: &str) -> Result<SocketServer> {
                     handle_connection(s, req_tx, evt_rx);
                 }
                 Err(e) => {
-                    eprintln!("hwprivacy-lsm: accept failed: {e}");
-                    break;
+                    // Do NOT break. One failed accept is not a reason to stop
+                    // serving forever — that turns a transient error into a
+                    // permanently deaf socket, which is the same outcome b5
+                    // produced by a different route.
+                    eprintln!("hwprivacy-lsm: accept failed: {e} (still listening)");
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             }
         }
+        eprintln!("hwprivacy-lsm: accept loop ENDED — no further clients can connect");
     });
 
     Ok(SocketServer {
@@ -137,14 +142,37 @@ fn handle_connection(
     });
 
     // Forward broadcast events into this connection's writer.
+    //
+    // `stop` is not optional bookkeeping — without it this thread wedges the
+    // whole server. It parks in recv() on the broadcast channel, whose sender
+    // is owned by SocketServer and therefore lives as long as the process. So
+    // recv() NEVER returns Err, the thread never exits, and the join() at the
+    // end of this function blocks forever. The accept loop then never runs
+    // again and no further client is ever accepted, while the log cheerfully
+    // shows "client disconnected".
+    //
+    // That was b5, diagnosed 2026-08-19 after it wedged the daemon three times
+    // in twenty minutes. It looked intermittent because an incoming camera or
+    // mic event would unblock recv() and let the join complete — hence the
+    // "~51 second reconnect delay" that was really a stuck accept.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_for_events = stop.clone();
     let out_for_events = out_tx.clone();
     let events_handle = std::thread::spawn(move || {
         let rx = evt_rx.lock().unwrap();
-        while let Ok(ev) = rx.recv() {
-            if out_for_events.send(ev).is_err() {
-                break;
+        while !stop_for_events.load(std::sync::atomic::Ordering::SeqCst) {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(ev) => {
+                    if out_for_events.send(ev).is_err() {
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
+        // Dropping `rx` here releases the mutex, which is what lets the NEXT
+        // connection's events thread take it.
     });
 
     // Reader: this thread. One JSON object per line.
@@ -221,9 +249,11 @@ fn handle_connection(
     }
 
     eprintln!("hwprivacy-lsm: client disconnected ({peer})");
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(out_tx);
     let _ = writer_handle.join();
     let _ = events_handle.join();
+    eprintln!("hwprivacy-lsm: ready for the next client");
 }
 
 /// Who is on the other end, via `SO_PEERCRED`.
@@ -286,6 +316,69 @@ fn chown_group(path: &Path, gid: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// b5, 2026-08-19: after the first client disconnected, the server never
+    /// accepted another. The daemon's connect() still succeeded — a unix socket
+    /// reports ESTAB as soon as it is in the listen backlog — so it believed it
+    /// was connected and blocked forever on a reply that could not come.
+    /// Enforcement kept running on the last pushed policy, so nothing looked
+    /// broken while every config change silently stopped taking effect.
+    ///
+    /// The cause was a per-connection events thread parked in recv() on a
+    /// channel whose sender lives as long as the process, joined unconditionally
+    /// at the end of handle_connection.
+    ///
+    /// This test connects, disconnects, and connects AGAIN. Before the fix the
+    /// second connect is accepted by the kernel but never by us, so the request
+    /// never arrives and this times out.
+    #[test]
+    fn a_second_client_is_accepted_after_the_first_disconnects() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream;
+
+        let dir = std::env::temp_dir().join(format!("hwp-sock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.sock");
+
+        // The user's own group: resolvable, and chown to it needs no privilege.
+        // Same approach as resolves_the_users_own_group above.
+        let group = match std::env::var("USER") {
+            Ok(u) if lookup_gid(&u).is_ok() => u,
+            _ => return, // no resolvable group in this environment; nothing to assert
+        };
+
+        let server = serve(&path, &group).expect("serve");
+
+        // Stand in for the main loop: answer every request with Pong.
+        let requests = server.requests;
+        std::thread::spawn(move || {
+            while let Ok((_req, rep_tx)) = requests.recv() {
+                let _ = rep_tx.send(Reply::Pong);
+            }
+        });
+
+        let ping = |label: &str| {
+            let mut c = UnixStream::connect(&path)
+                .unwrap_or_else(|e| panic!("{label}: connect failed: {e}"));
+            c.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            c.write_all(b"{\"req\":\"ping\"}\n").unwrap();
+            c.flush().unwrap();
+            let mut line = String::new();
+            let n = BufReader::new(c.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap_or_else(|e| panic!("{label}: read failed (b5 regression): {e}"));
+            assert!(n > 0, "{label}: server never answered — b5 has regressed");
+            assert!(line.contains("pong"), "{label}: unexpected reply {line}");
+        };
+
+        ping("first client");
+        // First client is dropped here. The accept loop must come back.
+        ping("second client");
+        ping("third client");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn resolves_a_group_that_certainly_exists() {

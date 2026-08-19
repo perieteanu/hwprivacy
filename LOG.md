@@ -116,3 +116,7 @@
 19-08-2026 22:04 | Wed | hw | [decide] allow wireplumber the camera — Costin's call; restores the PipeWire camera node, costs kernel attribution
 19-08-2026 22:06 | Wed | hw | [note] b5 DIAGNOSED: helper stops accepting clients after the first disconnects; the "51s delay" was this
 19-08-2026 22:08 | Wed | hw | [add] ctl devices now shows a kernel-layer row — a camera absent from PipeWire is not an unprotected one
+19-08-2026 22:14 | Wed | hw | [note] allowing wireplumber alone changed nothing — /usr/bin/pipewire is what opens /dev/video0 to publish the node
+19-08-2026 22:18 | Wed | hw | [decide] revert the pipewire camera grant; wireplumber stays allowed. Granting pipewire would extend /dev/snd blindness to video
+19-08-2026 22:20 | Wed | hw | [fix] b5 FIXED — events thread parked in recv() forever, so join() wedged the accept loop after every disconnect
+19-08-2026 22:22 | Wed | hw | [add] b5 regression test, verified to FAIL against the reintroduced bug and pass against the fix
