@@ -15,7 +15,7 @@ decisions:
     consequences:
       - "Works for Firefox, Telegram, Chromium, OBS, anything — no per-app work."
       - "Identity is limited to what PipeWire exposes (see d-identity-by-pw-name)."
-      - "Cannot see inside a browser: one client, many tabs (answered by d-two-layer-model)."
+      - "Cannot see inside a browser: one client, many tabs (answered by d-per-stream-gating, formerly d-two-layer-model)."
     scope_correction_2026_08_04:
       finding: >
         The premise 'every audio/video device flows through PipeWire' is FALSE
@@ -44,10 +44,17 @@ decisions:
       - "Costin's verdict: 'the price of 1.2% of a core is very generous. i wouldnt pay such a price.'"
     status: "SUPERSEDED IN INTENT by d-event-driven-substrate. Still the shipped code."
 
-  - id: d-two-layer-model
+  - id: d-per-stream-gating
+    renamed_from: d-two-layer-model
+    renamed_on: "2026-08-19"
+    rename_reason: >
+      'Two-layer' was ambiguous after the 2026-08-04 kernel pivot. HERE it has
+      always meant app-rule + per-stream gating, a BROWSER-TAB problem entirely
+      inside the PipeWire layer. It does NOT mean PipeWire + kernel — that is
+      d-kernel-lsm-layer. This entry predates the kernel layer by four months.
     date: "2026-03-27"
     reconstructed: true
-    title: "Two-layer permission model to solve the browser problem"
+    title: "Per-stream gating to solve the browser problem (was: two-layer permission model)"
     context: >
       A browser is a mini OS: one 'Firefox' PipeWire client serves dozens of
       tabs. An app-level allow would grant every tab forever.
@@ -185,7 +192,15 @@ decisions:
 
   - id: d-event-driven-substrate
     date: "2026-08-04"
-    title: "DIRECTION SET: replace polling with an event-driven PipeWire substrate"
+    title: "LAYER 1 ONLY, DEFERRED: replace polling with an event-driven PipeWire substrate"
+    scope_note_2026_08_19: >
+      This entry applies to the PipeWire layer alone and is NOT the project's
+      current direction. It was written at 22:38 on 2026-08-04, two minutes
+      after the kernel pivot was logged and seventeen minutes before the first
+      kernel design decision — so it is the last word on a layer that had just
+      stopped being the whole project. Being last in this file made it read as
+      'what we are doing next', which it is not. Current direction is
+      d-kernel-lsm-layer; nothing here has been implemented.
     context: >
       Three separate complaints turned out to be one root cause. Polling
       pw-dump produces (a) 1.2% idle CPU, (b) the ~500ms race window, and
@@ -209,4 +224,73 @@ decisions:
         Genuinely better (blocks BEFORE the link exists, so zero data ever
         flows) but couples the project to WirePlumber's policy chain and its
         version churn. Keep as the v2/v3 goal after pipewire-rs lands.
-    status: "decided in direction, not yet implemented. No code written as of 2026-08-04."
+    status: "DEFERRED. Still no code as of 2026-08-19. Applies to layer 1; does not block or describe the kernel layer."
+
+  - id: d-kernel-lsm-layer
+    date: "2026-08-04"
+    title: "PIVOT: add a kernel eBPF LSM layer beneath PipeWire; both layers stay"
+    written_up: "2026-08-19"
+    written_up_note: >
+      Backfilled. The pivot happened on 2026-08-04 at 22:37 and was carried out
+      over the following day, but no ADR was ever written — MISSION.yaml,
+      ARCHITECTURE.yaml and DECISIONS.yaml were all last touched at 22:37-22:38,
+      before the first kernel design decision (22:40) and before the first line
+      of kernel code (22:55). For fifteen days this file recorded why the old
+      basis was wrong without recording what replaced it.
+    context: >
+      d-pipewire-graph-level rested on the premise that every audio/video device
+      flows through PipeWire. That premise was never tested and is false. Two
+      experiments on the live system settled it:
+        ffmpeg -f v4l2 -i /dev/video0  -> 90 frames captured, 0 events logged
+        ffmpeg -f alsa -i hw:0,0       -> 3s of mic audio,    0 events logged
+      Firefox and Chrome take the camera through V4L2 directly. No PipeWire node,
+      no link, nothing for the link-diff substrate to see. Not 'allowed', not
+      'missed' — structurally unobservable. Unfixable in the PipeWire layer.
+    decision: >
+      Add a second enforcement layer below PipeWire: an eBPF LSM program on
+      security_file_open, denying open() of camera (major 81) and ALSA (major
+      116) device nodes with -EPERM. A root helper (hwprivacy-lsm) owns the BPF
+      maps and serves an NDJSON unix socket; the existing user daemon connects
+      as a client and pushes policy. Both layers stay. Neither is sufficient
+      alone.
+    why_both_layers:
+      - "Kernel sees the camera but cannot attribute the microphone: /dev/snd is held by /usr/bin/pipewire, so the kernel cannot tell which app is behind it."
+      - "PipeWire knows the app ('Firefox wants the mic') but is blind to the camera entirely."
+      - "The playback-monitor feature has no kernel equivalent — there is no straightforward way to tap a sink monitor below PipeWire. That feature is the reason layer 1 is not merely legacy."
+    implementation:
+      new_crates:
+        hwprivacy-lsm:   "root helper + the BPF C program. ~2434 LOC."
+        hwprivacy-proto: "NDJSON wire protocol, serde only, so the root process links no D-Bus stack. ~271 LOC."
+      daemon_side: "lsm_client.rs — connects, reconnects, pushes the allowlist, receives kernel events. ~362 LOC."
+      unified_rule: "AppRule.exe_path governs BOTH layers. One rule, two enforcement points. Only `allow` + a present exe_path reaches the kernel map."
+      frontends: "Unchanged. Kernel events reach ctl/tui/gui through the existing D-Bus surface."
+    measured:
+      hook_cost: "+13.75 ns per open(), 95% CI [+7.3, +20.2] — 1.88% of a 733 ns open(), and 0% at idle."
+      contrast: "The PipeWire poll burns 1.2% of a core continuously, at idle, forever. Costin rejected that price; this one he did not."
+    proven:
+      phase_1: "observe-only LSM — validated live, attached first try."
+      phase_2: "camera enforcement — acceptance 5/5; denied live against Firefox and WhatsApp; access restored on detach."
+      phase_3: "daemon integration — 11/13. Connection, reconnect without restarting the daemon, policy push, gap reporting, enforcement, event flow to all three frontends, restore on detach, no interference with layer 1."
+    not_proven:
+      - "C5 burst counting — the test as written cannot verify it; the only denied app does not burst."
+      - "D1 — a call failed although firefox-esr was allowlisted. Two untested hypotheses, see HANDOFF.md."
+    consequences:
+      - "Enforcement cannot revoke an ALREADY-OPEN fd. The hook fires on open(), not on read. Costin saw live camera video with enforcement on because Firefox held the descriptor from earlier. Same class as g1/g2 in layer 1. A real limitation, not a bug — but it must be stated wherever the camera feature is described, because 'I enabled blocking and still saw video' is exactly how someone concludes the tool is broken."
+      - "Nothing is enforced at the kernel layer at rest. No systemd unit exists (Phase 4), the BPF program is never pinned, and killing the helper detaches it and restores normal access."
+      - "Kernel denials use an informational notification with NO action buttons — deliberately. Routing them through the action path would inherit b1 (dismiss writes a permanent deny) on day one."
+      - "Identity is now (dev, ino) of the executable, not a self-declared name. /usr/bin/firefox is a shell script; the real binaries are /usr/lib/firefox-esr/firefox-esr and ~/firefox-developer/firefox-bin, and they are different policy keys. That is the feature, not a bug."
+      - "Two dev_t encodings — glibc's and the kernel's — are a live trap. Decoding one with the other's rules yields major 0 and silently matches nothing while unit tests pass. This bit twice. All conversion now lives in device_index::glibc_to_kernel_dev()."
+      - "Audio enforcement at the kernel layer is agreed in principle and NOT started (Phase 5). Denying major 116 outright would deny /usr/bin/pipewire itself, which is every app's mic path."
+    rejected_alternative_1:
+      what: "Aya (pure-Rust eBPF) instead of libbpf-rs + one C file"
+      why_rejected: "Keeping the C minimal — no loops, no unbounded reads — is what keeps the verifier happy. libbpf+C is the conservative path for a program that must load on a stock Debian kernel."
+    alternatives_named_but_not_argued:
+      what: "AppArmor profiles and device-node ACLs, both listed in MISSION.yaml > what_would_fix_it"
+      honest_note: >
+        No contemporaneous rejection rationale was recorded for either. They were
+        named as candidates and eBPF was chosen; do not reconstruct a reason that
+        was never written down. If this is ever revisited, the argument still has
+        to be made.
+    supersedes_in_scope: "d-pipewire-graph-level — see its scope_correction_2026_08_04. That decision survives for the playback monitor and is wrong as a universal chokepoint argument."
+    do_not_confuse_with: "d-per-stream-gating (formerly d-two-layer-model, 2026-03-27) — that 'two layers' means app-rule + per-stream gating inside PipeWire, a browser-tab problem, and predates this pivot by four months."
+    status: "Phases 1-3 landed and substantially proven. Phase 4 (systemd unit for the helper) and Phase 5 (audio backstop) not started. This is the project's current direction."

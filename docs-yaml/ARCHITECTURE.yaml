@@ -1,26 +1,59 @@
 # What lives where, how data flows, who owns what.
-# Read this second, after MISSION.yaml.
-# Verified against source + the live running daemon on 2026-08-04.
+# Verified against source + the live running daemon on 2026-08-19.
+#
+# HISTORY OF THIS FILE: it was written 2026-08-04 22:38 and described a
+# 5-crate, PipeWire-only, zero-test project. That was accurate for eighteen
+# minutes. The kernel pivot (DECISIONS.yaml > d-kernel-lsm-layer) was logged at
+# 22:37 and the first kernel crate appeared at 22:55; this file was not
+# reopened until 2026-08-19, by which point it omitted ~3000 LOC — an entire
+# enforcement layer. Both layers are now described below.
 ---
 shape:
-  language: "Rust 2021"
-  layout: "Cargo workspace, 5 crates, 3434 LOC of first-party code"
+  language: "Rust 2021 + one BPF C file"
+  layout: "Cargo workspace, 7 crates, 7079 LOC of first-party code (6824 Rust + 255 BPF C; generated vmlinux.h excluded)"
   build: "cargo build --release --workspace  (or: make build)"
-  binaries: 4
-  tests: 0          # <-- there are none. Not a typo.
+  binaries: 5
+  tests: 63         # 44 lsm + 9 common + 6 proto + 4 daemon. Zero in ctl/tui/gui.
+  test_distribution_warning: >
+    Coverage is lopsided by era, not by risk. The kernel layer (2026-08) has 44
+    tests; the PipeWire layer (2026-03) has 4, none of which touch
+    classify_link() — the pure function that makes the entire layer-1 security
+    decision. See ROADMAP.yaml > next_up.
+
+two_layers:
+  summary: >
+    hwprivacy enforces in two places behind one policy engine. Neither layer is
+    sufficient alone, and they are complementary rather than redundant.
+  layer_1_pipewire:
+    binary: "hwprivacy-daemon (user service)"
+    sees: "which application wants the microphone; the playback monitor"
+    blind_to: "the camera entirely — Firefox and Chrome use V4L2 directly and create no PipeWire node"
+    mechanism: "poll pw-dump, diff link ids, destroy offending links"
+    nature: "DESTRUCTIVE and RETROACTIVE — the link exists and carries data before it is torn down"
+  layer_2_kernel:
+    binary: "hwprivacy-lsm (root, started by hand — no systemd unit yet)"
+    sees: "every open() of a video4linux (major 81) or ALSA (major 116) device node, keyed by executable inode"
+    blind_to: "which app wants the mic — /dev/snd is held by /usr/bin/pipewire on behalf of everyone"
+    mechanism: "eBPF LSM on security_file_open, returning -EPERM"
+    nature: "PREVENTIVE — the open() never succeeds. But it hooks open(), not read(), so an ALREADY-OPEN fd cannot be revoked."
+  why_both:
+    - "Kernel closes the camera gap that makes layer 1 a placeholder for that device."
+    - "PipeWire supplies app identity for the microphone, which the kernel cannot infer."
+    - "The playback-monitor feature has NO kernel equivalent — there is no straightforward way to tap a sink monitor below PipeWire. This is why layer 1 is not legacy."
+  ref: "DECISIONS.yaml > d-kernel-lsm-layer"
 
 crates:
   hwprivacy-common:
-    loc: 504
+    loc: 698
     purpose: "Shared types + the zbus client proxy. Every other crate depends on it."
     files:
-      config.rs:         "Permission enum (5 levels), AppRule, Config, TOML load/save, normalize_app_name"
+      config.rs:         "Permission enum (5 levels), AppRule (incl. exe_path, which governs BOTH layers), Config, TOML load/save, normalize_app_name, kernel-allowlist derivation + gap reporting"
       device.rs:         "DeviceCategory (Microphone|Camera|Monitor), ProtectedDevice"
       stream.rs:         "StreamInfo, ActiveConnection, AccessEvent, AccessAction"
       dbus_interface.rs: "#[zbus::proxy] trait HwPrivacy — the client side of the API"
 
   hwprivacy-daemon:
-    loc: 1638
+    loc: 2095
     purpose: "The only component that enforces anything. Everything else is a viewer."
     files:
       main.rs:            "CLI (run/install/uninstall/service-status), the monitoring loop, systemd+D-Bus unit installation"
@@ -32,9 +65,10 @@ crates:
       notification.rs:    "2-stage freedesktop notifications via notify-rust"
       dbus_service.rs:    "#[zbus::interface] server impl — 11 methods, 3 declared signals"
       state.rs:           "DaemonState = config + devices + tracker + known_link_ids + block_all"
+      lsm_client.rs:      "layer 2 client — connects to the root helper's unix socket, reconnects every 10s, pushes the allowlist, receives kernel AccessEvents and folds them into the same tracker/notification path (362 LOC)"
 
   hwprivacy-ctl:
-    loc: 196
+    loc: 230
     purpose: "CLI. status | devices | rules {list,set,remove} | streams | log | block-all | unblock-all"
     note: "Pure D-Bus client. Cannot function without the daemon."
 
@@ -52,7 +86,45 @@ crates:
       tray.rs:   "ksni tray: Show / Hide to Tray / Exit; left-click toggles window"
     note: "Close button hides to tray (connect_close_request returns Propagation::Stop). Ctrl+Q or tray Exit really quits."
 
-enforcement_pipeline:
+  hwprivacy-proto:
+    loc: 271
+    tests: 6
+    purpose: "The wire protocol between the root helper and the user daemon. serde + serde_json ONLY, deliberately — so the root process links no D-Bus stack."
+    wire: "NDJSON, one JSON object per line. PROTO_VERSION = 1, checked before anything else is parsed."
+    types:
+      Request:  "tagged on `req` — hello, set_policy, get_policy, ..."
+      Reply:    "tagged on `rep` — unknown message types are REJECTED, not silently ignored"
+      PolicyEntry:    "(dev, ino) of an executable + a permission bitmask (PERM_CAMERA = 1<<0, PERM_AUDIO = 1<<1)"
+      UnresolvedEntry: "a rule that wants the camera but whose exe_path does not resolve — reported back so the user can see the gap"
+      AccessEvent:    "a kernel-side open() attempt, with verdict"
+    note: "A burst summary is identified by pid 0, so it contributes to the count without firing a second notification."
+
+  hwprivacy-lsm:
+    loc: 2434
+    tests: 44
+    purpose: "The root helper. Owns the BPF maps and is the only writer to them."
+    runs_as: "root, by hand. NO systemd unit exists (Phase 4 not started)."
+    files:
+      main.rs:         "CLI, BPF load/attach, the event loop, /proc enrichment, coalescing. BPF maps never leave the main thread."
+      device_index.rs: "maps (major,minor) -> a human device name; owns glibc_to_kernel_dev()"
+      policy.rs:       "the in-kernel allowlist, keyed by executable (dev, ino)"
+      socket.rs:       "the unix-socket server — the helper's ONLY interface to the outside"
+      event.rs:        "AccessEvent construction, coalescing, burst accounting"
+      bpf/devices.bpf.c: "255 lines. The LSM program on security_file_open. Kept minimal — no loops, no unbounded reads — so the verifier accepts it."
+    enforcement: "camera (major 81) is denied under --enforce; audio (major 116) is OBSERVE-ONLY and never denied here"
+    why_audio_is_not_enforced: >
+      Denying major 116 outright would deny /usr/bin/pipewire, which is every
+      application's microphone path. The audio backstop (Phase 5, not started)
+      needs a different shape: only the audio server may open capture devices.
+    security_boundary: >
+      The socket's MODE AND GROUP are the access control; the protocol grants
+      nothing on its own. Directory 0755, socket 0660, group-owned by the
+      desktop user. Anyone who can open /run/hwprivacy/lsm.sock can set camera
+      policy.
+    not_pinned: "The BPF program is never pinned. Killing the helper detaches it and restores normal access. Nothing is enforced at rest."
+
+enforcement_pipeline_layer_1_pipewire:
+  applies_to: "hwprivacy-daemon only. The kernel pipeline is described below."
   substrate: "polling — subprocess `pw-dump`, parsed as JSON"
   cadence: "policy.poll_interval_ms, default 500"
   measured_cost_2026_08_04:
@@ -84,6 +156,49 @@ enforcement_pipeline:
     Any future work on this substrate inherits this blind spot; only a layer
     below PipeWire closes it.
 
+enforcement_pipeline_layer_2_kernel:
+  applies_to: "hwprivacy-lsm + hwprivacy-daemon/lsm_client.rs"
+  substrate: "eBPF LSM program attached to security_file_open"
+  measured_cost_2026_08_05:
+    hook: "+13.75 ns per open(), 95% CI [+7.3, +20.2]"
+    relative: "1.88% of a 733 ns open()"
+    idle: "0% — nothing runs when nothing opens a device"
+    contrast: "layer 1 burns ~1.2-1.5% of a core continuously, at idle, forever"
+  steps:
+    - "1. helper starts as root, loads the BPF object, attaches, binds /run/hwprivacy/lsm.sock (0660, group = desktop user)"
+    - "2. daemon's lsm_client connects; on failure it retries every 10s, forever"
+    - "3. daemon derives the allowlist from config: only `allow` + a resolvable exe_path becomes a PolicyEntry (dev, ino)"
+    - "4. rules that want the camera but whose exe_path does not resolve are returned as UnresolvedEntry and surfaced to the user"
+    - "5. kernel: on open() of major 81/116, look up the calling executable's (dev, ino) in the allowlist"
+    - "6. camera + not allowed + --enforce -> return -EPERM. audio -> observe only, never denied."
+    - "7. helper coalesces a burst (a camera session is ~13 open() calls) into one event, and flushes the count separately"
+    - "8. AccessEvent crosses the socket; the daemon folds it into the SAME tracker, event log and D-Bus surface, so ctl/tui/gui need no changes"
+  identity: >
+    (dev, ino) of the executable, not a self-declared name. This is strictly
+    stronger than layer 1's identity, which an app asserts about itself.
+    Consequence: /usr/bin/firefox is a shell script; the real binaries
+    /usr/lib/firefox-esr/firefox-esr and ~/firefox-developer/firefox-bin are
+    different inodes and therefore different policy keys. That is the feature.
+  notification_path: >
+    Kernel denials use an INFORMATIONAL notification with no action buttons,
+    deliberately. The action path carries blocker b1 (dismiss writes a
+    permanent deny); routing a new event source through it would inherit that
+    bug on day one. Kernel camera policy is edited in config.toml until b1 is
+    fixed.
+  critical_limitation: >
+    Cannot revoke an ALREADY-OPEN fd. The hook fires on open(), not on read.
+    Costin observed live camera video while enforcement was on, because Firefox
+    had opened the device earlier and kept the descriptor. Same class as layer
+    1's g1/g2. Closing it means hooking security_file_permission (intercepting
+    every read) or revoking on policy change — a design step, not a patch.
+  trap_that_bit_twice: >
+    glibc's stat() dev_t and the kernel's dev_t are different bit layouts.
+    Decoding one with the other's rules yields major 0 and silently matches
+    NOTHING, while unit tests pass. It bit once for i_rdev and again for s_dev
+    in the allowlist, where it looked exactly like 'enforcement works,
+    allowlist does not'. All conversion now lives in
+    device_index::glibc_to_kernel_dev().
+
 app_identity_resolution:
   where: "pipewire_monitor.rs parse_node()"
   precedence:
@@ -103,7 +218,7 @@ app_identity_resolution:
   trap: >
     Notification bodies render '{app} (pid:{n})'. A rule created by copying
     that whole string ends with ')', so nothing is stripped and the rule can
-    NEVER match. One such dead rule exists in the live config.
+    NEVER match. THREE such dead rules exist in the live config (verified 2026-08-19).
 
 device_classification:
   where: "device_discovery.rs classify_node()"
@@ -162,17 +277,25 @@ state_ownership:
 deployment:
   systemd_user_unit: "~/.config/systemd/user/hwprivacy.service  (generated by `hwprivacy-daemon install`)"
   dbus_activation:   "~/.local/share/dbus-1/services/org.hwprivacy.Daemon.service"
-  live_2026_08_04: >
-    Running as PID 2331 from /home/perieteanu/projects/hwprivacy/target/release/
-    — i.e. from the DEV TREE, not from /usr/bin. `make install` has never been
-    run and no .deb has ever been built. Rebuilding the workspace replaces the
-    binary underneath the running service.
+  live_2026_08_19: >
+    hwprivacy.service active, MainPID 2134, NRestarts 0, running from
+    ~/.local/bin/hwprivacy-daemon. It was moved out of target/release/ on
+    2026-08-04 precisely because rebuilding replaced the binary underneath the
+    running service. Four of the five binaries live in ~/.local/bin;
+    hwprivacy-lsm does NOT — it is started by hand as root, per test.
+    `make install` (which targets /usr/bin, needs sudo) has never been run and
+    no .deb has ever been built.
+  after_rebuild: "install -m 0755 target/release/hwprivacy-{daemon,ctl,tui,gui} ~/.local/bin/ && systemctl --user restart hwprivacy"
+  kernel_helper_unit: "NONE. Phase 4. Until it exists, layer 2 enforces only while a human is running the helper."
   debian_dir: "complete (control, rules, changelog, copyright, compat, .service, .desktop, 4x .install) but never exercised"
 
 external_dependencies:
   runtime_binaries: ["pw-dump", "pw-link", "pw-cli"]
   note: "Called as subprocesses. If PipeWire tooling is absent the daemon degrades to a no-op that logs warnings."
+  kernel_layer_toolchain: "clang, libbpf-dev, libelf-dev, bpftool (in /usr/sbin, off a non-root PATH), vmlinux.h generated from /sys/kernel/btf/vmlinux. 'libelf.h: No such file' means the Phase 0 toolchain script has not run."
+  kernel_requirements: "CONFIG_BPF_LSM=y, CONFIG_DEBUG_INFO_BTF=y, and `bpf` present in /sys/kernel/security/lsm. Satisfied on this machine (kernel 6.12) with no boot-parameter change."
   notable_crates:
+    libbpf-rs: "layer 2. Chosen over Aya so the C stays minimal and the verifier stays happy."
     notify-rust: "=4.11.3 — hard-pinned for Debian 13 MSRV (rustc 1.85)"
     zbus: "4, tokio feature, default-features off"
     gtk4: "0.9"

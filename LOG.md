@@ -39,3 +39,36 @@
 05-08-2026 20:56 | Wed | hw | [note] C5 unverifiable as written: Firefox is allowlisted so its burst is not denied; needs a denied burster
 05-08-2026 20:57 | Wed | hw | [note] D1 unresolved — call failed although firefox-esr was allowlisted; two untested hypotheses recorded
 05-08-2026 20:58 | Wed | hw | [defer] Phase 3 substantially proven; burst counting and D1 still open. Phases 4-5 not started
+04-08-2026 23:38 | Tue | hw | [work] commit: Initial commit: PipeWire permission manager + kernel eBPF LSM layer
+04-08-2026 23:40 | Tue | hw | [work] commit: Decouple the running service from the dev tree; fix broken D-Bus activation
+05-08-2026 09:36 | Wed | hw | [work] commit: HANDOFF: correct stale 'No git' entry — git was added at the end of that session
+05-08-2026 09:47 | Wed | hw | [work] commit: Measure the eBPF LSM hook overhead: +13.75 ns/open, architecture passes
+05-08-2026 10:09 | Wed | hw | [work] commit: hwprivacy-lsm: announce up front how a run terminates
+05-08-2026 10:10 | Wed | hw | [work] commit: docs: refresh memory mirror (4 memories)
+05-08-2026 10:18 | Wed | hw | [work] commit: Phase 2: kernel camera enforcement (-EPERM), default deny, coalesced
+05-08-2026 10:27 | Wed | hw | [work] commit: Fix: allowlist inserted glibc st_dev where the kernel reads its own dev_t
+05-08-2026 10:30 | Wed | hw | [work] commit: Add --dump-policy; make the acceptance test build before it tests
+05-08-2026 10:35 | Wed | hw | [work] commit: Phase 2 acceptance PASSED; add the Firefox end-to-end test
+05-08-2026 10:48 | Wed | hw | [work] commit: Flush stranded coalescing counters so denials are not silently lost
+05-08-2026 10:48 | Wed | hw | [work] commit: docs: record the Firefox end-to-end result and the getUserMedia finding
+05-08-2026 11:08 | Wed | hw | [work] commit: Test contract: announce how it ends, where results appear, what to paste back
+05-08-2026 14:48 | Wed | hw | [work] commit: Scope the test banner correctly: test AND sudo, not either alone
+05-08-2026 18:51 | Wed | hw | [work] commit: Phase 3a-c: workspace folded, wire protocol, root helper serves a socket
+05-08-2026 19:04 | Wed | hw | [work] commit: Rename exe -> exe_path; add it to AppRule with kernel-layer helpers
+05-08-2026 19:38 | Wed | hw | [work] commit: Phase 3d-f: daemon connects to the kernel layer; fix a D-Bus activation race
+05-08-2026 19:47 | Wed | hw | [work] commit: docs: Phase 3 acceptance criteria, rewritten HANDOFF, refreshed mirrors
+05-08-2026 19:50 | Wed | hw | [work] commit: log: 2026-08-05 session — Phase 2 proven, Phase 3 code-complete
+05-08-2026 19:56 | Wed | hw | [work] commit: Phase 4 reshaped: continuous operation AND a persistent audit trail
+05-08-2026 19:57 | Wed | hw | [work] commit: Phase 4: record the fail2ban-shaped reporting proposal
+05-08-2026 20:32 | Wed | hw | [work] commit: Stop scripts running a stale binary — third mechanism, real guard this time
+05-08-2026 20:50 | Wed | hw | [work] commit: Fix C5 (burst count never reached the daemon) and three test bugs
+05-08-2026 20:59 | Wed | hw | [work] commit: Phase 3 result: 11/13. Record what is proven, what is not, and why
+05-08-2026 21:33 | Wed | hw | [work] commit: HANDOFF: correct stale counts and the 'never been run' line
+19-08-2026 16:52 | Wed | hw | [note] doc audit vs code+live host: HANDOFF/ROADMAP accurate; ARCHITECTURE/MISSION/CLAUDE.md stale by one whole layer
+19-08-2026 16:53 | Wed | hw | [note] measured drift: docs said 5 crates/3434 LOC/0 tests; actual 7 crates/7079 LOC/63 tests passing
+19-08-2026 16:55 | Wed | hw | [add] d-kernel-lsm-layer ADR — the 2026-08-04 pivot had NO decision entry for 15 days
+19-08-2026 16:55 | Wed | hw | [fix] d-event-driven-substrate demoted from "DIRECTION SET" to layer-1-only/deferred; it read as current direction
+19-08-2026 16:56 | Wed | hw | [fix] renamed d-two-layer-model -> d-per-stream-gating; "two-layer" meant two different things since the pivot
+19-08-2026 17:02 | Wed | hw | [fix] CLAUDE.md rewritten against the filesystem: git exists, 63 tests, 8 warnings, notification.rs:146 -> :196
+19-08-2026 17:08 | Wed | hw | [fix] ARCHITECTURE.yaml now covers both layers — it had omitted hwprivacy-lsm and -proto entirely (~3000 LOC)
+19-08-2026 17:09 | Wed | hw | [note] still stale and untouched: README.md (0 mentions of kernel/eBPF/LSM) and MISSION.yaml
