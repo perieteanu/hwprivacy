@@ -783,15 +783,15 @@ PipeWire 1.4.2, ALC257 codec (2 internal mics as stereo), Integrated Camera.
 
 ### Automated tests
 
-`cargo test --workspace` → **63 tests, all passing**. Note the distribution:
+`cargo test --workspace` → **78 tests, all passing**. Note the distribution:
 
 | crate | LOC | tests |
 |---|---|---|
-| hwprivacy-lsm | 2434 | 44 |
-| hwprivacy-common | 698 | 9 |
+| hwprivacy-lsm | 2872 | 48 |
+| hwprivacy-daemon | 2603 | 15 |
+| hwprivacy-common | 705 | 9 |
 | hwprivacy-proto | 271 | 6 |
-| hwprivacy-daemon | 2095 | 4 |
-| hwprivacy-ctl / -tui / -gui | 1326 | 0 |
+| hwprivacy-ctl / -tui / -gui | 1366 | 0 |
 
 Coverage is lopsided **by era, not by risk**. The kernel layer was written
 test-first; the PipeWire layer was not, and `classify_link()` — the pure

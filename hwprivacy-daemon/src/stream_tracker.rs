@@ -62,7 +62,12 @@ impl StreamTracker {
         action: AccessAction,
     ) {
         let event = AccessEvent {
-            timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+            // Date included, deliberately. This was "%H:%M:%S" — no date at all
+            // (gap g4), which is ambiguous the moment a log spans midnight and
+            // useless for the thing this log exists for: reading it back days
+            // later to see who tried. ISO order rather than the project's usual
+            // EU order because these lines get sorted and grepped as text.
+            timestamp: chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
             app_name: app_name.to_string(),
             pid,
             device_category: category,

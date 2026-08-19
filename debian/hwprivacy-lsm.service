@@ -1,0 +1,61 @@
+[Unit]
+# The kernel-layer enforcer. Runs as root because loading and attaching an
+# eBPF LSM program requires it; nothing else in this project does.
+#
+# This is a SYSTEM unit, unlike hwprivacy-daemon.service which is a user unit.
+# The two are separate on purpose: the helper must be up before any user logs
+# in (that is when the camera is least supervised), and it serves every session
+# from one place.
+Description=HWPrivacy kernel layer (eBPF LSM camera enforcement)
+Documentation=file:/usr/share/doc/hwprivacy-lsm/README.md
+
+# Ordinary boot ordering, deliberately. An earlier slot (DefaultDependencies=no
+# plus Before=sysinit.target) was tried and rejected: it risks an ordering cycle
+# against local-fs.target, which /var/lib/hwprivacy depends on, and buys
+# nothing — nothing opens the camera before multi-user.target on a desktop.
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/hwprivacy-lsm \
+    --socket /run/hwprivacy/lsm.sock \
+    --socket-group hwprivacy \
+    --policy-cache /var/lib/hwprivacy/policy \
+    --enforce \
+    --json
+
+# --json puts one NDJSON object per event on stdout, which systemd captures.
+# The journal IS the audit store: real timestamps, rotation and retention are
+# already solved, so there is no storage code in this project at all.
+StandardOutput=journal
+StandardError=journal
+
+Restart=on-failure
+RestartSec=2
+
+# The eBPF program is deliberately NOT pinned. Stopping this unit detaches it
+# and restores normal camera access immediately. That safety valve is worth
+# more than closing the brief gap while systemd restarts a crashed helper --
+# a privacy tool that can leave your camera dead with no obvious way back is
+# worse than one with a short unprotected window.
+
+# --- hardening, and one deliberate omission -------------------------------
+# DO NOT ADD ProtectHome=. The helper resolves allowlisted executables by path,
+# and real ones live under /home -- ~/firefox-developer/firefox-bin is an
+# actual allowlist target on the developer's machine. ProtectHome=yes would
+# make those paths unresolvable, and the symptom is not an error: it is the
+# app silently losing its camera. Same reasoning for ProtectSystem=strict,
+# which would block /var/lib/hwprivacy.
+NoNewPrivileges=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=no
+RuntimeDirectory=hwprivacy
+RuntimeDirectoryMode=0755
+StateDirectory=hwprivacy
+StateDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

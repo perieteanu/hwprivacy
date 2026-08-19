@@ -32,6 +32,8 @@ enum Commands {
         #[arg(long, default_value = "20")]
         last: u32,
     },
+    /// Who has been denied, how often, and since when (survives restarts)
+    Offenders,
     /// Emergency: deny everything immediately
     BlockAll,
     /// Restore to saved rules
@@ -207,11 +209,47 @@ async fn main() -> anyhow::Result<()> {
             if events.is_empty() {
                 println!("No recent events.");
             } else {
-                println!("{:<10} {:<20} {:<12} {}", "Time", "App", "Device", "Action");
-                println!("{}", "-".repeat(55));
+                // 19 wide: timestamps carry a full date now (g4), not just
+                // "%H:%M:%S". A 10-wide column silently truncated them.
+                println!("{:<19} {:<20} {:<12} {}", "Time", "App", "Device", "Action");
+                println!("{}", "-".repeat(64));
                 for (ts, app, dev, action) in &events {
-                    println!("{:<10} {:<20} {:<12} {}", ts, app, dev, action);
+                    println!("{:<19} {:<20} {:<12} {}", ts, app, dev, action);
                 }
+            }
+        }
+
+        Commands::Offenders => {
+            let rows = proxy.get_offenders().await?;
+            if rows.is_empty() {
+                println!("Nothing has been denied yet.");
+            } else {
+                println!(
+                    "{:<44} {:<11} {:<9} {:>6}  {:<19} {}",
+                    "IDENTITY", "DEVICE", "SOURCE", "DENIED", "FIRST", "LAST"
+                );
+                println!("{}", "-".repeat(104));
+                for (identity, device, source, denied, first, last) in &rows {
+                    println!(
+                        "{:<44} {:<11} {:<9} {:>6}  {:<19} {}",
+                        identity, device, source, denied, first, last
+                    );
+                }
+                println!();
+                // Said plainly rather than left for the reader to discover.
+                // A table that looks complete but is not is worse than no
+                // table: it would quietly under-report anything that happened
+                // while the session was down.
+                println!(
+                    "Counted only while the user daemon was running. Events from before\n\
+                     login are in the kernel helper's journal instead:\n\
+                     \n    journalctl -u hwprivacy-lsm --since '3 days ago'\n"
+                );
+                println!(
+                    "'kernel' rows are keyed on the executable path and are stable across\n\
+                     restarts. 'pipewire' rows are keyed on a name the application declares\n\
+                     about itself, which is weaker — treat them as a hint, not an identity."
+                );
             }
         }
 

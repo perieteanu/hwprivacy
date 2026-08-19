@@ -5,11 +5,12 @@ Android-style hardware permission manager for the Linux desktop. Gates native
 **playback monitor** across **two enforcement layers**: the PipeWire graph, and
 an eBPF LSM in the kernel.
 
-Rust workspace, **7 crates, 7079 LOC** (6824 Rust + 255 lines of BPF C;
+Rust workspace, **7 crates, 7817 LOC** (7562 Rust + 255 lines of BPF C;
 generated `vmlinux.h` excluded). Debian 13 / PipeWire / KDE + GNOME.
 Registered in project-tracker as `hwprivacy`, short name `hw`.
 
 Verified against the filesystem and the live daemon on **2026-08-19**.
+Run `make doc-check` before trusting any number in this file.
 
 ---
 
@@ -149,7 +150,7 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 cargo build --release --workspace       # or: make build
 cargo check --workspace                 # 8 warnings, 0 errors
 cargo clippy                            # NOT AVAILABLE — no such command on this toolchain
-cargo test --workspace                  # 63 tests, all pass
+cargo test --workspace                  # 78 tests, all pass
 ```
 
 Binaries (5): `hwprivacy-daemon` (layer 1 enforcer + policy owner),
@@ -161,11 +162,11 @@ Test coverage is **not** evenly spread:
 
 | crate | LOC | tests |
 |---|---|---|
-| hwprivacy-lsm | 2434 | 44 |
-| hwprivacy-common | 698 | 9 |
+| hwprivacy-lsm | 2872 | 48 |
+| hwprivacy-daemon | 2603 | 15 |
+| hwprivacy-common | 705 | 9 |
 | hwprivacy-proto | 271 | 6 |
-| hwprivacy-daemon | 2095 | 4 |
-| hwprivacy-ctl / -tui / -gui | 1326 | 0 |
+| hwprivacy-ctl / -tui / -gui | 1366 | 0 |
 
 **`cargo test` does not refresh `target/debug/hwprivacy-lsm`** — it builds a
 separate `cfg(test)` harness. 30 passing tests once said nothing about the

@@ -1,0 +1,60 @@
+#!/bin/sh
+set -e
+
+# Creates the group that owns the control socket. Deliberately does NOT add any
+# user to it.
+#
+# Membership of 'hwprivacy' is authority to set camera policy, and membership of
+# 'systemd-journal' is authority to read every service's logs on the machine.
+# A package that hands out either silently is doing something the admin did not
+# ask for. Both are printed as instructions instead.
+#
+# The obvious shortcut -- reuse the existing 'video' group -- is wrong here: on
+# a typical desktop it already contains unrelated service accounts (ollama, on
+# the developer's machine), and all of them would inherit the ability to
+# allowlist themselves.
+
+case "$1" in
+    configure)
+        if ! getent group hwprivacy >/dev/null; then
+            addgroup --system hwprivacy
+        fi
+
+        # Owned by root, group-readable, so the helper can write its cache and
+        # an admin can inspect it. The helper creates the file itself.
+        mkdir -p /var/lib/hwprivacy
+        chmod 0755 /var/lib/hwprivacy
+
+        cat <<'EOF'
+
+hwprivacy-lsm: two manual steps are needed before this does anything useful.
+
+  1. Let your desktop user talk to the kernel helper:
+
+         sudo adduser <you> hwprivacy
+
+     Without this the user daemon cannot connect, so no allowlist is ever
+     pushed and -- under --enforce -- the camera is denied to everything.
+
+  2. To read the audit trail, join the journal group:
+
+         sudo adduser <you> systemd-journal
+
+     Then:  journalctl -u hwprivacy-lsm --since "3 days ago"
+
+     Without this the events are still recorded, but only root can read them.
+
+  Log out and back in for group changes to take effect, then:
+
+         sudo systemctl enable --now hwprivacy-lsm
+
+  Stopping the service detaches the eBPF program and restores normal camera
+  access immediately. It is never pinned.
+
+EOF
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

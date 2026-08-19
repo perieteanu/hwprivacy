@@ -136,6 +136,34 @@ impl HwPrivacyService {
         )
     }
 
+    /// Persistent denial counters: (identity, device, source, denied,
+    /// first_seen, last_seen), most persistent first.
+    ///
+    /// Unlike GetEvents, which reads a 500-entry in-memory ring buffer that
+    /// dies with the daemon, this survives restarts — it is the answer to
+    /// "who has been trying, over days".
+    ///
+    /// Additive, like GetKernelStatus: GetEvents keeps its signature so the
+    /// three frontends stay working untouched.
+    async fn get_offenders(&self) -> Vec<(String, String, String, u32, String, String)> {
+        let state = self.state.read().await;
+        state
+            .offenders
+            .sorted()
+            .into_iter()
+            .map(|o| {
+                (
+                    o.identity,
+                    o.device,
+                    o.source,
+                    o.denied,
+                    o.first_seen,
+                    o.last_seen,
+                )
+            })
+            .collect()
+    }
+
     async fn get_events(&self, last_n: u32) -> Vec<(String, String, String, String)> {
         let state = self.state.read().await;
         state

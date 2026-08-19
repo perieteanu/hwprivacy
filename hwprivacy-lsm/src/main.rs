@@ -40,7 +40,7 @@ use hwprivacy_proto::{AccessEvent, PolicyEntry, Reply, Request, UnresolvedEntry,
 use policy::{Policy, PolicyKey};
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -99,6 +99,19 @@ struct Cli {
     /// Read the camera allowlist from a file (one executable path per line).
     #[arg(long, value_name = "FILE")]
     policy_file: Option<PathBuf>,
+
+    /// Persist the daemon's allowlist here, and reload it at startup.
+    ///
+    /// Without this the helper starts with an EMPTY allowlist, so under
+    /// `--enforce` it denies the camera to everything until the user session
+    /// comes up and pushes config.toml over the socket. That window is the
+    /// whole machine's camera, and after a daemon restart it was measured at
+    /// ~51 seconds. The cache closes it: enforcement is correct from boot.
+    ///
+    /// Ignored when `--allow` or `--policy-file` is given, so the acceptance
+    /// tests keep driving policy explicitly.
+    #[arg(long, value_name = "FILE")]
+    policy_cache: Option<PathBuf>,
 
     /// Coalescing window in milliseconds. Repeat opens by the same executable
     /// on the same device class inside this window are counted, not reported
@@ -250,6 +263,51 @@ fn main() -> Result<()> {
     }
     for p in &cli.allow {
         pol.allow_path(p);
+    }
+
+    // Explicit policy wins. Only fall back to the cache when the caller gave
+    // none, so a test driving `--allow` is never silently merged with whatever
+    // the last daemon push happened to leave on disk.
+    //
+    // A cache that exists but cannot be read is FATAL under --enforce. Carrying
+    // on would mean enforcing an empty allowlist — denying every camera on the
+    // machine — while looking like a healthy start. That is the exact shape of
+    // "enforcement works, the allowlist doesn't", which has already cost this
+    // project two debugging cycles.
+    if pol.entries.is_empty() && cli.policy_file.is_none() && cli.allow.is_empty() {
+        if let Some(cache) = &cli.policy_cache {
+            match Policy::from_file(cache) {
+                Ok(cached) => {
+                    if !cli.json {
+                        eprintln!(
+                            "hwprivacy-lsm: loaded {} allowlist entr(ies) from {}",
+                            cached.entries.len(),
+                            cache.display()
+                        );
+                    }
+                    pol = cached;
+                }
+                Err(e) if cache.exists() => {
+                    anyhow::bail!(
+                        "the policy cache {} exists but could not be read: {e:#}\n\
+                         Refusing to start: continuing would enforce an EMPTY \
+                         allowlist and deny the camera to everything.",
+                        cache.display()
+                    );
+                }
+                Err(_) => {
+                    // No cache yet — first boot, or it was never written.
+                    // Correct and expected; the daemon will populate it.
+                    if !cli.json {
+                        eprintln!(
+                            "hwprivacy-lsm: no policy cache at {} yet — starting with an \
+                             empty allowlist until the daemon connects",
+                            cache.display()
+                        );
+                    }
+                }
+            }
+        }
     }
 
     for (path, why) in &pol.unresolved {
@@ -497,6 +555,7 @@ fn main() -> Result<()> {
                     req,
                     &mut enforcing,
                     coalesce_ns,
+                    cli.policy_cache.as_deref(),
                 );
                 let _ = rep_tx.send(rep);
             }
@@ -569,6 +628,7 @@ fn handle_request(
     req: Request,
     enforcing: &mut bool,
     coalesce_ns: u64,
+    policy_cache: Option<&Path>,
 ) -> Reply {
     match req {
         Request::Hello { .. } => Reply::Hello {
@@ -596,6 +656,29 @@ fn handle_request(
                     unresolved.len(),
                     if enforce_camera { "ON" } else { "OFF" }
                 );
+
+                // Persist so the next boot enforces this same list rather than
+                // an empty one. Cache every path the daemon SENT, including any
+                // that failed to resolve right now — a binary can be missing at
+                // this instant (mid-upgrade) and present at the next boot, and
+                // dropping it here would silently revoke the user's rule.
+                //
+                // A cache write failure must not fail the push: the kernel is
+                // already correctly programmed, and refusing here would trade a
+                // working policy for a persistence problem.
+                if let Some(cache) = policy_cache {
+                    let paths: Vec<String> =
+                        entries.iter().map(|e| e.exe_path.clone()).collect();
+                    if let Err(e) = policy::write_cache(cache, &paths) {
+                        eprintln!(
+                            "hwprivacy-lsm: WARNING policy applied but the cache at {} \
+                             could not be written: {e:#}. Enforcement is correct now, \
+                             but the next boot will start with an empty allowlist.",
+                            cache.display()
+                        );
+                    }
+                }
+
                 Reply::PolicyApplied {
                     applied,
                     unresolved,
@@ -1000,6 +1083,7 @@ mod tests {
             policy_file: None,
             coalesce_ms: 2000,
             dump_policy: false,
+            policy_cache: None,
             socket: None,
             socket_group: None,
         }

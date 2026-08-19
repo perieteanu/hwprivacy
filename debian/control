@@ -7,7 +7,11 @@ Build-Depends: debhelper-compat (= 13),
                rustc,
                libgtk-4-dev,
                libdbus-1-dev,
-               pkg-config
+               pkg-config,
+               clang,
+               libbpf-dev,
+               libelf-dev,
+               bpftool
 Standards-Version: 4.6.2
 Homepage: https://github.com/perieteanu/hwprivacy
 
@@ -19,6 +23,22 @@ Depends: ${shlibs:Depends}, ${misc:Depends},
 Description: Hardware privacy daemon
  Background service that manages hardware privacy controls such as
  camera, microphone, and other device toggles via D-Bus.
+
+Package: hwprivacy-lsm
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: Hardware privacy kernel layer (eBPF LSM)
+ Enforces camera policy in the kernel, on the security_file_open LSM hook,
+ by denying open() of video4linux device nodes to executables that are not
+ on the allowlist. This catches direct V4L2 access, which the PipeWire layer
+ cannot observe at all — Firefox and Chrome take the camera that way.
+ .
+ Runs as a system service, as root, because loading an eBPF program requires
+ it. Audio is observed but never denied here: denying the ALSA major would
+ deny the audio server itself, which is every application's microphone path.
+ .
+ Requires a kernel with CONFIG_BPF_LSM=y, CONFIG_DEBUG_INFO_BTF=y and 'bpf'
+ present in /sys/kernel/security/lsm.
 
 Package: hwprivacy-ctl
 Architecture: any

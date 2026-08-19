@@ -141,7 +141,49 @@ impl Policy {
         }
         m
     }
+}
 
+/// Render an allowlist to the on-disk cache format.
+///
+/// PATHS, deliberately, not `(dev, ino)`. An inode is the identity the kernel
+/// matches on, but it changes the moment the package manager replaces the
+/// binary — a cache of inodes would silently stop matching Firefox after the
+/// next update, which is the hardest possible failure to notice. Paths are
+/// re-resolved at every load.
+pub fn render_cache(paths: &[String]) -> String {
+    let mut s = String::from(
+        "# hwprivacy kernel allowlist cache — WRITTEN BY hwprivacy-lsm, DO NOT EDIT.\n\
+         # Rewritten in full every time the daemon pushes a policy.\n\
+         # Exists so enforcement survives a reboot: without it the helper starts\n\
+         # with an empty allowlist and denies the camera to everything until the\n\
+         # user session comes up and pushes config.toml.\n\
+         # Enforcement on/off is NOT stored here — that comes from --enforce.\n",
+    );
+    for p in paths {
+        s.push_str(p);
+        s.push('\n');
+    }
+    s
+}
+
+/// Write the cache atomically.
+///
+/// Temp file plus rename, because the failure mode of a torn write is not a
+/// missing allowlist but a TRUNCATED one — and a truncated allowlist under
+/// `--enforce` denies the camera to everything that was dropped, while looking
+/// exactly like working enforcement. A rename is atomic on the same
+/// filesystem, so a reader sees either the old list or the new one.
+pub fn write_cache(path: &Path, paths: &[String]) -> Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, render_cache(paths))
+        .with_context(|| format!("cannot write {}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("cannot rename {} to {}", tmp.display(), path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -163,6 +205,63 @@ mod tests {
             &[0, 0, 0, 0],
             "the _pad field must be zero or every kernel lookup misses"
         );
+    }
+
+    /// The cache exists so a reboot enforces the same list rather than an empty
+    /// one. If what we write cannot be read back, that guarantee is gone and
+    /// the next boot silently denies every camera on the machine.
+    #[test]
+    fn the_cache_round_trips_through_parse() {
+        let paths = vec![
+            "/usr/bin/true".to_string(),
+            "/usr/bin/false".to_string(),
+        ];
+        let back = Policy::parse(&render_cache(&paths));
+        assert_eq!(back.entries.len(), 2, "{back:?}");
+        assert_eq!(back.unresolved.len(), 0);
+        let got: Vec<_> = back
+            .entries
+            .iter()
+            .map(|e| e.path.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(got, paths);
+    }
+
+    /// The header is comments, so a cache with no entries must parse to an
+    /// empty allowlist rather than to garbage entries.
+    #[test]
+    fn an_empty_cache_is_empty_not_malformed() {
+        let p = Policy::parse(&render_cache(&[]));
+        assert!(p.entries.is_empty());
+        assert!(p.unresolved.is_empty());
+    }
+
+    /// Paths with a space are ordinary on a desktop — `/opt/Some App/bin`. The
+    /// format splits on newlines only, never on whitespace, or such an entry
+    /// would be silently truncated into a path that resolves to nothing.
+    #[test]
+    fn a_path_containing_spaces_survives_the_cache() {
+        let text = render_cache(&["/opt/Some App/thing".to_string()]);
+        let line = text
+            .lines()
+            .find(|l| !l.starts_with('#'))
+            .expect("an entry line");
+        assert_eq!(line, "/opt/Some App/thing");
+    }
+
+    /// A binary can be absent at the moment the daemon pushes (mid-upgrade) and
+    /// present at the next boot. `parse` must report it as unresolved rather
+    /// than dropping it, so the reason is visible instead of the rule just
+    /// vanishing.
+    #[test]
+    fn an_unresolvable_cached_path_is_reported_not_dropped() {
+        let p = Policy::parse(&render_cache(&[
+            "/usr/bin/true".to_string(),
+            "/definitely/not/here".to_string(),
+        ]));
+        assert_eq!(p.entries.len(), 1);
+        assert_eq!(p.unresolved.len(), 1);
+        assert_eq!(p.unresolved[0].0, PathBuf::from("/definitely/not/here"));
     }
 
     #[test]

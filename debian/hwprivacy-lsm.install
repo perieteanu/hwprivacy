@@ -1,0 +1,2 @@
+usr/bin/hwprivacy-lsm
+usr/lib/systemd/system/hwprivacy-lsm.service

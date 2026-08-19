@@ -49,7 +49,7 @@ blockers:
   b2_stale_oneshot_grants:
     severity: critical
     what: "`ask_each` streams get silently ALLOWED with no prompt."
-    where: "hwprivacy-daemon/src/stream_tracker.rs:128 grant_one_shot()"
+    where: "hwprivacy-daemon/src/stream_tracker.rs:133 grant_one_shot()"
     effect: "one_shot_allowed: Vec<u32> is never pruned and is keyed on the PipeWire node id, which PipeWire recycles. An old grant leaks onto an unrelated later stream."
     evidence: "live event log — 'Firefox [pipewire-pulse] microphone ALLOWED' while config says microphone = ask_each"
     mode: execute

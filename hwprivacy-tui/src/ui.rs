@@ -227,7 +227,9 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(10),
+            // 19, not 10: event timestamps carry a full date since g4 was
+            // fixed. At 10 the date rendered and the CLOCK was cut off.
+            Constraint::Length(19),
             Constraint::Length(20),
             Constraint::Length(12),
             Constraint::Min(15),

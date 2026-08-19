@@ -235,6 +235,7 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
         if ev.denied {
             let mut s = state.write().await;
             s.tracker.blocked_count += denied_opens(&ev);
+            record_offender(&mut s, &ev, category);
         }
         info!(
             "Kernel layer: {} further {} open(s) by {} (burst summary, not a new access)",
@@ -257,6 +258,10 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
         // `log_event_denial_contribution_is_one` pins that assumption.
         let already = if ev.denied { 1 } else { 0 };
         s.tracker.blocked_count += denied_opens(&ev) - already;
+
+        if ev.denied {
+            record_offender(&mut s, &ev, category);
+        }
     }
 
     if !ev.denied {
@@ -289,6 +294,31 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     };
 
     crate::notification::notify_kernel_denial(&app, ev.pid, category, &ev.device, detail).await;
+}
+
+/// Add a kernel denial to the persistent offender table.
+///
+/// Keyed on `exe_path`, NOT on the short name. The path is the identity the
+/// kernel actually decided on, it is stable across restarts and reboots, and
+/// two different binaries can share a basename — `firefox-esr` and
+/// `firefox-bin` are distinct policy subjects and must not collapse into one
+/// row here either.
+fn record_offender(
+    s: &mut crate::state::DaemonState,
+    ev: &AccessEvent,
+    category: DeviceCategory,
+) {
+    let now = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    s.offenders.record(
+        &ev.exe_path,
+        &format!("{category:?}").to_lowercase(),
+        crate::offenders::SOURCE_KERNEL,
+        denied_opens(ev),
+        &now,
+    );
+    s.offenders.save_if_dirty();
 }
 
 /// How many denied opens one kernel event represents.

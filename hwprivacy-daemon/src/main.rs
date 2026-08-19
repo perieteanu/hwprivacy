@@ -3,6 +3,7 @@ mod device_discovery;
 mod link_manager;
 mod lsm_client;
 mod notification;
+mod offenders;
 mod pipewire_monitor;
 mod policy_engine;
 mod state;
@@ -270,12 +271,11 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     warn!("Failed to destroy link in block-all mode: {}", e);
                 }
                 let mut s = state.write().await;
-                s.tracker.log_event(
+                s.log_denied(
                     &stream.app_name,
                     stream.pid,
                     device.category,
                     &stream.node_name,
-                    AccessAction::Denied,
                 );
                 continue;
             }
@@ -321,7 +321,7 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                         warn!("Failed to destroy denied link: {}", e);
                     }
                     let mut s = state.write().await;
-                    s.tracker.log_event(&app, pid, cat, &node, AccessAction::Denied);
+                    s.log_denied(&app, pid, cat, &node);
                     drop(s);
 
                     // Instant notification — rule already says deny
@@ -353,12 +353,11 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     {
                         let mut s = state.write().await;
                         if in_cooldown {
-                            // log_event() increments blocked_count itself for a
-                            // Denied action (stream_tracker.rs). An extra += 1
-                            // here counted every cooldown-suppressed block twice.
-                            // The other two Denied paths in this file correctly
-                            // rely on log_event alone.
-                            s.tracker.log_event(&app, pid, cat, &node, AccessAction::Denied);
+                            // log_denied() -> log_event() increments
+                            // blocked_count itself for a Denied action
+                            // (stream_tracker.rs). An extra += 1 here counted
+                            // every cooldown-suppressed block twice.
+                            s.log_denied(&app, pid, cat, &node);
                         } else {
                             s.tracker.log_event(&app, pid, cat, &node, AccessAction::AskedUser);
                         }

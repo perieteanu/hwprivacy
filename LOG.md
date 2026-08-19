@@ -95,3 +95,9 @@
 19-08-2026 20:12 | Wed | hw | [note] b1 is NARROWER than documented: ask_each never writes config; only the plain ask path does
 19-08-2026 20:12 | Wed | hw | [note] reconnect after daemon restart took ~51s not ~10s — helper enforces the OLD policy meanwhile
 19-08-2026 20:13 | Wed | hw | [decide] Firefox-ESR is THE test browser; firefox-bin is a different inode and not allowlisted
+19-08-2026 20:22 | Wed | hw | [add] Phase 4 stage 1: --policy-cache — the helper persists the pushed allowlist and reloads it at boot
+19-08-2026 20:26 | Wed | hw | [add] Phase 4 stage 2: system unit debian/hwprivacy-lsm.service + packaging + make install-lsm
+19-08-2026 20:31 | Wed | hw | [fix] g4 CLOSED — event timestamps now carry a full date; ctl and TUI columns widened to match
+19-08-2026 20:36 | Wed | hw | [add] Phase 4 stage 4: offenders table, persistent per-identity denial counters + ctl offenders
+19-08-2026 20:40 | Wed | hw | [note] verified: daemon restart wipes the event ring but the offenders table survives
+19-08-2026 20:41 | Wed | hw | [note] doc-check caught a real anchor drift: g4 moved grant_one_shot 128 -> 133

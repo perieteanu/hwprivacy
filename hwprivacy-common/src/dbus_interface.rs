@@ -34,6 +34,13 @@ pub trait HwPrivacy {
     /// (connected, enforcing_camera, allowed_exes, unresolved, last_error)
     fn get_kernel_status(&self) -> zbus::Result<(bool, bool, u32, u32, String)>;
 
+    /// Persistent denial counters, most persistent first:
+    /// (identity, device, source, denied, first_seen, last_seen)
+    ///
+    /// Survives daemon restarts, unlike `get_events`, which reads an in-memory
+    /// ring buffer.
+    fn get_offenders(&self) -> zbus::Result<Vec<(String, String, String, u32, String, String)>>;
+
     /// Emergency: deny everything immediately
     fn block_all(&self) -> zbus::Result<bool>;
 
