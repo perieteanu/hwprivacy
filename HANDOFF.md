@@ -15,7 +15,7 @@ where.
 | 1 | observe-only eBPF LSM | **validated live** |
 | 2 | camera enforcement | **PROVEN** — acceptance 5/5, denied live against Firefox/WhatsApp |
 | 3 | daemon integration | **13/13 — COMPLETE** (2026-08-19) |
-| 4 | systemd unit for the helper | not started |
+| 4 | continuous operation + audit trail | **code complete**, stage 1 verified live; unit not yet installed |
 | 5 | audio backstop | agreed in principle, not started |
 
 `git`: 26 commits, clean tree. **63 tests**, all passing. 7 crates, 7079 LOC.

@@ -251,6 +251,46 @@ kernel_layer:
       - "c4 is visual too: whether a notification actually appeared, and whether its wording reads right."
       - "Nothing here tests the audio path. Audio is Phase 5 and is deliberately untouched."
 
+  phase_4_stage_1_verified_2026_08_19:
+    what: "The kernel allowlist now survives a helper restart, and a reboot."
+    mechanism: >
+      hwprivacy-lsm --policy-cache. The HELPER owns the file, not the daemon:
+      the daemon is unprivileged and /var/lib is root-owned, so having root read
+      a user-writable path would add a TOCTOU surface for no benefit.
+    stores_paths_not_inodes: >
+      An inode is what the kernel matches on, but it changes when the package
+      manager replaces a binary. A cache of inodes would silently stop matching
+      Firefox after an update — the hardest possible failure to notice. Paths
+      are re-resolved on every load.
+    verified_write: "policy set by daemon -> /var/lib/hwprivacy/policy contains /usr/lib/firefox-esr/firefox-esr"
+    verified_reload: >
+      Helper restarted with --policy-cache and deliberately NO --socket, so the
+      daemon could not connect and could not quietly repair anything. Result:
+      'loaded 1 allowlist entr(ies)', and userspace and kernel agreed exactly —
+      dev=271581186 ino=30287776, the Firefox-ESR inode confirmed earlier the
+      same evening. Camera restored on exit; still never pinned.
+    why_the_absence_matters: >
+      Same reasoning that settled D1: prove it by what is ABSENT. With a socket
+      present you can never rule out the daemon having fixed things behind the
+      test.
+
+  test_harness_race_2026_08_19:
+    what: "A --policy-cache test failed twice and the product was not at fault."
+    cause: >
+      The script killed the running helper while the daemon was mid-push, so
+      SetPolicy arrived at a helper that was already shutting down. The main
+      loop was gone, the reply channel dropped, and the cache code never ran.
+    two_things_that_hid_it:
+      - "The script wrote the helper's log to a mktemp dir and deleted it in the EXIT trap — destroying the one artifact that would have shown 'policy set by daemon' never appearing. A summary chosen in advance only helps if you already guessed what mattered."
+      - "socket.rs reported RecvTimeoutError::Disconnected as 'timed out waiting for the enforcement thread'. A 0.22s disconnect read as a 5s timeout and sent the investigation after slow I/O that did not exist. Now says which of the two it is."
+    the_pattern: >
+      Four instruments failed tonight while the product behaved correctly: a
+      grep for a log line suppressed by --json, two `pkill -f` patterns that
+      matched the checking shell itself, and this race. Assertions on log TEXT
+      and on process-name patterns are the recurring shape. Prefer asserting on
+      STATE — does the socket exist, does the map hold the key, is the open
+      denied.
+
   c5_closed_2026_08_19:
     status: "CLOSED. Measured, defect found, fixed, and re-verified against a live kernel."
     why_it_was_unverifiable_before: >

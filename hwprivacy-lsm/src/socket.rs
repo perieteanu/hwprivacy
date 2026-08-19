@@ -195,10 +195,27 @@ fn handle_connection(
                     break;
                 }
             }
-            Err(_) => {
+            // These two are NOT the same failure and must not report as one.
+            // Timeout means the main loop is alive but slow. Disconnected means
+            // it dropped the reply channel — it exited, or the handler died —
+            // and the request was never answered at all.
+            //
+            // They were conflated as "timed out", and on 2026-08-19 that cost a
+            // debugging cycle: a disconnect arriving in 0.22s was read as a
+            // 5-second timeout, which pointed the investigation at slow I/O
+            // that did not exist.
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 let _ = out_tx.send(Reply::Error {
-                    message: "timed out waiting for the enforcement thread".into(),
+                    message: "the enforcement thread did not answer within 5s".into(),
                 });
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = out_tx.send(Reply::Error {
+                    message: "the enforcement thread stopped without answering — \
+                              it exited or the request handler died"
+                        .into(),
+                });
+                break;
             }
         }
     }

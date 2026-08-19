@@ -101,3 +101,7 @@
 19-08-2026 20:36 | Wed | hw | [add] Phase 4 stage 4: offenders table, persistent per-identity denial counters + ctl offenders
 19-08-2026 20:40 | Wed | hw | [note] verified: daemon restart wipes the event ring but the offenders table survives
 19-08-2026 20:41 | Wed | hw | [note] doc-check caught a real anchor drift: g4 moved grant_one_shot 128 -> 133
+19-08-2026 20:52 | Wed | hw | [done] policy cache WRITE verified: daemon push -> /var/lib/hwprivacy/policy holds firefox-esr
+19-08-2026 20:57 | Wed | hw | [done] policy cache RELOAD verified with NO --socket: kernel map matches userspace exactly
+19-08-2026 20:58 | Wed | hw | [fix] socket.rs conflated timeout with disconnect; a 0.22s disconnect read as a 5s timeout
+19-08-2026 20:58 | Wed | hw | [note] the two cache failures were a race in MY test script, not the product — helper killed mid-push
