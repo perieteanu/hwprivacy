@@ -278,11 +278,32 @@ fn main() -> Result<()> {
         if let Some(cache) = &cli.policy_cache {
             match Policy::from_file(cache) {
                 Ok(cached) => {
-                    if !cli.json {
+                    // NOT gated on !cli.json, deliberately.
+                    //
+                    // The unit runs with --json, and --json suppresses the human
+                    // startup banner. On 2026-08-19 that meant the installed
+                    // service logged "serving the socket" and nothing about
+                    // whether the allowlist had loaded — the single fact an
+                    // operator most needs about a service whose whole job
+                    // depends on that file. It goes to stderr, so it lands in
+                    // the journal without polluting the NDJSON event stream on
+                    // stdout.
+                    //
+                    // Same root cause as the readiness grep that killed a
+                    // working helper earlier the same evening: --json gating a
+                    // message that is not debug chatter.
+                    eprintln!(
+                        "hwprivacy-lsm: loaded {} allowlist entr(ies) from {}",
+                        cached.entries.len(),
+                        cache.display()
+                    );
+                    for e in &cached.entries {
+                        eprintln!("hwprivacy-lsm:   allowed: {}", e.path.display());
+                    }
+                    for (path, why) in &cached.unresolved {
                         eprintln!(
-                            "hwprivacy-lsm: loaded {} allowlist entr(ies) from {}",
-                            cached.entries.len(),
-                            cache.display()
+                            "hwprivacy-lsm:   UNUSABLE: {} ({why}) — this app WILL be denied",
+                            path.display()
                         );
                     }
                     pol = cached;
@@ -296,15 +317,15 @@ fn main() -> Result<()> {
                     );
                 }
                 Err(_) => {
-                    // No cache yet — first boot, or it was never written.
-                    // Correct and expected; the daemon will populate it.
-                    if !cli.json {
-                        eprintln!(
-                            "hwprivacy-lsm: no policy cache at {} yet — starting with an \
-                             empty allowlist until the daemon connects",
-                            cache.display()
-                        );
-                    }
+                    // Also ungated: "the allowlist is empty and everything is
+                    // denied" is the most consequential state this program can
+                    // be in, and it must never be invisible.
+                    eprintln!(
+                        "hwprivacy-lsm: no policy cache at {} yet — starting with an \
+                         EMPTY allowlist. Under --enforce every application is \
+                         denied the camera until the daemon connects and pushes one.",
+                        cache.display()
+                    );
                 }
             }
         }

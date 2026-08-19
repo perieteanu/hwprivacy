@@ -102,8 +102,31 @@ async fn main() -> anyhow::Result<()> {
                             );
                         }
                     } else {
+                        // "unknown", NOT "no".
+                        //
+                        // A disconnected daemon cannot see the kernel state, and
+                        // reporting its own default as fact is how this line came
+                        // to say "NOT blocked" on 2026-08-19 while the camera was
+                        // demonstrably blocked — 3/3 opens denied by a running
+                        // hwprivacy-lsm.service that the daemon simply could not
+                        // reach. Claiming protection that is absent and denying
+                        // protection that is present are the same class of bug,
+                        // and both destroy trust in the readout.
                         println!("  Connected:        no");
-                        println!("  Camera enforced:  no — direct /dev/video* access is NOT blocked");
+                        println!(
+                            "  Camera enforced:  UNKNOWN — the daemon cannot reach the kernel helper,"
+                        );
+                        println!(
+                            "                    so it cannot see whether the camera is enforced."
+                        );
+                        println!("                    Check directly with:");
+                        println!("                      systemctl is-active hwprivacy-lsm");
+                        println!(
+                            "                    If that unit is active, the camera IS being enforced"
+                        );
+                        println!(
+                            "                    from /var/lib/hwprivacy/policy regardless of this line."
+                        );
                     }
                     if !err.is_empty() {
                         println!("  Last error:       {}", err);

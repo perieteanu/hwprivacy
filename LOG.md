@@ -108,3 +108,6 @@
 19-08-2026 21:14 | Wed | hw | [note] ROADMAP shape figures refreshed to 7817 LOC / 78 tests; g4 marked closed
 19-08-2026 21:15 | Wed | hw | [add] install script for hwprivacy-lsm as a system service — typed INSTALL gate, enable+start, no reboot
 19-08-2026 21:16 | Wed | hw | [note] Phase 4 stage 2 stays UNPROVEN until the unit is installed and survives a boot
+19-08-2026 21:21 | Wed | hw | [done] Phase 4 stage 2 PROVEN: unit installed, enforcing from the cache with no daemon connected
+19-08-2026 21:26 | Wed | hw | [fix] ctl said "Camera enforced: no" while the camera WAS enforced; now UNKNOWN when disconnected
+19-08-2026 21:27 | Wed | hw | [fix] --json hid the cache-load line, so the installed service never logged whether the allowlist loaded
