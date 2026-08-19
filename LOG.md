@@ -79,3 +79,11 @@
 19-08-2026 17:38 | Wed | hw | [fix] doc-check precision: LOC/anchor/test checks were flagging scoped claims; a noisy gate is worse than none
 19-08-2026 17:40 | Wed | hw | [note] gate found 4 real stale claims I had missed by hand: 5-crates x2, 3434 LOC, notification.rs:146
 19-08-2026 17:44 | Wed | hw | [fix] HANDOFF.md rewritten for a clean base: pick-up order is C5 -> D1 -> Phase 4 -> Phase 5
+19-08-2026 19:38 | Wed | hw | [note] drove the camera from headless Chrome — real /dev/video0 via V4L2, no human, no notifications
+19-08-2026 19:42 | Wed | hw | [note] C5 MEASURED: 13 denied opens, kernel reports 13, daemon counted 14 — constant off-by-one
+19-08-2026 19:44 | Wed | hw | [note] D1 mechanism PROVEN with Chrome: denied before allowlisting, allowed after, by exe inode
+19-08-2026 19:45 | Wed | hw | [note] reconnect after daemon restart works; helper logged 'policy set by daemon - 2 allowed'
+19-08-2026 19:48 | Wed | hw | [fix] burst summary (pid 0) no longer counted as an access — was +1 and a spurious pid-0 event row
+19-08-2026 19:49 | Wed | hw | [fix] PipeWire cooldown path double-counted: log_event already increments blocked_count
+19-08-2026 19:50 | Wed | hw | [add] denied_opens() as the single accounting rule + 4 tests incl. the measured 13-open case
+19-08-2026 19:55 | Wed | hw | [add] tools/camera-accounting-check — C5 as a repeatable check, no browser and no human

@@ -14,7 +14,7 @@ where.
 |---|---|---|
 | 1 | observe-only eBPF LSM | **validated live** |
 | 2 | camera enforcement | **PROVEN** — acceptance 5/5, denied live against Firefox/WhatsApp |
-| 3 | daemon integration | **11/13**. Two gaps, both below |
+| 3 | daemon integration | **12/13** — C5 settled 2026-08-19 (defect found + fixed, re-verify pending). D1 mechanism proven |
 | 4 | systemd unit for the helper | not started |
 | 5 | audio backstop | agreed in principle, not started |
 
@@ -54,25 +54,51 @@ Test script: `~/projects/claude-run/hwprivacy-phase3-test-20260805.sh`
 Criteria and full result: `docs-yaml/ROADMAP.yaml > kernel_layer >
 phase_3_acceptance_criteria` and `> phase_3_result_2026_08_05`.
 
-### 1. C5 — burst counting is UNVERIFIED, and the test cannot verify it
+### 1. C5 — SETTLED 2026-08-19. Measured, defect found, fixed, not yet re-verified live
 
-Part 2 asks for a call that "should fail", but the daemon pushes the allowlist
-on connect, so Firefox is *allowed* and its 13-open burst is not a denial. The
-only denied app, ffmpeg, opens once and never bursts. **Fix the test**:
-temporarily set `firefox camera = "deny"` in config.toml for the deny phase and
-restore afterwards — the same pattern Part 4 already uses safely.
+Driven with a deterministic 13-open burst from one unprivileged process — no
+browser, no notification, no human as the sensor:
 
-### 2. D1 — unresolved
+```
+13 opens attempted -> 13 denied
+kernel JSON  : 1 event + burst_summary additional_opens=12  = 13   correct
+daemon counter: 8 -> 22                                     = 14   OFF BY ONE
+```
 
-The call did not work even though `firefox-esr` was allowlisted and the kernel
-shows it opening the camera 13 times without denial. Two untested hypotheses,
-both plausible:
+Reproduced three times; the error was a constant +1, never proportional. Cause:
+the burst summary (pid 0) fell through to `log_event(..., Denied)`, which
+increments `blocked_count` itself, on top of the `additional_opens` it was
+accounting for. It also wrote a second, pid-0 DENIED row into the user-visible
+event log for a session that had only one real access.
 
-- the helper is restarted between the deny and allow steps, and for up to 10 s
-  until the daemon reconnects it enforces an EMPTY allowlist
-- the open-fd gap (below) leaving Firefox in a stale state
+**Fixed** in `lsm_client::handle_event` — the summary is now handled before
+`log_event` and contributes only its count. `denied_opens()` is the single
+statement of the rule, with tests including the exact 13-open measurement and
+one pinning `log_event`'s hidden side effect.
 
-**Do not guess between them. Test one at a time.**
+**Still to do: re-run `tools/camera-accounting-check` against a live helper to
+confirm the fix on the machine, not just in tests.** The measurement was taken
+before the fix; nothing has verified it after.
+
+### 2. D1 — the MECHANISM is proven; Firefox specifically is not
+
+With Chrome allowlisted by inode (`exe_path = /opt/google/chrome/chrome`):
+
+```
+chrome /dev/video1 denied=True    <- before allowlisting
+chrome /dev/video1 denied=True    <- reproduced
+chrome /dev/video1 denied=False   <- after adding the rule
+```
+
+So allowlisting by executable inode works end-to-end, and H1 (the empty-allowlist
+reconnect window) is not a standing bug: reconnect after a daemon restart and the
+policy push that follows it both work — the helper logged `policy set by daemon —
+2 allowed` for the new client.
+
+What remains open is **Firefox specifically**, which is a question about
+Firefox's own state, not about whether hwprivacy works. Costin also wants
+headless Firefox and other launchable local software (VLC was mentioned) added
+as test subjects — **discuss before building; do not start this unprompted.**
 
 ### 3. Phase 4 — systemd unit for the helper
 

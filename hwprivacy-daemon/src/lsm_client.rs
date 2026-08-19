@@ -221,32 +221,45 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     // keeps the identity that made the decision.
     let app = short_name(&ev.exe_path);
 
+    // A burst SUMMARY carries pid 0. It is accounting for opens the kernel
+    // already suppressed — not a fresh access — so it must contribute its
+    // count and NOTHING else: no event-log row, no notification.
+    //
+    // Handled BEFORE log_event() deliberately. It used to fall through, and
+    // log_event() increments blocked_count itself on a Denied action, so the
+    // summary was counted once as an access plus once per suppressed open.
+    // Measured 2026-08-19 with a controlled 13-open denied burst: the kernel
+    // reported 13, the daemon counted 14, and the event log showed a second
+    // DENIED row with pid 0 for a session that had only one real prompt.
+    if ev.pid == 0 {
+        if ev.denied {
+            let mut s = state.write().await;
+            s.tracker.blocked_count += denied_opens(&ev);
+        }
+        info!(
+            "Kernel layer: {} further {} open(s) by {} (burst summary, not a new access)",
+            ev.additional_opens,
+            if ev.denied { "denied" } else { "allowed" },
+            app
+        );
+        return;
+    }
+
     {
         let mut s = state.write().await;
         s.tracker
             .log_event(&app, ev.pid, category, &ev.exe_path, action);
 
-        // The kernel already collapsed a burst into one event; count the rest
-        // so "blocked attempts" reflects reality rather than notifications.
-        if ev.denied && ev.additional_opens > 0 {
-            s.tracker.blocked_count += ev.additional_opens;
-        }
+        // denied_opens() is the single statement of how much this event is
+        // worth. log_event() has ALREADY added one for a Denied action, so add
+        // only the remainder — otherwise the two disagree and one of them wins
+        // silently, which is precisely how the +1 got in.
+        // `log_event_denial_contribution_is_one` pins that assumption.
+        let already = if ev.denied { 1 } else { 0 };
+        s.tracker.blocked_count += denied_opens(&ev) - already;
     }
 
     if !ev.denied {
-        return;
-    }
-
-    // A burst SUMMARY carries pid 0: it is the accounting for opens already
-    // reported, not a fresh access. Notifying here would fire a second popup
-    // for the same camera session and defeat the coalescing this summary
-    // exists to support. It still counts toward blocked_count above — the
-    // number must be right even though the notification must not repeat.
-    if ev.pid == 0 {
-        info!(
-            "Kernel layer: {} further denied open(s) by {} (burst summary, no notification)",
-            ev.additional_opens, app
-        );
         return;
     }
 
@@ -276,6 +289,25 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     };
 
     crate::notification::notify_kernel_denial(&app, ev.pid, category, &ev.device, detail).await;
+}
+
+/// How many denied opens one kernel event represents.
+///
+/// Exists as a pure function because this arithmetic was wrong in a way no
+/// unit test could see: it lived inline in `handle_event`, tangled with
+/// `log_event`'s own side effect of incrementing the same counter.
+///
+/// * an allowed event contributes nothing — `blocked_count` counts denials
+/// * a burst summary (pid 0) represents ONLY the opens it accounts for
+/// * any other event is one real open, plus whatever the kernel attached to it
+pub fn denied_opens(ev: &AccessEvent) -> u32 {
+    if !ev.denied {
+        return 0;
+    }
+    if ev.pid == 0 {
+        return ev.additional_opens;
+    }
+    1 + ev.additional_opens
 }
 
 /// Last path component, for a readable event log. `/usr/lib/firefox-esr/firefox-esr`
@@ -321,6 +353,91 @@ mod tests {
     /// camera session produces two popups, which is the defect coalescing
     /// exists to prevent.
     #[test]
+    /// The exact case measured on 2026-08-19 against the live kernel: one
+    /// process opened /dev/video0 thirteen times inside the coalescing window
+    /// and every open was denied. The helper reported one event plus a burst
+    /// summary carrying additional_opens=12 — thirteen opens in total.
+    ///
+    /// The daemon counted FOURTEEN. This test is that measurement.
+    #[test]
+    fn the_measured_thirteen_open_burst_counts_as_thirteen() {
+        let primary = AccessEvent {
+            ts_unix: 0,
+            exe_path: "/usr/bin/python3.13".into(),
+            pid: 645492,
+            device: "/dev/video0".into(),
+            role: "CAMERA".into(),
+            denied: true,
+            additional_opens: 0,
+        };
+        let summary = AccessEvent {
+            pid: 0,
+            additional_opens: 12,
+            ..primary.clone()
+        };
+        assert_eq!(denied_opens(&primary), 1, "the primary open counts once");
+        assert_eq!(
+            denied_opens(&summary), 12,
+            "the summary accounts for the suppressed opens and nothing more"
+        );
+        assert_eq!(
+            denied_opens(&primary) + denied_opens(&summary), 13,
+            "thirteen opens must count as thirteen, not fourteen"
+        );
+    }
+
+    /// `handle_event` subtracts 1 from `denied_opens()` because `log_event`
+    /// silently increments `blocked_count` itself. That is a hidden coupling
+    /// between two files. If it ever stops being true, the compensation above
+    /// becomes an under-count and nothing else would notice.
+    #[test]
+    fn log_event_denial_contribution_is_one() {
+        use hwprivacy_common::stream::AccessAction;
+        use hwprivacy_common::DeviceCategory;
+        let mut t = crate::stream_tracker::StreamTracker::new();
+        assert_eq!(t.blocked_count, 0);
+        t.log_event("x", 1, DeviceCategory::Camera, "/dev/video0", AccessAction::Denied);
+        assert_eq!(t.blocked_count, 1, "log_event counts exactly one denial");
+        t.log_event("x", 1, DeviceCategory::Camera, "/dev/video0", AccessAction::Allowed);
+        assert_eq!(t.blocked_count, 1, "an allowed event must not count");
+    }
+
+    /// The kernel may attach a burst's suppressed count to the NEXT real
+    /// event instead of flushing it separately. That event is still one real
+    /// open, so it carries its own count plus the ones it absorbed.
+    #[test]
+    fn a_real_event_carrying_a_suppressed_count_includes_itself() {
+        let ev = AccessEvent {
+            ts_unix: 0,
+            exe_path: "/opt/google/chrome/chrome".into(),
+            pid: 4242,
+            device: "/dev/video1".into(),
+            role: "CAMERA".into(),
+            denied: true,
+            additional_opens: 7,
+        };
+        assert_eq!(denied_opens(&ev), 8);
+    }
+
+    /// blocked_count counts DENIALS. An allowed burst coalesces exactly the
+    /// same way — measured with an allowlisted Chrome, additional_opens=7 —
+    /// and must contribute nothing.
+    #[test]
+    fn an_allowed_burst_never_touches_the_blocked_count() {
+        let allowed = AccessEvent {
+            ts_unix: 0,
+            exe_path: "/opt/google/chrome/chrome".into(),
+            pid: 4242,
+            device: "/dev/video1".into(),
+            role: "CAMERA".into(),
+            denied: false,
+            additional_opens: 7,
+        };
+        assert_eq!(denied_opens(&allowed), 0);
+        let allowed_summary = AccessEvent { pid: 0, ..allowed.clone() };
+        assert_eq!(denied_opens(&allowed_summary), 0);
+    }
+
     fn a_burst_summary_is_identified_by_pid_zero() {
         let summary = AccessEvent {
             ts_unix: 0,

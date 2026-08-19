@@ -353,8 +353,12 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     {
                         let mut s = state.write().await;
                         if in_cooldown {
+                            // log_event() increments blocked_count itself for a
+                            // Denied action (stream_tracker.rs). An extra += 1
+                            // here counted every cooldown-suppressed block twice.
+                            // The other two Denied paths in this file correctly
+                            // rely on log_event alone.
                             s.tracker.log_event(&app, pid, cat, &node, AccessAction::Denied);
-                            s.tracker.blocked_count += 1;
                         } else {
                             s.tracker.log_event(&app, pid, cat, &node, AccessAction::AskedUser);
                         }

@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+hwprivacy — assert the daemon counts denied camera opens exactly.
+
+WHY THIS EXISTS
+---------------
+Phase 3 criterion C5 said "blocked-attempts must rise by the TOTAL opens (13
+for a Firefox session), not by 1". It went unverified for two weeks because the
+only test asked a human to start a video call in a browser that was ALLOWLISTED
+— so nothing was denied and the counter could not move. The check also asserted
+only `delta >= 10`, which would have passed the bug it was meant to catch.
+
+Measured 2026-08-19 against the live kernel: a controlled 13-open denied burst
+was reported by the kernel as 13 and counted by the daemon as 14. The burst
+summary (pid 0) was being counted as an access in its own right, on top of the
+opens it was accounting for.
+
+This replaces both the browser and the human. It drives a deterministic burst
+from one unprivileged process, then compares two independent sources:
+
+    kernel truth  = the helper's own --json output
+    daemon belief = Blocked attempts, over D-Bus
+
+They must be equal. No magic number, no browser, no notification, no eyes.
+
+WHAT IT DOES NOT COVER
+    Whether a real browser behaves the same. Chrome was measured separately and
+    agreed; Firefox is untested. This checks the ACCOUNTING, not any one app.
+
+Usage:
+    tools/camera-accounting-check [--opens N] [--json-log PATH]
+
+Requires the root helper to already be running with --socket --enforce --json:
+    ~/projects/claude-run/hwprivacy-helper-up-*.sh
+
+Exits non-zero if the two sources disagree.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+DEV = "/dev/video0"
+
+
+def ctl_blocked():
+    try:
+        out = subprocess.run(["hwprivacy-ctl", "status"], capture_output=True,
+                             text=True, timeout=15).stdout
+    except Exception as e:
+        sys.exit(f"cannot reach the daemon: {e}")
+    for line in out.splitlines():
+        if "blocked attempts" in line.lower():
+            return int("".join(c for c in line if c.isdigit()))
+    sys.exit("could not parse 'Blocked attempts' from hwprivacy-ctl status")
+
+
+def ctl_connected():
+    out = subprocess.run(["hwprivacy-ctl", "status"], capture_output=True,
+                         text=True, timeout=15).stdout
+    return "Connected:        yes" in out or "Connected: yes" in out
+
+
+def camera_holders():
+    """Anything already holding the camera makes this untestable: the LSM hook
+    fires on open(), not read, so a pre-existing fd keeps working."""
+    held = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        d = f"/proc/{pid}/fd"
+        try:
+            for fd in os.listdir(d):
+                try:
+                    if os.readlink(f"{d}/{fd}").startswith("/dev/video"):
+                        held.append(pid)
+                        break
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return held
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--opens", type=int, default=13,
+                    help="opens in the burst (default 13, the measured Firefox session)")
+    ap.add_argument("--json-log", default="/tmp/hwprivacy-lsm.json")
+    ap.add_argument("--settle", type=float, default=6.0,
+                    help="seconds to wait for the kernel burst flush")
+    a = ap.parse_args()
+
+    if not os.path.exists(a.json_log):
+        sys.exit(f"no kernel log at {a.json_log} — is the helper running with --json?\n"
+                 f"start it with: ~/projects/claude-run/hwprivacy-helper-up-*.sh")
+
+    if not ctl_connected():
+        sys.exit("the daemon is not connected to the kernel helper.\n"
+                 "Start the helper, wait for 'Connected: yes', then re-run.")
+
+    held = camera_holders()
+    if held:
+        sys.exit(f"pids {','.join(held)} already hold the camera. Close them:\n"
+                 "an already-open fd survives enforcement by design, so this\n"
+                 "measurement would be uninterpretable.")
+
+    before = ctl_blocked()
+    start = os.path.getsize(a.json_log)
+
+    denied = 0
+    for _ in range(a.opens):
+        try:
+            fd = os.open(DEV, os.O_RDONLY)
+            os.close(fd)
+        except OSError:
+            denied += 1
+
+    if denied != a.opens:
+        sys.exit(f"only {denied}/{a.opens} opens were denied — enforcement is not "
+                 f"active, so there is nothing to count. Is the helper running "
+                 f"with --enforce?")
+
+    time.sleep(a.settle)
+    after = ctl_blocked()
+
+    # kernel truth, from the helper's own output
+    kernel_total = 0
+    with open(a.json_log, encoding="utf-8", errors="replace") as fh:
+        fh.seek(start)
+        for line in fh:
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if d.get("kind") == "burst_summary":
+                if d.get("role") == "CAMERA":
+                    kernel_total += int(d.get("additional_opens", 0))
+            elif d.get("role") == "CAMERA" and d.get("denied"):
+                kernel_total += 1
+
+    delta = after - before
+    print(f"  opens driven : {a.opens} (all denied)")
+    print(f"  kernel says  : {kernel_total}")
+    print(f"  daemon says  : {delta}   ({before} -> {after})")
+
+    if delta == kernel_total == a.opens:
+        print("\nPASS — the daemon's count matches the kernel's, exactly.")
+        return 0
+    if kernel_total != a.opens:
+        print(f"\nFAIL — the KERNEL under/over-reported: {kernel_total} for "
+              f"{a.opens} real opens. The coalescing or flush is wrong, not the daemon.")
+        return 1
+    print(f"\nFAIL — the daemon counted {delta} for {kernel_total} real opens "
+          f"(off by {delta - kernel_total}).")
+    if delta == kernel_total + 1:
+        print("       +1 is the burst-summary regression: a pid-0 summary being")
+        print("       counted as an access as well as the opens it accounts for.")
+        print("       See lsm_client::denied_opens() and its tests.")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
