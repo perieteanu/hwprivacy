@@ -72,3 +72,10 @@
 19-08-2026 17:02 | Wed | hw | [fix] CLAUDE.md rewritten against the filesystem: git exists, 63 tests, 8 warnings, notification.rs:146 -> :196
 19-08-2026 17:08 | Wed | hw | [fix] ARCHITECTURE.yaml now covers both layers — it had omitted hwprivacy-lsm and -proto entirely (~3000 LOC)
 19-08-2026 17:09 | Wed | hw | [note] still stale and untouched: README.md (0 mentions of kernel/eBPF/LSM) and MISSION.yaml
+19-08-2026 17:24 | Wed | hw | [fix] README rewritten: kernel layer added, false "every device flows through PipeWire" premise corrected
+19-08-2026 17:26 | Wed | hw | [fix] README dismiss section now says the code writes a permanent deny; signals table marks the two dead declarations
+19-08-2026 17:28 | Wed | hw | [fix] README Known Limitations +5: already-open fd, grandfathered links, BlockAll, unpinned BPF, same-user stop
+19-08-2026 17:35 | Wed | hw | [add] tools/doc-check + make doc-check — 7 checks, each one a contradiction that actually happened here
+19-08-2026 17:38 | Wed | hw | [fix] doc-check precision: LOC/anchor/test checks were flagging scoped claims; a noisy gate is worse than none
+19-08-2026 17:40 | Wed | hw | [note] gate found 4 real stale claims I had missed by hand: 5-crates x2, 3434 LOC, notification.rs:146
+19-08-2026 17:44 | Wed | hw | [fix] HANDOFF.md rewritten for a clean base: pick-up order is C5 -> D1 -> Phase 4 -> Phase 5

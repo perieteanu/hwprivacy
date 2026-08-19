@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""
+hwprivacy — assert that the docs do not contradict the code.
+
+WHY THIS EXISTS
+---------------
+On 2026-08-04 at 22:37 this project pivoted from PipeWire-only enforcement to a
+two-layer design with an eBPF LSM beneath it. ARCHITECTURE.yaml, MISSION.yaml
+and DECISIONS.yaml were last written at 22:37-22:38 — before the first kernel
+design decision and before the first line of kernel code. Nobody reopened them
+for fifteen days. By 2026-08-19 the docs asserted, in writing:
+
+    5 crates / 3434 LOC / `tests: 0  # <-- there are none. Not a typo.` / "No git."
+
+against an actual 7 crates / 7079 LOC / 63 passing tests / 25 commits, and
+ARCHITECTURE.yaml described an architecture missing one of its two enforcement
+layers (~3000 LOC).
+
+The rule meant to prevent this already existed ("update the docs with current
+state"). It failed because it has NO COMPLETION TEST — no way to know when you
+are done. This file is that test.
+
+DELIBERATELY FEW CHECKS
+-----------------------
+Every check below corresponds to a contradiction that ACTUALLY OCCURRED in this
+repo. A linter with twenty checks and occasional false positives trains you to
+ignore it, and then you are worse off than with no check at all. Adding one
+needs the same argument any new dependency needs: something must have gone
+wrong first.
+
+Numeric checks use a tolerance where the number drifts on every commit (LOC),
+and are exact where it does not (crates, binaries, tests). An exact LOC check
+would fail constantly and teach you to skip the gate — which is the failure
+mode this file exists to prevent.
+
+Usage:
+    tools/doc-check          human
+    tools/doc-check --json   for Claude
+
+Read-only. Exits non-zero if any doc contradicts the code, which is what makes
+it usable as a commit or deploy gate.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+JSON = "--json" in sys.argv
+LOC_TOLERANCE = 0.10
+
+failures = []
+passes = []
+
+def fail(check, path, problem):
+    failures.append({"check": check, "file": path, "problem": problem})
+
+def ok(msg):
+    passes.append(msg)
+
+def read(rel):
+    p = os.path.join(ROOT, rel)
+    if not os.path.exists(p):
+        return None
+    with open(p, encoding="utf-8") as fh:
+        return fh.read()
+
+# Docs that make architectural claims. If you add one, add it here.
+DOCS = ["CLAUDE.md", "README.md", "HANDOFF.md",
+        "docs-yaml/ARCHITECTURE.yaml", "docs-yaml/MISSION.yaml",
+        "docs-yaml/ROADMAP.yaml", "docs-yaml/DECISIONS.yaml",
+        "docs-yaml/CONVENTIONS.yaml"]
+
+# ══════════════════════════════════════════════════════════════════
+# ground truth, measured from the tree
+# ══════════════════════════════════════════════════════════════════
+import tomllib
+with open(os.path.join(ROOT, "Cargo.toml"), "rb") as fh:
+    members = tomllib.load(fh)["workspace"]["members"]
+N_CRATES = len(members)
+
+rust_loc = 0
+bpf_loc = 0
+for dirpath, dirnames, filenames in os.walk(ROOT):
+    dirnames[:] = [d for d in dirnames if d not in ("target", ".git")]
+    for f in filenames:
+        fp = os.path.join(dirpath, f)
+        if f.endswith(".rs"):
+            rust_loc += sum(1 for _ in open(fp, encoding="utf-8", errors="replace"))
+        elif f.endswith(".bpf.c"):
+            bpf_loc += sum(1 for _ in open(fp, encoding="utf-8", errors="replace"))
+N_LOC = rust_loc + bpf_loc
+
+N_BINS = len([m for m in members if os.path.exists(os.path.join(ROOT, m, "src", "main.rs"))])
+HAS_GIT = os.path.isdir(os.path.join(ROOT, ".git"))
+
+# ══════════════════════════════════════════════════════════════════
+# 1. Crate count.  OCCURRED: docs said 5, tree had 7, for 15 days.
+# ══════════════════════════════════════════════════════════════════
+for rel in DOCS:
+    body = read(rel)
+    if body is None:
+        continue
+    for m in re.finditer(r"(\d+)\s+crates", body):
+        if int(m.group(1)) != N_CRATES:
+            fail("crate-count", rel,
+                 f"claims {m.group(1)} crates; Cargo.toml has {N_CRATES}")
+ok(f"crate count ({N_CRATES}) consistent across docs")
+
+# ══════════════════════════════════════════════════════════════════
+# 2. Test count.  OCCURRED: ARCHITECTURE.yaml carried
+#    `tests: 0   # <-- there are none. Not a typo.` while 63 passed.
+#    A doc claiming ZERO tests when tests exist is the dangerous case:
+#    it tells the next session not to bother looking.
+# ══════════════════════════════════════════════════════════════════
+n_tests = 0
+try:
+    out = subprocess.run(["cargo", "test", "--workspace", "--no-run", "--message-format=short"],
+                         cwd=ROOT, capture_output=True, text=True, timeout=900)
+    src = subprocess.run(["grep", "-rn", "--include=*.rs", "-e", r"#\[test\]", "-e", r"#\[tokio::test\]", "."],
+                         cwd=ROOT, capture_output=True, text=True)
+    n_tests = len([l for l in src.stdout.splitlines() if "/target/" not in l])
+except Exception as e:
+    fail("test-count", "-", f"could not count tests: {e}")
+
+# A line that names a symbol -- "classify_link() still has zero tests" -- is a
+# SCOPED claim and is usually both true and worth writing. Only an unscoped,
+# project-wide claim is the failure this check exists for. The distinguishing
+# mark is cheap and reliable: a symbol reference contains "()".
+NO_TESTS = (r"tests:\s*0\b", r"zero tests", r"there are none",
+            r"runs nothing", r"there are no tests")
+if n_tests:
+    for rel in DOCS:
+        body = read(rel)
+        if body is None:
+            continue
+        for line in body.splitlines():
+            if "()" in line:          # scoped to a symbol -- not a project claim
+                continue
+            for pat in NO_TESTS:
+                if re.search(pat, line, re.I):
+                    fail("test-count", rel,
+                         f"claims the project has no tests ({line.strip()[:60]!r}); "
+                         f"{n_tests} test functions exist")
+                    break
+    ok(f"no doc claims the project has zero tests ({n_tests} exist)")
+
+# ══════════════════════════════════════════════════════════════════
+# 3. "No git".  OCCURRED: CLAUDE.md said "No git." with 25 commits in .git.
+# ══════════════════════════════════════════════════════════════════
+if HAS_GIT:
+    for rel in DOCS:
+        body = read(rel)
+        if body and re.search(r"\*\*No git\.?\*\*|(?<!\w)No git\.", body):
+            if "renamed" not in body[:0]:  # no exemption; kept explicit
+                fail("git-claim", rel, "claims 'No git' but .git/ exists")
+    ok("no doc claims the project is untracked")
+
+# ══════════════════════════════════════════════════════════════════
+# 4. LOC, with tolerance.  OCCURRED: docs said 3434, tree had 7079 (+106%).
+#    Tolerance exists so ordinary drift does not train you to ignore this.
+# ══════════════════════════════════════════════════════════════════
+# Matches ONLY the canonical project-shape claim ("7 crates, 7079 LOC"), which
+# is the one that rotted. Per-crate figures ("hwprivacy-lsm ... 2434 LOC") and
+# prose about how much was once omitted are NOT project-shape claims, and
+# flagging them would make this gate noise.
+SHAPE_RE = re.compile(r"\d+\s+crates\**,\s*\**([\d,]{3,})\s*\**\s+LOC")
+for rel in DOCS:
+    body = read(rel)
+    if body is None:
+        continue
+    for m in SHAPE_RE.finditer(body):
+        claimed = int(m.group(1).replace(",", ""))
+        if abs(claimed - N_LOC) > N_LOC * LOC_TOLERANCE:
+            fail("loc", rel,
+                 f"project-shape claim of {claimed} LOC; tree has {N_LOC} "
+                 f"(outside +/-{int(LOC_TOLERANCE*100)}%)")
+ok(f"project-shape LOC claims within tolerance of {N_LOC}")
+
+# ══════════════════════════════════════════════════════════════════
+# 5. Source-line anchors.  OCCURRED: b1 was cited as notification.rs:146 in
+#    two docs. Inserting notify_kernel_denial() pushed the real line to 196.
+#    The claim stayed true; the coordinate rotted, and a coordinate that
+#    silently points at the wrong line is worse than none.
+#
+#    Add an anchor here when a doc starts citing a specific line.
+# ══════════════════════════════════════════════════════════════════
+# (source file) -> (token in the SOURCE, marker the DOC uses when citing it).
+# A citation counts as anchored only when the doc names the marker on the SAME
+# LINE as the file:line reference. Without that, every unrelated citation of the
+# same file gets flagged and the gate becomes noise.
+ANCHORS = {
+    "hwprivacy-daemon/src/notification.rs":
+        ("perm.or(Some(Permission::Deny))", "perm.or("),
+    "hwprivacy-daemon/src/stream_tracker.rs":
+        ("pub fn grant_one_shot", "grant_one_shot"),
+}
+for src_rel, (token, marker) in ANCHORS.items():
+    body = read(src_rel)
+    if body is None:
+        fail("anchor", src_rel, "anchored source file does not exist")
+        continue
+    lines = body.splitlines()
+    hits = [i + 1 for i, l in enumerate(lines) if token in l]
+    if len(hits) != 1:
+        fail("anchor", src_rel,
+             f"anchor token {token!r} found {len(hits)} times; expected exactly 1")
+        continue
+    true_line = hits[0]
+    base = os.path.basename(src_rel)
+    cite_re = re.compile(re.escape(base) + r"[#:]L?(\d+)")
+    for rel in DOCS:
+        doc = read(rel)
+        if doc is None:
+            continue
+        for doc_line in doc.splitlines():
+            if marker not in doc_line:
+                continue
+            for m in cite_re.finditer(doc_line):
+                cited = int(m.group(1))
+                if cited != true_line:
+                    fail("anchor", rel,
+                         f"cites {base}:{cited} alongside {marker!r}; "
+                         f"it is at line {true_line}")
+
+# Every OTHER file:line citation is only checked for being in range — a cheap
+# guard against a reference to a file that shrank or was deleted.
+CITE_ANY = re.compile(r"(hwprivacy-[a-z]+/src/[\w/]+\.rs)[#:]L?(\d+)")
+for rel in DOCS:
+    doc = read(rel)
+    if doc is None:
+        continue
+    for m in CITE_ANY.finditer(doc):
+        src, num = m.group(1), int(m.group(2))
+        body = read(src)
+        if body is None:
+            fail("anchor", rel, f"cites {src}:{num} but that file does not exist")
+        elif num > len(body.splitlines()):
+            fail("anchor", rel,
+                 f"cites {src}:{num} but the file has only "
+                 f"{len(body.splitlines())} lines")
+ok("cited source lines match their anchors and are in range")
+
+# ══════════════════════════════════════════════════════════════════
+# 6. Both layers described.  OCCURRED: ARCHITECTURE.yaml and README described
+#    only the PipeWire layer for 15 days while hwprivacy-lsm sat in the tree.
+#    This is the failure this file was written for.
+# ══════════════════════════════════════════════════════════════════
+if os.path.isdir(os.path.join(ROOT, "hwprivacy-lsm")):
+    for rel in ["docs-yaml/ARCHITECTURE.yaml", "CLAUDE.md", "README.md"]:
+        body = read(rel)
+        if body is None:
+            continue
+        if "hwprivacy-lsm" not in body:
+            fail("layer-2-undocumented", rel,
+                 "hwprivacy-lsm/ exists in the tree but this doc never mentions it")
+    ok("both enforcement layers are described")
+
+# ══════════════════════════════════════════════════════════════════
+# 7. docs-yaml parses.  OCCURRED elsewhere in the portfolio; these files are
+#    hand-edited and an unparseable one is silently skipped by every reader.
+# ══════════════════════════════════════════════════════════════════
+try:
+    import yaml
+    d = os.path.join(ROOT, "docs-yaml")
+    for f in sorted(os.listdir(d)):
+        if f.endswith(".yaml"):
+            try:
+                yaml.safe_load(open(os.path.join(d, f), encoding="utf-8"))
+            except Exception as e:
+                fail("yaml", f"docs-yaml/{f}", f"does not parse: {str(e)[:120]}")
+    ok("all docs-yaml/*.yaml parse")
+except ImportError:
+    pass
+
+# ══════════════════════════════════════════════════════════════════
+if JSON:
+    print(json.dumps({"ok": not failures, "failures": failures,
+                      "passes": passes,
+                      "measured": {"crates": N_CRATES, "loc": N_LOC,
+                                   "binaries": N_BINS, "tests": n_tests,
+                                   "git": HAS_GIT}}, indent=2))
+else:
+    print(f"hwprivacy doc-check — measured: {N_CRATES} crates, {N_LOC} LOC, "
+          f"{N_BINS} binaries, {n_tests} tests, git={'yes' if HAS_GIT else 'no'}")
+    print()
+    for p in passes:
+        print(f"  ok    {p}")
+    if failures:
+        print()
+        for f in failures:
+            print(f"  FAIL  [{f['check']}] {f['file']}")
+            print(f"        {f['problem']}")
+        print(f"\n{len(failures)} contradiction(s) between docs and code.")
+    else:
+        print("\nNo contradictions.")
+
+sys.exit(1 if failures else 0)

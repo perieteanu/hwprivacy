@@ -12,7 +12,7 @@ current_state:
     unpredictable.
 
   verified_working:
-    - "Cargo workspace, 5 crates, 3434 LOC, builds clean (5 trivial warnings, 0 errors)"
+    - "Cargo workspace, 7 crates, 7079 LOC, builds clean (8 trivial warnings, 0 errors) — verified 2026-08-19"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"
@@ -40,7 +40,7 @@ blockers:
   b1_dismiss_writes_deny:
     severity: critical
     what: "Dismissing a notification writes a permanent `deny` rule instead of doing nothing."
-    where: "hwprivacy-daemon/src/notification.rs:146 — `perm.or(Some(Permission::Deny))`"
+    where: "hwprivacy-daemon/src/notification.rs:196 — `perm.or(Some(Permission::Deny))`  (was :146 until notify_kernel_denial() was inserted above it; tools/doc-check now guards this coordinate)"
     effect: "The unreachable `None` arm in main.rs:382 means record_dismiss()/is_in_cooldown() are dead code. Config silently accumulated denials the user never chose."
     evidence: "journalctl 18:47:04 — 'dismissed — no rule saved' immediately followed by 'User set rule: ... = deny'"
     mode: execute

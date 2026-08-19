@@ -2,9 +2,17 @@
 
 An Android-style hardware permission manager for the Linux desktop.
 Applications must be granted explicit permission to access microphones, cameras,
-and playback monitor sources. Default policy: **deny all**.
+and playback monitor sources.
+
+Enforcement happens in **two layers**: the PipeWire graph, and an **eBPF LSM in
+the kernel**. Neither is sufficient alone — see [How It Works](#how-it-works).
 
 Built for Debian 13 (Trixie) with PipeWire/WirePlumber. Works on KDE Plasma and GNOME.
+
+> **Default policy is currently `ask`, not deny-all.** The shipped config sets
+> `default_action = "ask"`. Deny-by-default is the stated intent but has not
+> been settled — see `docs-yaml/DECISIONS.yaml > d-posture-unsettled`. Earlier
+> versions of this README claimed deny-all; that was never what the code did.
 
 ---
 
@@ -45,7 +53,23 @@ and enforcing access policies for all applications regardless of packaging forma
 
 ## How It Works
 
-Every audio/video device on a modern Linux desktop flows through **PipeWire**.
+### The premise this project started from — and where it broke
+
+The original design rested on: *every audio/video device on a modern Linux
+desktop flows through PipeWire*. **That premise is false**, and it was never
+tested until 2026-08-04, when it was measured on the live system:
+
+```
+ffmpeg -f v4l2 -i /dev/video0 -frames:v 90   → 90 frames captured, 0 events logged
+ffmpeg -f alsa -i hw:0,0      -t 3           → 3s of mic audio,     0 events logged
+```
+
+Firefox and Chrome take the camera through **V4L2 directly**. No PipeWire node,
+no link, nothing to observe — not "allowed", not "missed", but structurally
+invisible. This is why a second, lower layer exists.
+
+### Layer 1 — the PipeWire graph
+
 PipeWire represents everything as a directed graph:
 
 - **Device nodes**: microphone sources, camera sources, speaker sinks
@@ -65,11 +89,54 @@ when an `Audio/Sink` node appears as the **output** side of a link to a
 (recording what's playing through the speakers). Normal playback flows in the
 opposite direction (`Stream/Output/Audio → Audio/Sink`) and is never blocked.
 
+### Layer 2 — the kernel (eBPF LSM)
+
+`hwprivacy-lsm` attaches an eBPF program to the `security_file_open` LSM hook.
+Every `open()` of a video4linux (major 81) or ALSA (major 116) device node is
+seen, keyed by the **inode of the calling executable** — not by a name the
+application asserts about itself.
+
+- **Camera (major 81)** is enforced under `--enforce`: an executable not on the
+  allowlist gets `-EPERM` from the kernel. Unbypassable from userspace.
+- **Audio (major 116)** is **observe-only** and never denied here. Denying
+  major 116 outright would deny `/usr/bin/pipewire`, which is every
+  application's microphone path. A proper audio backstop is future work.
+
+Measured cost: **+13.75 ns per `open()`** (95% CI [+7.3, +20.2]), 1.88% of a
+733 ns `open()`, and **0% at idle**.
+
+### Why both layers stay
+
+| | sees | blind to |
+|---|---|---|
+| **PipeWire layer** | *which app* wants the mic; the playback monitor | the camera entirely |
+| **Kernel layer** | any `open()` of a camera/ALSA node, by inode | *which app* wants the mic — `/dev/snd` is held by `/usr/bin/pipewire` on everyone's behalf |
+
+The **playback-monitor feature has no kernel equivalent** — there is no
+straightforward way to tap a sink monitor below PipeWire. That is why layer 1
+is not merely legacy.
+
+> **The kernel layer is not running by default.** It has no systemd unit yet,
+> and the BPF program is never pinned — killing the helper detaches it and
+> restores normal access. It currently runs only when started by hand as root.
+
 ---
 
 ## Architecture
 
 ```
+    Application open("/dev/video0")
+                         |
+                         v
+    +--------------------------------------------+
+    |   hwprivacy-lsm (root)  —  eBPF LSM         |
+    |   security_file_open, major 81 / 116        |
+    |   allowlist keyed by executable (dev, ino)  |
+    |   camera: -EPERM      audio: observe only   |
+    +--------------------------------------------+
+                         | AccessEvent, NDJSON over
+                         | /run/hwprivacy/lsm.sock (0660)
+                         v
                     PipeWire Graph
                     (nodes + links)
                          |
@@ -112,17 +179,18 @@ opposite direction (`Stream/Output/Audio → Audio/Sink`) and is never blocked.
 | `ask` | Prompt once, save permanent rule | Unknown apps (default) |
 | `deny` | Always blocked, instant notification shown | Untrusted apps |
 
-### Two-Layer Model (The Browser Solution)
+### Per-Stream Gating (The Browser Solution)
 
 Browsers are mini operating systems — one "Firefox" PipeWire client serves dozens
 of tabs. At the PipeWire level, all tabs share one client name. However, each tab
 that requests mic/camera access creates a **separate PipeWire node** with unique
 properties (`object.serial`, `node.name`, `media.name`).
 
-HWPrivacy uses two layers:
+HWPrivacy gates this in two *stages* (note: unrelated to the two enforcement
+**layers** above — this is entirely inside the PipeWire layer):
 
-- **Layer 1 (App rule)**: "Firefox may use the mic" — baseline permission
-- **Layer 2 (Per-stream gating)**: With `ask_each`, every NEW capture node from
+- **App rule**: "Firefox may use the mic" — baseline permission
+- **Per-stream gating**: With `ask_each`, every NEW capture node from
   Firefox triggers a notification. Shady JavaScript in a background tab gets caught.
 
 ### Notification Behavior
@@ -136,13 +204,24 @@ HWPrivacy uses two layers:
    Presents buttons to set a rule. For `ask`: [Always Allow] [Ask Each Time]
    [While in Use] [Always Deny]. For `ask_each`: [Allow Stream] [Deny Stream].
 
-**Dismiss behavior:**
+**Dismiss behavior — DEFECT, this section describes the intent, not the code:**
 
-- Dismissing (closing without clicking a button) = **no rule saved**
+The design below is what `main.rs` implements and what should happen:
+
+- Dismissing (closing without clicking a button) = no rule saved
 - Access stays blocked for this attempt
-- A **60-second cooldown** prevents notification spam (the monitoring loop runs
-  every 500ms, so without cooldown, a dismissed prompt would reappear instantly)
+- A 60-second cooldown prevents notification spam
 - After cooldown expires, the next attempt prompts again
+
+**What actually happens:** `notification.rs` converts the dismiss into
+`Some(Permission::Deny)` before it ever reaches that logic, so **dismissing a
+prompt writes a permanent `deny` rule** and the cooldown path is dead code.
+Months of ignored popups became policy the user never chose. Tracked as
+blocker **b1** in `docs-yaml/ROADMAP.yaml`; **not yet fixed**.
+
+Because of b1, **kernel-layer denials deliberately use an informational
+notification with no buttons** — routing a new event source through the action
+path would inherit this bug on day one.
 
 ### Protected Device Categories
 
@@ -414,7 +493,7 @@ Rules are automatically saved when set via CLI, TUI, GUI, or notification action
 
 ### Phase 1: Foundation (complete)
 
-- [x] Cargo workspace with 5 crates (common, daemon, ctl, tui, gui)
+- [x] Cargo workspace with 7 crates (common, proto, daemon, lsm, ctl, tui, gui)
 - [x] Config system (TOML, user/system paths, load/save)
 - [x] Device auto-discovery from PipeWire graph via `pw-dump`
 - [x] PipeWire graph monitoring with link diff detection
@@ -538,6 +617,29 @@ Rules are automatically saved when set via CLI, TUI, GUI, or notification action
 5. **GTK4 on KDE**: GTK4 apps work on KDE but use GTK theming, not native Qt/KDE
    look. For a fully native KDE experience, a Qt frontend would be needed.
 
+6. **Kernel enforcement cannot revoke an already-open fd.** The LSM hook fires
+   on `open()`, not on `read()`. An application that opened the camera *before*
+   a deny rule took effect keeps its descriptor and keeps receiving video. This
+   was observed live. Closing it would mean hooking `security_file_permission`
+   (intercepting every read) or revoking on policy change — a design step, not
+   a patch.
+
+7. **Links that already exist when the daemon starts are never evaluated.**
+   They are seeded into `known_link_ids` and grandfathered in. Starting the
+   daemon does not stop an in-progress capture.
+
+8. **`BlockAll()` does not stop anything already recording.** It blocks *new*
+   links. An active stream survives it.
+
+9. **Nothing is enforced at the kernel layer at rest.** `hwprivacy-lsm` has no
+   systemd unit and the BPF program is never pinned, so killing the helper
+   restores normal access.
+
+10. **A process running as your user can just stop the daemon.** `systemctl
+    --user stop hwprivacy` needs no privileges you do not already have. The
+    honest framing is "prevents accidental capture and gives visibility", not
+    "enforces permissions against an adversary".
+
 ---
 
 ## Project Structure
@@ -559,7 +661,22 @@ hwprivacy/
 │       ├── stream.rs                   # StreamInfo, ActiveConnection, AccessEvent
 │       └── dbus_interface.rs           # D-Bus proxy trait (zbus)
 │
-├── hwprivacy-daemon/                   # core daemon
+├── hwprivacy-proto/                    # wire protocol: root helper <-> user daemon
+│   └── src/lib.rs                      # NDJSON, serde ONLY (no D-Bus stack in root)
+│
+├── hwprivacy-lsm/                      # LAYER 2 — the root helper (eBPF LSM)
+│   ├── build.rs
+│   └── src/
+│       ├── main.rs                     # CLI, BPF load/attach, event loop, coalescing
+│       ├── device_index.rs             # (major,minor) -> name; glibc_to_kernel_dev()
+│       ├── policy.rs                   # in-kernel allowlist, keyed by exe (dev, ino)
+│       ├── socket.rs                   # unix socket — the helper's ONLY interface
+│       ├── event.rs                    # AccessEvent, coalescing, burst accounting
+│       └── bpf/
+│           ├── devices.bpf.c           # the LSM program on security_file_open
+│           └── vmlinux.h               # generated from /sys/kernel/btf/vmlinux
+│
+├── hwprivacy-daemon/                   # LAYER 1 — core daemon + layer 2 client
 │   └── src/
 │       ├── main.rs                     # entry point, CLI, monitoring loop, service install
 │       ├── device_discovery.rs         # pw-dump JSON → ProtectedDevice list
@@ -567,8 +684,9 @@ hwprivacy/
 │       ├── policy_engine.rs            # rule matching, link classification, decisions
 │       ├── link_manager.rs             # pw-link/pw-cli link destruction
 │       ├── stream_tracker.rs           # active connections, events, cooldowns
-│       ├── notification.rs             # 2-stage freedesktop notifications
+│       ├── notification.rs             # freedesktop notifications (2-stage + kernel)
 │       ├── dbus_service.rs             # D-Bus server (zbus interface impl)
+│       ├── lsm_client.rs               # connects to hwprivacy-lsm, pushes policy
 │       └── state.rs                    # DaemonState (config + devices + tracker)
 │
 ├── hwprivacy-ctl/                      # CLI tool
@@ -629,11 +747,16 @@ Path: `/org/hwprivacy/Daemon`
 
 ### Signals
 
-| Signal | Args | When |
-|--------|------|------|
-| `AccessAttempt` | (app, pid, device, node, action) | New access attempt processed |
-| `RuleChanged` | (app, device, permission) | Rule created/updated/removed |
-| `StreamEvent` | (app, device, serial, event_type) | Stream connected/disconnected |
+| Signal | Args | When | Emitted? |
+|--------|------|------|----------|
+| `AccessAttempt` | (app, pid, device, node, action) | New access attempt processed | **NO — dead declaration** |
+| `RuleChanged` | (app, device, permission) | Rule created/updated/removed | yes |
+| `StreamEvent` | (app, device, serial, event_type) | Stream connected/disconnected | **NO — dead declaration** |
+
+`AccessAttempt` and `StreamEvent` are declared on the interface but nothing
+ever emits them. **The TUI and GUI therefore poll** (1s and 2s respectively)
+rather than subscribing. Any claim elsewhere that clients are signal-driven is
+false.
 
 ---
 
@@ -657,6 +780,37 @@ PipeWire 1.4.2, ALC257 codec (2 internal mics as stereo), Integrated Camera.
 | D-Bus activation | Daemon auto-starts on first CLI/TUI/GUI connection |
 | GUI tray icon | Shows in KDE system tray, left-click toggles window |
 | GUI close to tray | X hides window, tray "Exit" actually quits |
+
+### Automated tests
+
+`cargo test --workspace` → **63 tests, all passing**. Note the distribution:
+
+| crate | LOC | tests |
+|---|---|---|
+| hwprivacy-lsm | 2434 | 44 |
+| hwprivacy-common | 698 | 9 |
+| hwprivacy-proto | 271 | 6 |
+| hwprivacy-daemon | 2095 | 4 |
+| hwprivacy-ctl / -tui / -gui | 1326 | 0 |
+
+Coverage is lopsided **by era, not by risk**. The kernel layer was written
+test-first; the PipeWire layer was not, and `classify_link()` — the pure
+function that makes the entire layer-1 security decision — still has **zero
+tests**.
+
+> `cargo test` does **not** refresh `target/debug/hwprivacy-lsm`; it builds a
+> separate `cfg(test)` harness. Passing tests once said nothing about the
+> binary actually being executed. Test scripts must `cargo build` themselves.
+
+### Kernel layer acceptance
+
+| Phase | Result |
+|---|---|
+| 1 — observe-only LSM | validated live, attached first try |
+| 2 — camera enforcement | **5/5**, denied live against Firefox and WhatsApp, access restored on detach |
+| 3 — daemon integration | **11/13**. Open: C5 (burst counting) and D1 (unresolved) |
+| 4 — systemd unit for the helper | not started |
+| 5 — audio backstop | not started |
 
 ---
 
