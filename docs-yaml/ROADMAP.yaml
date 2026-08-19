@@ -12,7 +12,7 @@ current_state:
     unpredictable.
 
   verified_working:
-    - "Cargo workspace, 7 crates, 7079 LOC, builds clean (8 trivial warnings, 0 errors) — verified 2026-08-19"
+    - "Cargo workspace, 7 crates, 7817 LOC, 78 tests, builds clean (8 trivial warnings, 0 errors) — verified 2026-08-19"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"
@@ -96,9 +96,9 @@ security_gaps:
     effect: "No forensics. 'Did anything use my mic last Tuesday' is unanswerable."
 
   g4_timestamps_lack_a_date:
-    what: "AccessEvent.timestamp is '%H:%M:%S' only."
-    where: "stream_tracker.rs:65"
-    effect: "Events are ambiguous past midnight; unusable if g3 is ever fixed."
+    status: "CLOSED 2026-08-19 — timestamps now carry a full date; ctl and TUI columns widened to match (at width 10 the date rendered and the clock was cut off)."
+    what: "AccessEvent.timestamp was '%H:%M:%S' only."
+    effect: "Events were ambiguous past midnight — and useless for reading a log back days later, which is what Phase 4 exists for."
 
   g5_camera_bypass:
     severity: "critical — the camera feature does not function against the real threat"
