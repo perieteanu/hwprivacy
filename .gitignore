@@ -14,3 +14,7 @@ hwprivacy-lsm/src/bpf/vmlinux.h
 *.swp
 *~
 .DS_Store
+
+# python bytecode from tools/
+__pycache__/
+*.pyc
