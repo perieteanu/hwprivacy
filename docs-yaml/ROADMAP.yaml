@@ -347,8 +347,48 @@ kernel_layer:
       - "Two Firefox builds: ~/firefox-developer/firefox-bin is inode 1312111 and was never allowlisted, while config.toml reads 'firefox: camera allow'. Calls from Developer Edition are correctly denied and look like a bug."
       - "PipeWire microphone prompts fire during a video call, duplicated (b3), from the old untrusted layer — easily read as the tool misbehaving."
 
+  b5_helper_stops_accepting_clients:
+    severity: critical
+    status: "DIAGNOSED 2026-08-19 22:06. Supersedes the earlier 'reconnect delay' entry, which described the SYMPTOM."
+    what: >
+      After its first client disconnects, hwprivacy-lsm does not reliably accept
+      the next one. The daemon's connect() succeeds — a unix socket reports
+      ESTAB as soon as it is in the listen backlog — so the daemon believes it
+      is connected and blocks waiting for a reply that can never arrive.
+    evidence_2026_08_19: |
+      helper journal, whole boot:
+        client connected    (uid=1000 gid=1000 pid=2086)
+        policy set by daemon — 1 allowed
+        client disconnected (uid=1000 gid=1000 pid=2086)
+        <no further 'client connected' — ever>
+      daemon (pid 15490) logged 'connected to /run/hwprivacy/lsm.sock' and the
+      two config gaps, then nothing. `ss -x` showed its socket ESTAB.
+      Still hung 4 minutes later; a config change could not be pushed at all.
+    where: "hwprivacy-lsm/src/socket.rs — single accept thread; handle_connection() blocks it until that client leaves."
+    why_it_looked_like_a_delay: >
+      Earlier the same evening this presented as a ~51s pause before a policy
+      push landed, and was recorded as 'reconnect delay, observed not
+      diagnosed'. It is not a delay and not a retry interval — it is a stuck
+      accept, which sometimes clears and sometimes does not.
+    impact: >
+      A daemon restart can leave the kernel layer permanently unreachable until
+      the HELPER is restarted. Enforcement continues from the last pushed
+      policy, so the machine stays protected — but config changes silently do
+      not take effect, which is the worst kind of failure for a policy tool.
+    do_not_guess: >
+      Two candidate causes, untested: the accept loop exiting on an Err from
+      listener.incoming(), or the queued connection being lost when
+      handle_connection returns. Instrument the accept loop before changing it.
+    fix_shape: >
+      Accept must not be gated on the previous client finishing. Either accept
+      on its own thread and hand connections off, or handle clients
+      concurrently. Whatever the shape, the helper must log every accept AND
+      every accept error — the absence of a log line is what made this
+      invisible for hours.
+
   reconnect_delay_observed_2026_08_19:
     severity: medium
+    superseded_by: "b5_helper_stops_accepting_clients — this entry described the symptom; that one has the cause."
     what: "After a daemon restart the policy push took ~51s, not the ~10s RECONNECT_SECS implies."
     evidence: "daemon 805082 logged 'connected' at 20:11:39; '1 executable(s) allowed' only at 20:12:30. Seen at least twice."
     why_it_matters: >

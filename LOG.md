@@ -111,3 +111,8 @@
 19-08-2026 21:21 | Wed | hw | [done] Phase 4 stage 2 PROVEN: unit installed, enforcing from the cache with no daemon connected
 19-08-2026 21:26 | Wed | hw | [fix] ctl said "Camera enforced: no" while the camera WAS enforced; now UNKNOWN when disconnected
 19-08-2026 21:27 | Wed | hw | [fix] --json hid the cache-load line, so the installed service never logged whether the allowlist loaded
+19-08-2026 21:54 | Wed | hw | [done] PHASE 4 COMPLETE — unit started 7s after boot, enforcing from cache, daemon connected, NRestarts 0
+19-08-2026 21:59 | Wed | hw | [note] firefox-esr camera ALLOWED by rule (17 opens, denied=false) while python denied 3/3 — both correct
+19-08-2026 22:04 | Wed | hw | [decide] allow wireplumber the camera — Costin's call; restores the PipeWire camera node, costs kernel attribution
+19-08-2026 22:06 | Wed | hw | [note] b5 DIAGNOSED: helper stops accepting clients after the first disconnects; the "51s delay" was this
+19-08-2026 22:08 | Wed | hw | [add] ctl devices now shows a kernel-layer row — a camera absent from PipeWire is not an unprotected one

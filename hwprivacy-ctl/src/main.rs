@@ -142,6 +142,8 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Devices => {
             let devices = proxy.get_devices().await?;
+            let kernel = proxy.get_kernel_status().await.ok();
+
             if devices.is_empty() {
                 println!("No protected devices discovered.");
             } else {
@@ -156,6 +158,47 @@ async fn main() -> anyhow::Result<()> {
                         if *guarded { "ON" } else { "OFF" }
                     );
                 }
+            }
+
+            // The kernel layer guards a device the PipeWire list cannot show.
+            //
+            // This row exists because of what happened on 2026-08-19: with
+            // wireplumber denied the camera, PipeWire had no Video/Source node
+            // at all, so this table listed three devices and NO camera —
+            // while the camera was in fact the single most strongly protected
+            // device on the machine. The tool was silent about it precisely
+            // BECAUSE protection was working.
+            //
+            // Listing devices by what PipeWire happens to expose describes the
+            // monitoring substrate, not the hardware. Say what is guarded.
+            if let Some((connected, enforcing, allowed, unresolved, _)) = kernel {
+                println!();
+                println!("Kernel layer (eBPF LSM) — guards device nodes directly, not via PipeWire");
+                println!("{}", "-".repeat(95));
+                if connected && enforcing {
+                    println!(
+                        "{:<12} {:<45} {:<30} {}",
+                        "camera", "/dev/video* (by executable inode)",
+                        format!("{allowed} executable(s) allowed"), "ON"
+                    );
+                    if unresolved > 0 {
+                        println!(
+                            "{:<12} {:<45} {:<30} {}",
+                            "", "", format!("{unresolved} rule(s) UNUSABLE — those apps are denied"), ""
+                        );
+                    }
+                } else if connected {
+                    println!(
+                        "{:<12} {:<45} {:<30} {}",
+                        "camera", "/dev/video*", "helper connected, observing only", "OFF"
+                    );
+                } else {
+                    println!("  Not connected — this daemon cannot see the kernel layer.");
+                    println!("  It may still be enforcing. Check: systemctl is-active hwprivacy-lsm");
+                }
+                println!();
+                println!("A camera absent from the PipeWire list above is not unprotected —");
+                println!("it may mean wireplumber was denied, so no PipeWire node exists at all.");
             }
         }
 
