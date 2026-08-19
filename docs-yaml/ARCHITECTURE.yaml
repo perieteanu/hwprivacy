@@ -10,10 +10,10 @@
 ---
 shape:
   language: "Rust 2021 + one BPF C file"
-  layout: "Cargo workspace, 7 crates, 7079 LOC of first-party code (6824 Rust + 255 BPF C; generated vmlinux.h excluded)"
+  layout: "Cargo workspace, 7 crates, 7878 LOC of first-party code (7623 Rust + 255 BPF C; generated vmlinux.h excluded)"
   build: "cargo build --release --workspace  (or: make build)"
   binaries: 5
-  tests: 63         # 44 lsm + 9 common + 6 proto + 4 daemon. Zero in ctl/tui/gui.
+  tests: 78         # 48 lsm + 15 daemon + 9 common + 6 proto. Zero in ctl/tui/gui.
   test_distribution_warning: >
     Coverage is lopsided by era, not by risk. The kernel layer (2026-08) has 44
     tests; the PipeWire layer (2026-03) has 4, none of which touch
