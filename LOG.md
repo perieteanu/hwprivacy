@@ -123,3 +123,5 @@
 19-08-2026 22:33 | Wed | hw | [note] MEASURED: right mic link cut mid-capture -> rms 0.0, left kept recording, parecord never noticed
 19-08-2026 22:35 | Wed | hw | [decide] b3 is a LABELLING bug not a duplication bug — two prompts are two MICROPHONES; do not coalesce
 19-08-2026 22:36 | Wed | hw | [note] mic was MUTED for every microphone test tonight until 22:32; link-level results unaffected
+19-08-2026 22:40 | Wed | hw | [decide] naming for indistinguishable devices: mic1..micN, cam1..camN — never left/right — unless the device publishes a name
+19-08-2026 22:41 | Wed | hw | [note] ordinals must derive from a REBOOT-STABLE key (port name, not port id) or a rule silently moves to another device

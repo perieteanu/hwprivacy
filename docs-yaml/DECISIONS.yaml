@@ -328,8 +328,13 @@ decisions:
       - "b3's fix_shape in ROADMAP is WRONG as written and must not be implemented as coalescing."
       - "Whatever renders a prompt must name the microphone, or the user cannot tell which of two identical dialogs to answer."
       - "The offenders table will need the same distinction, or two mics collapse into one row."
-    open_question: >
-      Which physical microphone is FL and which is FR depends on codec wiring
-      and has NOT been determined. A label saying 'left' must be verified
-      against the hardware before it is shown to anyone, or it will be
-      confidently wrong.
+    open_question_CLOSED_2026_08_19: >
+      "Which mic is physically left?" was not answered — it was made
+      irrelevant. Costin's ruling: do not use left/right at all. Name them
+      mic1..micN and cam1..camN, ordinals only, unless the device publishes its
+      own name. An ordinal claims only "the first one", which is true by
+      construction; "left" is a claim about the chassis that we never verified.
+      See CONVENTIONS.yaml > multiple_devices_of_one_kind for the naming rule
+      and, critically, the stability constraint: the ordinal must come from a
+      key that survives a reboot (port NAME, not port id) or a rule silently
+      migrates to a different microphone.

@@ -117,3 +117,35 @@ test_subjects:
     Headless Firefox and other local software (VLC was raised) as additional
     subjects. DISCUSS BEFORE BUILDING — Costin asked explicitly not to start
     this unprompted.
+
+multiple_devices_of_one_kind:
+  rule: "mic1, mic2, mic3 … micN. cam1, cam2 … camN. UNLESS the device publishes its own name or identifier, in which case use that."
+  decided: "2026-08-19, by Costin, after declining to determine which internal microphone is physically left."
+  why_ordinals_and_not_left_right: >
+    "Left" is a claim about the physical world. Which internal microphone maps
+    to capture_FL depends on codec wiring and was NOT determined. A label that
+    says "left microphone" and is wrong is worse than one that says nothing,
+    because the user acts on it — and this project has spent two days cleaning
+    up readouts that asserted things they had not established. "mic1" claims
+    only that it is the first one, which is true by construction.
+  the_constraint_that_makes_or_breaks_this: >
+    The ordinal MUST be derived deterministically from something STABLE across
+    reboots, or a rule saying "mic2 = deny" silently starts denying a different
+    microphone. PipeWire port IDs are NOT stable — they are allocated per
+    session. Port NAMES are: capture_FL and capture_FR persist. So sort by a
+    stable key (port name) and assign ordinals in that order. Never assign by
+    discovery order, arrival order, or port id.
+  prefer_the_published_name: >
+    A USB webcam or headset usually reports a product name. Use it. Ordinals
+    are the fallback for indistinguishable devices on one physical adapter,
+    not the default for everything.
+  applies_to:
+    - "notification text — the user must be able to tell two prompts apart"
+    - "rules in config.toml"
+    - "the offenders table, or two mics collapse into one row"
+    - "hwprivacy-ctl devices"
+  worked_example_2026_08_19: >
+    This laptop: one ALSA stereo capture device, two physical microphones,
+    exposed by PipeWire as ports capture_FL and capture_FR. Sorted by name that
+    is FL then FR, so FL = mic1 and FR = mic2 — with no claim about which one
+    is on the left of the chassis.
