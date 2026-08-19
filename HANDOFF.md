@@ -1,4 +1,4 @@
-# HANDOFF — 2026-08-19
+# HANDOFF — 2026-08-19 (evening session)
 
 Read this first, then `CLAUDE.md`, then `docs-yaml/ROADMAP.yaml`.
 
@@ -18,11 +18,14 @@ where.
 | 4 | continuous operation + audit trail | **code complete**, stage 1 verified live; unit not yet installed |
 | 5 | audio backstop | agreed in principle, not started |
 
-`git`: 26 commits, clean tree. **63 tests**, all passing. 7 crates, 7079 LOC.
+`git`: 32 commits, clean tree. **78 tests**, all passing. 7 crates, 7817 LOC.
+Run `make doc-check` before trusting any number in any doc here — it is green
+as of this commit and it has already caught two real drifts.
 
-The last *code* session was 2026-08-05. The 2026-08-19 session wrote no code —
-it realigned the documentation with the tree and built the gate that keeps it
-that way. Nothing about the program's behaviour changed.
+2026-08-19 was two sessions. The morning wrote no code — it realigned the docs
+with the tree and built `tools/doc-check` to keep them that way. The evening
+closed Phase 3 (C5 + D1), fixed three accounting defects, and built all of
+Phase 4. Behaviour changed; see below.
 
 ---
 
@@ -50,67 +53,35 @@ systemctl --user restart hwprivacy
 
 ## Pick up here — in this order
 
-Test script: `~/projects/claude-run/hwprivacy-phase3-test-20260805.sh`
-Criteria and full result: `docs-yaml/ROADMAP.yaml > kernel_layer >
-phase_3_acceptance_criteria` and `> phase_3_result_2026_08_05`.
+### 1. Install the kernel unit and prove it survives a boot
 
-### 1. C5 — CLOSED 2026-08-19. Measured, defect found, fixed, verified live
+Everything about Phase 4 is written and committed, and stages 1, 3 and 4 are
+verified live. **Stage 2 is not**: the systemd unit has never been installed or
+booted. Until it is, the kernel layer still protects nothing unless a human
+starts it by hand — which was the entire point of Phase 4.
 
-Driven with a deterministic 13-open burst from one unprivileged process — no
-browser, no notification, no human as the sensor:
-
-```
-13 opens attempted -> 13 denied
-kernel JSON  : 1 event + burst_summary additional_opens=12  = 13   correct
-daemon counter: 8 -> 22                                     = 14   OFF BY ONE
+```bash
+~/projects/claude-run/hwprivacy-install-lsm-20260819.sh   # asks you to type INSTALL
 ```
 
-Reproduced three times; the error was a constant +1, never proportional. Cause:
-the burst summary (pid 0) fell through to `log_event(..., Denied)`, which
-increments `blocked_count` itself, on top of the `additional_opens` it was
-accounting for. It also wrote a second, pid-0 DENIED row into the user-visible
-event log for a session that had only one real access.
+Then reboot and confirm the helper is active and enforcing from
+`/var/lib/hwprivacy/policy` before anyone logs in.
 
-**Fixed** in `lsm_client::handle_event` — the summary is now handled before
-`log_event` and contributes only its count. `denied_opens()` is the single
-statement of the rule, with tests including the exact 13-open measurement and
-one pinning `log_event`'s hidden side effect.
+**Expect `hwprivacy-ctl` to say `Connected: no` right after installing.** The
+desktop session predates the `hwprivacy` group, so the daemon cannot open the
+socket until the next login. Not a fault. The helper enforces from the cache
+meanwhile, which is exactly the boot scenario.
 
-**Re-verified live 2026-08-19 19:55**, after the fix, against a running helper:
+### 2. b3 — duplicate prompts. Now corrupts the audit trail too
 
-```
-tools/camera-accounting-check --opens 1   -> kernel 1,  daemon 1   PASS
-tools/camera-accounting-check --opens 5   -> kernel 5,  daemon 5   PASS
-tools/camera-accounting-check --opens 13  -> kernel 13, daemon 13  PASS
-tools/camera-accounting-check --opens 27  -> kernel 27, daemon 27  PASS
-headless Chrome (a real browser)          -> kernel 2,  daemon 2   PASS
-```
+One stereo capture creates two PipeWire links, evaluated independently, so it
+produces two BLOCKED popups, two rule prompts, **and two rows in the persistent
+offenders table**. Seen four times live on 2026-08-19. It was cosmetic; now
+that Phase 4 persists counters, it inflates history for as long as it stays
+unfixed. Fix shape: coalesce new links by (app node, device category) within a
+poll before deciding or notifying.
 
-The event log also shows one row per session again, not two — four bursts
-produced exactly four DENIED rows, where before each session added a second
-row with pid 0. C5 is closed.
-
-### 2. D1 — CLOSED 2026-08-19. Proven both directions, on screen
-
-Firefox-ESR (inode 30287776), one config line changed between the two runs:
-
-| | policy | kernel verdict | on screen |
-|---|---|---|---|
-| 20:02 | `camera = "allow"` | `denied=False`, 13 opens | live video |
-| 20:10 | `camera = "deny"` | `denied=True`, 4 opens | "Camera or microphone not found" |
-
-Both confounds were excluded **before** the deny run, not argued away after:
-`Allowed binaries` was 0, the helper independently logged `0 allowed`, nothing
-held `/dev/video*`, and a probe confirmed 3/3 denied seconds earlier.
-
-Enforcement works. What had made it look broken: a retained fd (the hook is on
-`open()`, not read), two Firefox builds with different inodes where only one is
-allowlisted, and loud duplicated microphone prompts from the old layer during
-any video call.
-
-**Phase 3 is 13/13.**
-
-### 3. Phase 4 — systemd unit for the helper
+### 3. Phase 4 background — why the unit matters
 
 Until this exists, layer 2 protects nothing unless a human is running it. This
 is the single largest gap between "proven in a test" and "actually protecting
@@ -191,27 +162,30 @@ Hook cost: **+13.75 ns/open**, 95 % CI `[+7.3, +20.2]`, 1.88 % of a 733 ns
 
 ## What the 2026-08-19 session changed
 
-No code. Documentation only, plus one new tool.
+Two sessions in one day. The morning was documentation; the evening was code
+and measurement.
 
-- **`d-kernel-lsm-layer`** written. The 2026-08-04 pivot had **no ADR at all**
-  for fifteen days; `DECISIONS.yaml` recorded why the old basis was wrong and
-  never what replaced it. Marked as backfilled, not dressed up as
-  contemporaneous.
-- **`d-event-driven-substrate` demoted** to layer-1-only/deferred. It was
-  titled "DIRECTION SET" and sat last in the file, so a cold reader concluded
-  the current direction was "rewrite the PipeWire poller". It is not.
-- **`d-two-layer-model` → `d-per-stream-gating`.** "Two-layer" meant both
-  *app-rule + per-stream gating* (March, browser tabs) and *PipeWire + kernel*
-  (August). `renamed_from:` is kept so a grep for the old id still lands.
-- **`CLAUDE.md`, `ARCHITECTURE.yaml`, `README.md`** realigned with the tree.
-  ARCHITECTURE had omitted `hwprivacy-lsm`, `hwprivacy-proto` and
-  `lsm_client.rs` entirely — roughly 3000 LOC, one of the two enforcement
-  layers. README had zero occurrences of "kernel", "eBPF" or "LSM".
-- **`tools/doc-check`** (`make doc-check`). Seven checks, each one corresponding
-  to a contradiction that actually occurred here. Deliberately few: a linter
-  with twenty checks and occasional false positives trains you to ignore it.
+**Documentation** — the 2026-08-04 kernel pivot had no ADR for fifteen days;
+`DECISIONS.yaml` recorded why the old basis was wrong and never what replaced
+it. Added `d-kernel-lsm-layer`, demoted `d-event-driven-substrate` to
+layer-1-only (it was titled "DIRECTION SET" and read as the current direction),
+renamed `d-two-layer-model` → `d-per-stream-gating` to kill a phrase collision,
+and realigned CLAUDE.md, ARCHITECTURE.yaml and README with the tree. Added
+`tools/doc-check` (`make doc-check`) — seven checks, each one a contradiction
+that actually occurred here.
 
----
+**Phase 3 closed, 13/13.** C5 was measured, found to over-count by exactly one,
+fixed, and re-verified. D1 was proven in both directions with Firefox-ESR.
+
+**Phase 4 built**, stages 1/3/4 verified live: `--policy-cache`, dated
+timestamps, and `hwprivacy-ctl offenders`.
+
+**A pattern, not just fixes.** Four instruments failed while the product
+behaved correctly — a grep for a line `--json` suppresses, two `pkill -f`
+patterns matching the checking shell itself, and a test that killed the helper
+mid-push then deleted the log proving it. Recorded in `ROADMAP.yaml >
+test_harness_race_2026_08_19`. Assert on STATE, never on log text or process
+names, and never let a test delete its own raw evidence.
 
 ## Deliberately NOT done
 

@@ -105,3 +105,6 @@
 19-08-2026 20:57 | Wed | hw | [done] policy cache RELOAD verified with NO --socket: kernel map matches userspace exactly
 19-08-2026 20:58 | Wed | hw | [fix] socket.rs conflated timeout with disconnect; a 0.22s disconnect read as a 5s timeout
 19-08-2026 20:58 | Wed | hw | [note] the two cache failures were a race in MY test script, not the product — helper killed mid-push
+19-08-2026 21:14 | Wed | hw | [note] ROADMAP shape figures refreshed to 7817 LOC / 78 tests; g4 marked closed
+19-08-2026 21:15 | Wed | hw | [add] install script for hwprivacy-lsm as a system service — typed INSTALL gate, enable+start, no reboot
+19-08-2026 21:16 | Wed | hw | [note] Phase 4 stage 2 stays UNPROVEN until the unit is installed and survives a boot
