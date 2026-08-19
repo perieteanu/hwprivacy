@@ -120,3 +120,6 @@
 19-08-2026 22:18 | Wed | hw | [decide] revert the pipewire camera grant; wireplumber stays allowed. Granting pipewire would extend /dev/snd blindness to video
 19-08-2026 22:20 | Wed | hw | [fix] b5 FIXED — events thread parked in recv() forever, so join() wedged the accept loop after every disconnect
 19-08-2026 22:22 | Wed | hw | [add] b5 regression test, verified to FAIL against the reintroduced bug and pass against the fix
+19-08-2026 22:33 | Wed | hw | [note] MEASURED: right mic link cut mid-capture -> rms 0.0, left kept recording, parecord never noticed
+19-08-2026 22:35 | Wed | hw | [decide] b3 is a LABELLING bug not a duplication bug — two prompts are two MICROPHONES; do not coalesce
+19-08-2026 22:36 | Wed | hw | [note] mic was MUTED for every microphone test tonight until 22:32; link-level results unaffected

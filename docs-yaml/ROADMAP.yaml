@@ -61,7 +61,8 @@ blockers:
     where: "hwprivacy-daemon/src/main.rs — `for link in &new_links`, no grouping"
     effect: "Each channel is its own PipeWire link and is evaluated independently. Reads as broken."
     evidence: "event log shows exact pairs: 18:45:17 monitor DENIED x2, 18:45:19 x2, 18:45:22 x2"
-    fix_shape: "coalesce new links by (app node, device category) within a poll before deciding/notifying"
+    fix_shape: "SUPERSEDED — do NOT coalesce. See DECISIONS d-per-microphone-identity: the two links are two PHYSICAL MICROPHONES (capture_FL / capture_FR), not duplicates. Label each prompt with which microphone it is."
+    reframed_2026_08_19: "b3 is a LABELLING bug, not a duplication bug. Coalescing would destroy the only handle on which mic is being requested — and per-channel gating was measured to work: right mic cut mid-capture went to rms 0.0 while the left kept recording and the app never noticed."
     mode: execute
     est_minutes: 60
 
