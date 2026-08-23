@@ -129,6 +129,38 @@ pub struct PolicyConfig {
     /// surface reported healthy.
     #[serde(default = "default_exe_recheck")]
     pub exe_recheck_secs: u64,
+
+    /// Notify when access is ALLOWED, not only when it is denied.
+    ///
+    /// Measured 2026-08-21: firefox-esr opened the camera twice in one morning
+    /// with no video call, because a website held a standing per-origin grant
+    /// and a restored tab re-acquired on reload. hwprivacy allowed both
+    /// correctly and said nothing — the deny path had a notification and a
+    /// history row, the allow path had neither.
+    #[serde(default = "default_true")]
+    pub notify_on_allow: bool,
+
+    /// Stay quiet about allowed access for this many seconds after the daemon
+    /// starts.
+    ///
+    /// System components probe the camera at boot — `wireplumber` does it about
+    /// eight seconds in, and `v4l_id` before that. A grace window suppresses
+    /// them without naming any of them, which matters because naming
+    /// applications is exactly what this project does not do
+    /// (`d-executable-is-the-principal`). Cost: a real access in the first
+    /// minute after login is silent.
+    #[serde(default = "default_notify_allow_grace")]
+    pub notify_allow_grace_secs: u64,
+
+    /// Minimum gap between two "allowed" notifications for the same
+    /// (app, device).
+    ///
+    /// Collapses one burst of activity into one notification, while still
+    /// reporting the same app again later — the two firefox-esr camera opens
+    /// that prompted this feature were 26 minutes apart and were two separate
+    /// things worth knowing.
+    #[serde(default = "default_notify_allow_cooldown")]
+    pub notify_allow_cooldown_secs: u64,
 }
 
 fn default_deny_action() -> Permission {
@@ -147,6 +179,14 @@ fn default_exe_recheck() -> u64 {
     30
 }
 
+fn default_notify_allow_grace() -> u64 {
+    60
+}
+
+fn default_notify_allow_cooldown() -> u64 {
+    300
+}
+
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
@@ -154,6 +194,9 @@ impl Default for PolicyConfig {
             poll_interval_ms: default_poll_interval(),
             dismiss_cooldown_secs: default_dismiss_cooldown(),
             exe_recheck_secs: default_exe_recheck(),
+            notify_on_allow: true,
+            notify_allow_grace_secs: default_notify_allow_grace(),
+            notify_allow_cooldown_secs: default_notify_allow_cooldown(),
         }
     }
 }

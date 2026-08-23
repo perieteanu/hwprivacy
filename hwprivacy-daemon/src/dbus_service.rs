@@ -157,10 +157,10 @@ impl HwPrivacyService {
     ///
     /// Additive, like GetKernelStatus: GetEvents keeps its signature so the
     /// three frontends stay working untouched.
-    async fn get_offenders(&self) -> Vec<(String, String, String, u32, String, String)> {
+    async fn get_history(&self) -> Vec<(String, String, String, u32, u32, String, String)> {
         let state = self.state.read().await;
         state
-            .offenders
+            .history
             .sorted()
             .into_iter()
             .map(|o| {
@@ -169,6 +169,7 @@ impl HwPrivacyService {
                     o.device,
                     o.source,
                     o.denied,
+                    o.allowed,
                     o.first_seen,
                     o.last_seen,
                 )

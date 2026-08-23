@@ -1,9 +1,10 @@
 mod dbus_service;
 mod device_discovery;
+mod history;
 mod link_manager;
 mod lsm_client;
 mod notification;
-mod offenders;
+mod notify_allow;
 mod pipewire_monitor;
 mod policy_engine;
 mod state;
@@ -474,14 +475,58 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                         s.tracker
                             .track_while_in_use(&stream.app_name, stream.node_id);
                     }
-                    s.tracker.log_event(
+                    s.log_allowed(
                         &stream.app_name,
                         stream.pid,
                         device.category,
                         instance,
                         &stream.node_name,
-                        AccessAction::Allowed,
                     );
+
+                    // Say so, if this one is worth saying. The gate is a pure
+                    // function precisely so its rules can be tested; see
+                    // notify_allow.rs for why each of them exists.
+                    let access = notify_allow::AllowedAccess {
+                        app: &stream.app_name,
+                        device: device.category,
+                        pid: stream.pid,
+                    };
+                    let now = std::time::Instant::now();
+                    let announce = s.allow_notifier.should_notify(
+                        access,
+                        s.uptime(),
+                        now,
+                        &s.config.policy,
+                    );
+                    if announce {
+                        s.allow_notifier.mark_notified(access, now);
+                    }
+                    let (app, pid, cat) =
+                        (stream.app_name.clone(), stream.pid, device.category);
+                    let inst = m.instance.clone();
+                    drop(s);
+                    if announce {
+                        // Logged, symmetrically with the kernel layer's
+                        // "Kernel layer ALLOWED". Whether a popup appeared is
+                        // otherwise invisible to everything except a human
+                        // watching the screen — which is not something a check
+                        // can assert on, and this project has already been
+                        // burned by verification that depended on someone
+                        // seeing a notification (C4, scored wrong twice).
+                        info!(
+                            "Announced allowed access: {} → {}",
+                            app,
+                            notification::device_label_for(cat, inst.as_deref())
+                        );
+                        notification::notify_allowed(
+                            &app,
+                            pid,
+                            cat,
+                            inst.as_deref(),
+                            "Allowed by your rules. hwprivacy cannot tell when access ends.",
+                        )
+                        .await;
+                    }
                 }
 
                 PolicyDecision::Deny => {

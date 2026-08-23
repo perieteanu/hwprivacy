@@ -72,6 +72,12 @@ notifications:
     Every body that names an app also prints "Rule name: <key>" — the string
     that will actually match. The pid stays visible because it distinguishes two
     instances, but it is no longer the only thing there is to copy.
+  allowed_access: >
+    "X used the Camera" — Urgency::Normal, transient, no buttons. PAST TENSE
+    always: the LSM hook is on open() and nothing fires on close, so hwprivacy
+    does not know when access ends and must not imply it does. Gated by
+    notify_allow.rs — see DECISIONS d-notify-on-allow for why the gate is a
+    startup grace plus a cooldown rather than an allowlist of system daemons.
   dismiss_contract:
     contract: "block this attempt, save NO rule, stay quiet for policy.dismiss_cooldown_secs, ask again after it"
     since: "2026-08-21 — see DECISIONS.yaml d-dismiss-saves-nothing"
@@ -98,7 +104,7 @@ code_style:
   lint: "cargo check is clean. clippy is NOT installed for this toolchain (`cargo clippy` -> no such command)."
 
 testing:
-  current: "120 tests — 15 common, 50 daemon, 49 lsm, 6 proto. Zero in ctl/tui/gui."
+  current: "132 tests — 15 common, 62 daemon, 49 lsm, 6 proto. Zero in ctl/tui/gui."
   still_uncovered:
     - "parse_node() / parse_link() / parse_port() against real pw-dump JSON. classify_link() is covered as of 2026-08-21, but from hand-built structs — the JSON parsing in front of it is not."
     - "the three frontends (ctl, tui, gui)."

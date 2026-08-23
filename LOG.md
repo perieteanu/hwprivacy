@@ -143,3 +143,8 @@
 23-08-2026 16:10 | Sun | hw | [note] LIVE: parecord mic -> two rows "microphone (mic1)" / "(mic2)"; monitor tap -> ONE row. b3 verified end to end
 23-08-2026 16:20 | Sun | hw | [note] NEW b6 found while verifying b1: Hint::Resident(true) beats timeout(60000) — the prompt never expires, so the cooldown never starts
 23-08-2026 16:22 | Sun | hw | [note] b1's fix holds (config byte-identical, no rule written) but "ask again later" does not happen — the first ask never ends. Not fixed, needs a decision
+23-08-2026 17:05 | Sun | hw | [add] notify-on-allow: the allow path was silent while the deny path was loud. Gate is a pure fn — startup grace + per-(app,device) cooldown
+23-08-2026 17:08 | Sun | hw | [decide] kernel layer announces CAMERA allows only — it sees /usr/bin/pipewire for the mic, and layer 1 already names the real app. One access, one notification
+23-08-2026 17:15 | Sun | hw | [add] offenders -> history, with an allowed column. Migration preserved all 115 accumulated denials; old file left in place
+23-08-2026 17:35 | Sun | hw | [note] LIVE: two allowed monitor accesses -> ONE announcement. Cooldown verified end to end
+23-08-2026 17:38 | Sun | hw | [note] added an "Announced allowed access" log line — whether a popup appeared is otherwise unassertable, which is how C4 got scored wrong twice

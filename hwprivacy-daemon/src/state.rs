@@ -1,9 +1,11 @@
 use hwprivacy_common::device::ProtectedDevice;
 use hwprivacy_common::Config;
 use crate::lsm_client::KernelLayerState;
-use crate::offenders::Offenders;
+use crate::history::History;
+use crate::notify_allow::AllowNotifier;
 use crate::stream_tracker::StreamTracker;
 use std::collections::HashSet;
+use std::time::Instant;
 
 /// Full runtime state of the daemon.
 pub struct DaemonState {
@@ -20,9 +22,15 @@ pub struct DaemonState {
     /// What we know about the kernel (eBPF LSM) layer. Absent/disconnected is
     /// normal — it is an addition, never a dependency.
     pub kernel: KernelLayerState,
-    /// Per-executable denial counters that SURVIVE a restart, unlike
+    /// Per-executable access counters that SURVIVE a restart, unlike
     /// `tracker.events` which is a 500-entry in-memory ring buffer.
-    pub offenders: Offenders,
+    pub history: History,
+    /// Rate-limits "X used your camera" so boot probes and repeat opens do not
+    /// become a stream of popups.
+    pub allow_notifier: AllowNotifier,
+    /// When the daemon started. Only used for the notify-on-allow grace window,
+    /// which suppresses the camera probes every boot produces.
+    pub started_at: Instant,
 }
 
 impl DaemonState {
@@ -34,8 +42,18 @@ impl DaemonState {
             known_link_ids: HashSet::new(),
             block_all: false,
             kernel: KernelLayerState::default(),
-            offenders: Offenders::load(crate::offenders::default_path()),
+            history: History::load_with_legacy(
+                crate::history::default_path(),
+                crate::history::legacy_path(),
+            ),
+            allow_notifier: AllowNotifier::default(),
+            started_at: Instant::now(),
         }
+    }
+
+    /// How long the daemon has been up.
+    pub fn uptime(&self) -> std::time::Duration {
+        self.started_at.elapsed()
     }
 
     /// Log a PipeWire-layer denial AND count it in the persistent table.
@@ -65,13 +83,42 @@ impl DaemonState {
         let now = chrono::Local::now()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();
-        self.offenders.record(
+        self.history.record_denied(
             &hwprivacy_common::config::normalize_app_name(app_name),
             &format!("{category:?}").to_lowercase(),
-            crate::offenders::SOURCE_PIPEWIRE,
+            crate::history::SOURCE_PIPEWIRE,
             1,
             &now,
         );
-        self.offenders.save_if_dirty();
+        self.history.save_if_dirty();
+    }
+
+    /// Log a PipeWire-layer ALLOW and count it in the persistent table.
+    ///
+    /// Mirrors [`Self::log_denied`] deliberately: the allow path used to write
+    /// an event-log row and nothing else, so "did anything use my camera on
+    /// Tuesday" was unanswerable for exactly the accesses that succeeded.
+    pub fn log_allowed(
+        &mut self,
+        app_name: &str,
+        pid: u32,
+        category: hwprivacy_common::DeviceCategory,
+        instance: Option<&str>,
+        node_name: &str,
+    ) {
+        use hwprivacy_common::stream::AccessAction;
+        self.tracker
+            .log_event(app_name, pid, category, instance, node_name, AccessAction::Allowed);
+        let now = chrono::Local::now()
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        self.history.record_allowed(
+            &hwprivacy_common::config::normalize_app_name(app_name),
+            &format!("{category:?}").to_lowercase(),
+            crate::history::SOURCE_PIPEWIRE,
+            1,
+            &now,
+        );
+        self.history.save_if_dirty();
     }
 }

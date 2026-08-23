@@ -12,7 +12,7 @@ current_state:
     unpredictable.
 
   verified_working:
-    - "Cargo workspace, 7 crates, 8814 LOC, 120 tests, builds clean (5 trivial warnings, 0 errors) — verified 2026-08-21"
+    - "Cargo workspace, 7 crates, 10181 LOC, 132 tests, builds clean (5 trivial warnings, 0 errors) — verified 2026-08-21"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"
@@ -860,23 +860,15 @@ kernel_layer:
 
 next_up:
   label: "Ordered. Tranche 1 landed 2026-08-21; what remains is below."
+  done_2026_08_23:
+    - "notify-on-allow — a pure gate (notify_allow.rs) with a startup grace and a per-(app,device) cooldown; kernel layer reports CAMERA allows only, to avoid double-notifying the mic"
+    - "offenders -> history, with an allowed column and a migration that preserved all 115 accumulated denials"
   done_2026_08_21:
     - "settle-posture — DECIDED: deny-by-default. Code default flipped; docs realigned."
     - "policy staleness s1/s2/s3 — one fingerprint mechanism, see policy_staleness_2026_08_21"
     - "b1, b2, b3, b4 — ALL FOUR fixed, each new test verified to fail against the reintroduced defect"
     - "classify_link() covered — 14 tests, including that ordinary playback is not a monitor tap. It held the whole layer-1 security decision with zero tests since 2026-03-27."
   steps:
-  - id: notify-on-allow
-    what: "Notify when an ALLOWED open happens, and carry allowed rows in the history table."
-    why: >
-      Measured 2026-08-21: firefox-esr opened the camera twice in one morning
-      with no video call, because a website held a standing per-origin grant.
-      hwprivacy allowed it correctly and said nothing — the deny path is loud
-      and the allow path is silent.
-    decided: "notification only. There is no 'camera released' event (the LSM hook is on open(), not close), so a tray dot would light and never go out."
-    also: "rename `hwprivacy-ctl offenders` -> `history` before publication; once it carries allowed rows the old name is wrong."
-    mode: execute
-
   - id: presets
     what: "Importable rule sets under /usr/share/hwprivacy/presets/ and ~/.config/hwprivacy/presets/."
     why: "Costin 2026-08-21, after ruling out anything browser-specific: the MECHANISM is generic, the CONTENT is data the user opts into."

@@ -159,6 +159,53 @@ pub async fn notify_blocked(
     .ok();
 }
 
+/// "Something used your camera" — the allowed counterpart of
+/// [`notify_blocked`]. Informational, no action buttons.
+///
+/// # Why the wording is in the past tense
+///
+/// It says *used*, never *is using*. The LSM hook is on `open()` and nothing
+/// fires on close, so hwprivacy genuinely does not know when access ends. A
+/// message implying a live state would be a claim it cannot support — and the
+/// same limit is why there is no tray in-use dot: it would light and never go
+/// out.
+///
+/// `Urgency::Normal`, not Critical. A denial is an alarm; this is a fact.
+pub async fn notify_allowed(
+    app_name: &str,
+    pid: u32,
+    device: DeviceCategory,
+    instance: Option<&str>,
+    detail: &str,
+) {
+    let label = device_label_for(device, instance);
+    let summary = format!("{} used the {}", app_name, label);
+    let body = format!(
+        "<b>{}</b> (pid:{}) was allowed <b>{}</b> by your rules.\n\
+         <i>{}</i>",
+        app_name, pid, label, detail
+    );
+    let icon = device_icon(device);
+
+    tokio::task::spawn_blocking(move || {
+        let result = Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .icon(icon)
+            .urgency(Urgency::Normal)
+            .hint(Hint::Category("device".to_string()))
+            .hint(Hint::Transient(true))
+            .timeout(6000)
+            .show();
+
+        if let Err(e) = result {
+            warn!("Failed to send allowed notification: {}", e);
+        }
+    })
+    .await
+    .ok();
+}
+
 /// Kernel-layer denial notification. Informational only — no action buttons.
 ///
 /// Originally not routed through [`ask_user_permission`] because that path

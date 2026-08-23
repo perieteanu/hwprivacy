@@ -1,4 +1,4 @@
-# HANDOFF — 2026-08-21 (two tranches)
+# HANDOFF — 2026-08-23 (three tranches)
 
 Read this first, then `CLAUDE.md`, then `docs-yaml/ROADMAP.yaml`.
 
@@ -13,10 +13,11 @@ that only knows coordinates.
 
 It started as "read the logs". Reading two days of live journals found a bug
 nobody had seen, and reading the code for *that* found two more of the same
-family. Two tranches followed: staleness + b1/b2/b4 + posture, then b3 and the
-first tests `classify_link()` has ever had.
+family. Three tranches followed: staleness + b1/b2/b4 + posture; then b3 and
+the first tests `classify_link()` has ever had; then notify-on-allow and the
+`offenders` → `history` rename.
 
-`git`: **uncommitted**. **120 tests**, all passing (was 78). 7 crates, 8814 LOC.
+`git`: **uncommitted**. **132 tests**, all passing (was 78). 7 crates, 10181 LOC.
 
 ### The find: enforcement silently stopped for sixteen hours
 
@@ -55,6 +56,7 @@ All three are one mechanism now: `PolicyFingerprint` in `lsm_client.rs`.
 | **posture** | `default_action` defaults to **deny** |
 | **staleness** | s1/s2/s3 above |
 | **b3** two identical prompts | split by category — see below |
+| **allow path was silent** | `notify_allow.rs` gate + an `allowed` column in the history table |
 | *incidental* | a test that had never run — `#[test]` was stacked twice on the function above it |
 
 ### b3: the reframe was half right
@@ -149,7 +151,16 @@ config.toml byte-identical after an unanswered prompt  ← b1
 The code default changed; his config sets `default_action = "ask"` explicitly,
 so nothing changed underneath him. Flipping it is a deliberate edit.
 
-### 4. Decide what to do about b6 (found live, not fixed)
+### 4. Verify notify-on-allow against a real camera access
+
+Verified live for the PipeWire layer (two allowed monitor accesses, **one**
+announcement — the cooldown works). The **kernel** allow path is unit-tested
+only: it needs an allowed camera open, and `firefox-esr` is already
+allowlisted, so opening any camera page more than a minute after login should
+produce one `Announced allowed access` line and an `allowed` count in
+`hwprivacy-ctl history`.
+
+### 5. Decide what to do about b6 (found live, not fixed)
 
 `Hint::Resident(true)` beats `timeout(60000)`, so an unanswered prompt never
 expires: the cooldown never starts, the same app re-prompts on every new stream,
@@ -157,12 +168,9 @@ and popups stack. b1's fix holds — nothing is written — but the "ask again
 later" half of the contract does not happen. Three options in
 `ROADMAP > b6_resident_prompt_never_times_out`; all three are decisions.
 
-### 5. Then: notify-on-allow → presets → README/MISSION for publication
+### 6. Then: presets → README/MISSION for publication
 
-See `ROADMAP.yaml > next_up`. Shape warning worth carrying:
-
-- **notify-on-allow has no "stopped" event.** The LSM hook is on `open()`;
-  nothing fires on close. A tray dot would light and never go out.
+See `ROADMAP.yaml > next_up`.
 
 ---
 
@@ -235,7 +243,9 @@ Hook cost: **+13.75 ns/open**, 95 % CI `[+7.3, +20.2]`, 1.88 % of a 733 ns
   the existing three need a manual clean with the daemon stopped.
 - **The live config still says `default_action = "ask"`.** The code default is
   now deny; his file sets it explicitly, so nothing changed underneath him.
-- **notify-on-allow, presets** — next tranche, by agreement.
+- **Presets** — next tranche, by agreement.
+- **The tray in-use indicator.** notify-on-allow ships without it: there is no
+  "camera released" event, so a dot would light and never go out.
 - **Per-device rules.** b3 labels the microphones; it does not let you write
   `mic2 = deny`. Rules are still per category.
 - **The CPU regression** — measured, not diagnosed.

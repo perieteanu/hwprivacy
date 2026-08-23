@@ -39,7 +39,7 @@ pub trait HwPrivacy {
     ///
     /// Survives daemon restarts, unlike `get_events`, which reads an in-memory
     /// ring buffer.
-    fn get_offenders(&self) -> zbus::Result<Vec<(String, String, String, u32, String, String)>>;
+    fn get_history(&self) -> zbus::Result<Vec<(String, String, String, u32, u32, String, String)>>;
 
     /// Emergency: deny everything immediately
     fn block_all(&self) -> zbus::Result<bool>;

@@ -10,10 +10,10 @@
 ---
 shape:
   language: "Rust 2021 + one BPF C file"
-  layout: "Cargo workspace, 7 crates, 8814 LOC of first-party code (BPF C included; generated vmlinux.h excluded)"
+  layout: "Cargo workspace, 7 crates, 10181 LOC of first-party code (BPF C included; generated vmlinux.h excluded)"
   build: "cargo build --release --workspace  (or: make build)"
   binaries: 5
-  tests: 120        # 49 lsm + 50 daemon + 15 common + 6 proto. Zero in ctl/tui/gui.
+  tests: 132        # 49 lsm + 62 daemon + 15 common + 6 proto. Zero in ctl/tui/gui.
   test_distribution_warning: >
     The 2026-08-21 tranches closed the worst of it: the dismiss path, one-shot
     grants, rule-name sanitising, policy staleness, and finally the layer-1
@@ -67,7 +67,8 @@ crates:
       dbus_service.rs:    "#[zbus::interface] server impl — 11 methods, 3 declared signals"
       state.rs:           "DaemonState = config + devices + tracker + known_link_ids + block_all"
       lsm_client.rs:      "layer 2 client — connects to the root helper's unix socket, reconnects every 10s, pushes the allowlist, RE-pushes it whenever PolicyFingerprint changes, receives kernel AccessEvents and folds them into the same tracker/notification path"
-      offenders.rs:       "the persistent per-(identity, device, source) denial table behind `hwprivacy-ctl offenders`. Survives restarts; $XDG_STATE_HOME/hwprivacy/offenders.json, atomic writes. Undocumented here until 2026-08-21."
+      history.rs:         "the persistent per-(identity, device, source) table behind `hwprivacy-ctl history` — denied AND allowed counts. Survives restarts; $XDG_STATE_HOME/hwprivacy/history.json, atomic writes, migrates from the pre-2026-08-21 offenders.json."
+      notify_allow.rs:    "the pure gate deciding whether an ALLOWED access is announced: startup grace, per-(app,device) cooldown, never a burst summary."
 
   hwprivacy-ctl:
     loc: 230
@@ -253,7 +254,8 @@ dbus_api:
     - "RemoveRule(app) -> b"
     - "GetActiveStreams() -> a(susssssb)    (app, pid, device, node, media, perm, active)"
     - "GetStatus() -> (buuuu)               (running, devices, rules, blocked, streams)"
-    - "GetEvents(last_n) -> a(ssss)         (timestamp, app, device, action)"
+    - "GetEvents(last_n) -> a(ssss)         (timestamp, app, device, action) — device carries the b3 instance, e.g. 'microphone (mic2)'"
+    - "GetHistory() -> a(sssuuss)            (identity, device, source, denied, allowed, first, last) — was GetOffenders until 2026-08-21"
     - "BlockAll() -> b"
     - "UnblockAll() -> b"
     - "AllowStream(node_id, app_name) -> b   (both: a node id alone is not an identity)"

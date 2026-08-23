@@ -32,8 +32,8 @@ enum Commands {
         #[arg(long, default_value = "20")]
         last: u32,
     },
-    /// Who has been denied, how often, and since when (survives restarts)
-    Offenders,
+    /// What has touched a device, how often, and since when (survives restarts)
+    History,
     /// Emergency: deny everything immediately
     BlockAll,
     /// Restore to saved rules
@@ -285,20 +285,20 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Offenders => {
-            let rows = proxy.get_offenders().await?;
+        Commands::History => {
+            let rows = proxy.get_history().await?;
             if rows.is_empty() {
-                println!("Nothing has been denied yet.");
+                println!("Nothing has touched a guarded device yet.");
             } else {
                 println!(
-                    "{:<44} {:<11} {:<9} {:>6}  {:<19} {}",
-                    "IDENTITY", "DEVICE", "SOURCE", "DENIED", "FIRST", "LAST"
+                    "{:<44} {:<11} {:<9} {:>7} {:>7}  {:<19} {}",
+                    "IDENTITY", "DEVICE", "SOURCE", "DENIED", "ALLOWED", "FIRST", "LAST"
                 );
-                println!("{}", "-".repeat(104));
-                for (identity, device, source, denied, first, last) in &rows {
+                println!("{}", "-".repeat(112));
+                for (identity, device, source, denied, allowed, first, last) in &rows {
                     println!(
-                        "{:<44} {:<11} {:<9} {:>6}  {:<19} {}",
-                        identity, device, source, denied, first, last
+                        "{:<44} {:<11} {:<9} {:>7} {:>7}  {:<19} {}",
+                        identity, device, source, denied, allowed, first, last
                     );
                 }
                 println!();
@@ -314,7 +314,16 @@ async fn main() -> anyhow::Result<()> {
                 println!(
                     "'kernel' rows are keyed on the executable path and are stable across\n\
                      restarts. 'pipewire' rows are keyed on a name the application declares\n\
-                     about itself, which is weaker — treat them as a hint, not an identity."
+                     about itself, which is weaker — treat them as a hint, not an identity.\n"
+                );
+                // Said outright, because a column headed ALLOWED next to one
+                // headed DENIED reads like a scoreboard of things that went
+                // wrong. It is the opposite: it is the record that was missing.
+                println!(
+                    "ALLOWED means the access SUCCEEDED, under a rule you set. It is not an\n\
+                     alarm — it is the answer to 'did anything use my camera on Tuesday',\n\
+                     which could not be answered at all before. Counts are opens, not\n\
+                     sessions, and hwprivacy cannot see when access ended."
                 );
             }
         }

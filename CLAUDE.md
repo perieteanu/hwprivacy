@@ -5,7 +5,7 @@ Android-style hardware permission manager for the Linux desktop. Gates native
 **playback monitor** across **two enforcement layers**: the PipeWire graph, and
 an eBPF LSM in the kernel.
 
-Rust workspace, **7 crates, 8814 LOC** (BPF C included; generated `vmlinux.h`
+Rust workspace, **7 crates, 10181 LOC** (BPF C included; generated `vmlinux.h`
 excluded). Debian 13 / PipeWire / KDE + GNOME.
 Registered in project-tracker as `hwprivacy`, short name `hw`.
 
@@ -154,7 +154,7 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 cargo build --release --workspace       # or: make build
 cargo check --workspace                 # 5 warnings, 0 errors
 cargo clippy                            # NOT AVAILABLE — no such command on this toolchain
-cargo test --workspace                  # 120 tests, all pass
+cargo test --workspace                  # 132 tests, all pass
 ```
 
 Binaries (5): `hwprivacy-daemon` (layer 1 enforcer + policy owner),
@@ -167,7 +167,7 @@ Test coverage is **not** evenly spread:
 | crate | tests |
 |---|---|
 | hwprivacy-lsm | 49 |
-| hwprivacy-daemon | 50 |
+| hwprivacy-daemon | 62 |
 | hwprivacy-common | 15 |
 | hwprivacy-proto | 6 |
 | hwprivacy-ctl / -tui / -gui | 0 |
@@ -200,9 +200,10 @@ Do **not** "fix" layer 1's CPU by raising `poll_interval_ms`. It is already a
 config knob and needs no code, but it buys CPU by widening the race window —
 the wrong trade for a security tool.
 
-Layer-1 ordering, updated 2026-08-21: posture is **settled (deny)**, b1–b4 are
-**all fixed**, and `classify_link()` is covered. What remains: notify-on-allow →
-presets → README/MISSION for publication → only then touch the substrate.
+Layer-1 ordering, updated 2026-08-23: posture is **settled (deny)**, b1–b4 are
+**all fixed**, `classify_link()` is covered, and notify-on-allow has landed.
+What remains: **b6** (a prompt never expires — needs a decision) → presets →
+README/MISSION for publication → only then touch the substrate.
 
 ---
 
@@ -223,6 +224,14 @@ presets → README/MISSION for publication → only then touch the substrate.
   made b3 look unfixable. See `d-per-microphone-identity` + ROADMAP b3.
 - **When you coalesce a prompt, never coalesce the teardown.** `LinkGroup`
   carries every link id for exactly this reason.
+- **The allow path is as important as the deny path.** `hwprivacy-ctl history`
+  (was `offenders`) carries both columns, and an allowed access notifies —
+  gated by `notify_allow.rs`. The measurement behind it: firefox-esr opened the
+  camera twice one morning with no video call, correctly allowed, and nothing
+  recorded it. See `d-notify-on-allow`.
+- **Notifications are invisible to any automated check**, so a code path that
+  decides to show one must also log that it did. C4 was scored wrong twice
+  because verification depended on a human seeing a popup.
 - **Prove a new test fails against the bug it catches**, before keeping it. Every
   test added on 2026-08-21 was run against the deliberately reintroduced defect
   and observed to fail. A test that passes both ways is worthless.

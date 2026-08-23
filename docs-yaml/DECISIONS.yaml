@@ -517,3 +517,77 @@ decisions:
       by running it against the reintroduced defect, which is the entire reason
       that discipline exists. Rewritten with an in-port that sorts first.
     scope: "Labelling only. Rules remain per CATEGORY; per-device rules stay deferred."
+
+  - id: d-notify-on-allow
+    date: "2026-08-21"
+    title: "Say when access is ALLOWED, not only when it is denied"
+    context: >
+      Measured 2026-08-21: firefox-esr opened the camera twice in one morning
+      with no video call — 08:48:56 and 09:14:41 — because web.whatsapp.com had
+      held a standing per-origin camera grant since 2026-07-26 and a restored
+      tab re-acquires on reload. hwprivacy allowed both CORRECTLY: at each layer
+      the question asked was "is this firefox-esr?", and it was. And it said
+      nothing at all. The deny path had a notification and a history row; the
+      allow path had neither.
+    decision: >
+      Notify on allowed access, and give the persistent table an `allowed`
+      column beside `denied`. A tool whose job is telling you when your camera
+      turns on cannot only tell you when it doesn't.
+    gate:
+      where: "hwprivacy-daemon/src/notify_allow.rs — a pure function, deliberately"
+      why_pure: >
+        Every rule in this project that decided whether a user-visible thing
+        happens and lived inline in a tokio::spawn turned out to be wrong AND
+        untestable — b1's dismiss handling, the C5 burst arithmetic. This one
+        takes values and returns a bool.
+      conditions: "notify_on_allow, real access (pid != 0), past the startup grace, outside the per-(app,device) cooldown"
+    why_a_startup_grace_and_not_an_allowlist:
+      what: "wireplumber opens the camera about eight seconds after the daemon starts, at every boot; v4l_id before that."
+      rejected: >
+        "Only notify for executables that have a rule" — my first idea, and it
+        does not even work: wireplumber HAS a rule in the live config. Naming
+        system processes would also be exactly the per-application coupling
+        ruled out by d-executable-is-the-principal.
+      chosen: "A time window. App-agnostic, covers anything that probes at boot."
+      accepted_cost: "a genuine access in the first minute after login is silent."
+    why_a_cooldown_and_not_once_per_session: >
+      The 08:48 and 09:14 opens were two separate things Costin did not know
+      about, 26 minutes apart. Both deserve saying. Five minutes collapses one
+      burst into one notification without hiding a later return.
+    the_kernel_layer_reports_camera_only:
+      what: "An allowed MIC event from the kernel is never announced."
+      why: >
+        The kernel sees /usr/bin/pipewire holding /dev/snd on behalf of
+        everyone. "pipewire used the microphone" is useless, and the PipeWire
+        layer announces the same act with the REAL app name — so allowing MIC
+        through both would give two notifications for one access. Each layer
+        speaks only about what it can actually see.
+    wording_is_past_tense: >
+      "used the camera", never "is using". The LSM hook is on open() and nothing
+      fires on close, so hwprivacy does not know when access ends. Same limit
+      that rules out a tray in-use dot: it would light and never go out.
+    urgency: "Normal, not Critical. A denial is an alarm; this is a fact."
+
+  - id: d-history-table
+    date: "2026-08-21"
+    title: "`offenders` becomes `history`, and gains an allowed column"
+    supersedes_naming_in: fail2ban_shaped_reporting
+    decision: "hwprivacy-ctl offenders -> history; Offender -> HistoryEntry; GetOffenders -> GetHistory; offenders.json -> history.json."
+    why: >
+      Once the table records allowed access the name is a lie — and it was
+      already wrong for the discovery-loop rows, where "signal-desktop denied
+      the camera 12 times" means add an exe_path, not that Signal is hostile.
+      Renamed BEFORE publication because it is a user-facing command.
+    migration_is_the_risky_part: >
+      The live table held 115 denials accumulated since 2026-08-19 — 42 for
+      firefox-bin, 18 for python3.13 — and that data exists nowhere else: the
+      event log is a 500-entry ring that dies with the daemon, and the journal
+      rotates. load_with_legacy() reads offenders.json when history.json is
+      absent, writes the new file immediately, and LEAVES THE OLD ONE in place
+      so a bad migration is recoverable. Verified live: 10 rows, 115 denials,
+      all present after the rename.
+    sort_order: "denied desc, then allowed desc. Denials stay the alarming column."
+    the_ctl_footer_says_so_outright: >
+      A column headed ALLOWED next to one headed DENIED reads like a scoreboard
+      of things that went wrong. It is the opposite, and the footer says it
+      plainly rather than leaving the reader to infer it.

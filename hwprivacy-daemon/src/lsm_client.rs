@@ -367,11 +367,17 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     // reported 13, the daemon counted 14, and the event log showed a second
     // DENIED row with pid 0 for a session that had only one real prompt.
     if ev.pid == 0 {
+        let mut s = state.write().await;
         if ev.denied {
-            let mut s = state.write().await;
             s.tracker.blocked_count += denied_opens(&ev);
-            record_offender(&mut s, &ev, category);
+            record_denied(&mut s, &ev, category);
+        } else {
+            // The suppressed opens still happened. Counting them keeps the
+            // allowed column honest — a 13-open camera session is 13, the same
+            // arithmetic the denied side already gets right.
+            record_allowed(&mut s, &ev, category);
         }
+        drop(s);
         info!(
             "Kernel layer: {} further {} open(s) by {} (burst summary, not a new access)",
             ev.additional_opens,
@@ -397,11 +403,12 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
         s.tracker.blocked_count += denied_opens(&ev) - already;
 
         if ev.denied {
-            record_offender(&mut s, &ev, category);
+            record_denied(&mut s, &ev, category);
         }
     }
 
     if !ev.denied {
+        notify_allowed_kernel(state, &ev, &app, category).await;
         return;
     }
 
@@ -433,14 +440,102 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     crate::notification::notify_kernel_denial(&app, ev.pid, category, &ev.device, detail).await;
 }
 
-/// Add a kernel denial to the persistent offender table.
+/// Announce an allowed kernel access, if this one is worth announcing.
+///
+/// # Camera only, deliberately
+///
+/// The kernel sees `/usr/bin/pipewire` holding `/dev/snd` on behalf of
+/// everyone — it cannot tell which application wants the microphone, and
+/// saying "pipewire used the microphone" would be both useless and wrong-ish.
+/// Worse, the PipeWire layer notifies for that same act with the REAL app name,
+/// so allowing MIC through here would produce two notifications for one access.
+/// One access, one notification; each layer speaks about what it can actually
+/// see.
+///
+/// This is the case the feature exists for: on 2026-08-21 firefox-esr opened
+/// the camera twice in one morning with no video call, hwprivacy allowed both
+/// correctly, and nothing said anything.
+async fn notify_allowed_kernel(
+    state: &SharedState,
+    ev: &AccessEvent,
+    app: &str,
+    category: DeviceCategory,
+) {
+    if category != DeviceCategory::Camera {
+        return;
+    }
+
+    let access = crate::notify_allow::AllowedAccess {
+        app,
+        device: category,
+        pid: ev.pid,
+    };
+    let now = std::time::Instant::now();
+
+    let announce = {
+        let mut s = state.write().await;
+        // Count it either way — the table answers "did anything use my camera
+        // on Tuesday", which must not depend on whether a popup was shown.
+        let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        s.history.record_allowed(
+            &ev.exe_path,
+            &format!("{category:?}").to_lowercase(),
+            crate::history::SOURCE_KERNEL,
+            allowed_opens(ev),
+            &ts,
+        );
+        s.history.save_if_dirty();
+
+        let yes = s
+            .allow_notifier
+            .should_notify(access, s.uptime(), now, &s.config.policy);
+        if yes {
+            s.allow_notifier.mark_notified(access, now);
+        }
+        yes
+    };
+
+    if !announce {
+        return;
+    }
+
+    info!("Kernel layer ALLOWED {} -> {} ({})", app, ev.device, ev.role);
+    crate::notification::notify_allowed(
+        app,
+        ev.pid,
+        category,
+        None,
+        "Allowed by your rules. hwprivacy cannot tell when access ends — \
+         the kernel hook fires on open, not on close.",
+    )
+    .await;
+}
+
+/// How many allowed opens one kernel event represents.
+///
+/// The mirror of [`denied_opens`], and it has to exist separately for the same
+/// reason that one does: a burst summary carries pid 0 and stands only for the
+/// opens it accounts for, while a real event is itself plus whatever the kernel
+/// attached to it. Getting this inline and implicit is what produced the C5
+/// off-by-one.
+pub fn allowed_opens(ev: &AccessEvent) -> u32 {
+    if ev.denied {
+        return 0;
+    }
+    if ev.pid == 0 {
+        return ev.additional_opens;
+    }
+    1 + ev.additional_opens
+}
+
+/// Add a kernel denial to the persistent history table.
 ///
 /// Keyed on `exe_path`, NOT on the short name. The path is the identity the
 /// kernel actually decided on, it is stable across restarts and reboots, and
 /// two different binaries can share a basename — `firefox-esr` and
 /// `firefox-bin` are distinct policy subjects and must not collapse into one
 /// row here either.
-fn record_offender(
+fn record_denied(
     s: &mut crate::state::DaemonState,
     ev: &AccessEvent,
     category: DeviceCategory,
@@ -448,14 +543,33 @@ fn record_offender(
     let now = chrono::Local::now()
         .format("%Y-%m-%d %H:%M:%S")
         .to_string();
-    s.offenders.record(
+    s.history.record_denied(
         &ev.exe_path,
         &format!("{category:?}").to_lowercase(),
-        crate::offenders::SOURCE_KERNEL,
+        crate::history::SOURCE_KERNEL,
         denied_opens(ev),
         &now,
     );
-    s.offenders.save_if_dirty();
+    s.history.save_if_dirty();
+}
+
+/// The allowed twin of [`record_denied`], same keying and same reasoning.
+fn record_allowed(
+    s: &mut crate::state::DaemonState,
+    ev: &AccessEvent,
+    category: DeviceCategory,
+) {
+    let now = chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    s.history.record_allowed(
+        &ev.exe_path,
+        &format!("{category:?}").to_lowercase(),
+        crate::history::SOURCE_KERNEL,
+        allowed_opens(ev),
+        &now,
+    );
+    s.history.save_if_dirty();
 }
 
 /// How many denied opens one kernel event represents.
