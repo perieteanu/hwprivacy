@@ -158,3 +158,7 @@
 23-08-2026 18:40 | Sun | hw | [add] desktop-baseline preset (pipewire+wireplumber) auto-imported by `daemon install` — without it a fresh install has no camera at all
 23-08-2026 18:45 | Sun | hw | [note] CORRECTION: 'pipewire [pipewire-pulse]' is NOT dead. It normalises to 'pipewire', matches, and has 24 denials. Docs said dead since 2026-08-04
 23-08-2026 18:47 | Sun | hw | [note] that live rule blocks `preset import desktop-baseline` on this machine — removing it is a prerequisite, not tidying
+23-08-2026 18:37 | Sun | hw | [change] removed 'pipewire [pipewire-pulse]' (live, 24 denials) plus the two genuinely dead rules — b4's manual step done, 9 rules -> 6
+23-08-2026 18:38 | Sun | hw | [change] imported desktop-baseline: pipewire camera=allow + exe_path. wireplumber correctly SKIPPED — Costin's own rule already existed
+23-08-2026 18:40 | Sun | hw | [note] PROOF of the staleness fix: "policy changed under us (added /usr/bin/pipewire); re-pushing" — kernel went 2 -> 3 allowed with NOTHING restarted
+23-08-2026 18:42 | Sun | hw | [note] camera node still absent: PipeWire enumerates once at session start. Reboot needed. /var/lib/hwprivacy/policy verified to hold all 3 before rebooting

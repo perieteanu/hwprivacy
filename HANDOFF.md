@@ -94,6 +94,37 @@ first. That is the entire argument for the discipline.
 
 ---
 
+## ⇢ FIRST THING AFTER THE REBOOT
+
+The config was changed on 2026-08-23 18:37 to restore the PipeWire camera
+route, and **a reboot is what makes it take effect** — PipeWire enumerates
+cameras once at session start and does not retry.
+
+Check, in this order:
+
+```bash
+hwprivacy-ctl devices          # a `camera` row should now appear (was 3 devices, expect 4)
+hwprivacy-ctl status           # Allowed binaries: 3
+journalctl -u hwprivacy-lsm -b | grep -a video   # pipewire should be ALLOWED, not DENIED
+```
+
+Then **Costin tests Firefox himself**. Two different things to try, and they
+exercise different layers:
+
+| what | route | gated by |
+|---|---|---|
+| a camera site in Firefox-ESR | V4L2 direct | layer 2, executable inode |
+| any app using the camera via a portal/Flatpak | PipeWire | layer 1, app name |
+
+If the camera row still does not appear, the thing to check is whether
+`/usr/bin/pipewire` was allowed at boot — the helper loads
+`/var/lib/hwprivacy/policy` before any session exists, and that file was
+verified to contain all three entries before the reboot.
+
+**Nothing else is pending.** No uncommitted work, no unrun migration.
+
+---
+
 ## What is running right now
 
 | | |
@@ -162,17 +193,25 @@ allowlisted, so opening any camera page more than a minute after login should
 produce one `Announced allowed access` line and an `allowed` count in
 `hwprivacy-ctl history`.
 
-### 5. Remove the rule that blocks the baseline
+### 5. README and MISSION — the publication blocker
 
-`preset import desktop-baseline` skips both entries here, correctly — an import
-never changes a rule you already have, and `pipewire [pipewire-pulse]` occupies
-the `pipewire` key. **That rule is NOT dead**, despite four months of docs
-saying so: it normalises to `pipewire`, matches, and has denied 24 times.
-Removing it is a prerequisite for the baseline, not tidying.
+Costin is publishing this on public GitHub. Both files state things that are
+flatly false, and `doc-check` cannot catch either because it only reads files:
 
-### 6. Then: README/MISSION for publication
+- **README** — says the helper is started by hand (boot-time service since
+  2026-08-20) and that the default posture is `ask` (code default is `deny`
+  since 2026-08-21). Known Limitations omits that the executable is the
+  principal.
+- **MISSION.yaml** — frozen 2026-08-04 22:37, still files the kernel layer
+  under `what_would_fix_it`, in the conditional.
 
-See `ROADMAP.yaml > next_up`. This is the publication blocker.
+Add the credit line to README Credits at the same time.
+
+### 6. The CPU regression
+
+1.24 % of a core (2026-08-04) → 2.93 % (2026-08-21), same method, undiagnosed.
+Costin rejected 1.2 % as "very generous", so publishing a number 2.4× worse
+without an explanation is its own problem. Measure before proposing.
 
 ---
 
