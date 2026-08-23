@@ -30,6 +30,18 @@ pub struct StreamTracker {
     /// When a user dismisses a notification, suppress the same prompt for
     /// `policy.dismiss_cooldown_secs` to avoid notification spam.
     pub dismiss_cooldowns: HashMap<(String, DeviceCategory), Instant>,
+    /// (app, device) pairs with a prompt already on screen, awaiting an answer.
+    ///
+    /// Prompts are Resident — they stay until the user answers, which is what
+    /// makes them a to-do item rather than something that vanishes while you
+    /// are away from the keyboard. The cost is that a second stream from the
+    /// same app would stack a second identical popup asking the same question,
+    /// and a browser produces those steadily. One pending question per
+    /// (app, device); the answer, when it comes, governs what follows.
+    ///
+    /// This is blocker b6. It was invisible until b1 was fixed, because before
+    /// that the popup wrote a permanent deny the moment it was closed.
+    pending_prompts: HashSet<(String, DeviceCategory)>,
 }
 
 impl StreamTracker {
@@ -41,6 +53,7 @@ impl StreamTracker {
             blocked_count: 0,
             one_shot_allowed: HashMap::new(),
             dismiss_cooldowns: HashMap::new(),
+            pending_prompts: HashSet::new(),
         }
     }
 
@@ -66,6 +79,33 @@ impl StreamTracker {
         } else {
             false
         }
+    }
+
+    /// Claim the right to ask about this (app, device).
+    ///
+    /// Returns false when a prompt for the same pair is already on screen. The
+    /// caller must then block the access as usual and say nothing — the
+    /// question has already been asked and is waiting for an answer.
+    ///
+    /// Keyed on the NORMALISED app name so `Firefox` and
+    /// `Firefox [pipewire-pulse]` are one pending question, not two.
+    pub fn try_begin_prompt(&mut self, app_name: &str, category: DeviceCategory) -> bool {
+        self.pending_prompts
+            .insert((normalize_app_name(app_name), category))
+    }
+
+    /// Release the claim once the prompt has been answered, dismissed, or
+    /// failed to show. MUST run on every path out of the prompt, or that
+    /// (app, device) is never asked about again for the life of the daemon.
+    pub fn end_prompt(&mut self, app_name: &str, category: DeviceCategory) {
+        self.pending_prompts
+            .remove(&(normalize_app_name(app_name), category));
+    }
+
+    /// Is a prompt for this pair already waiting for an answer?
+    pub fn prompt_pending(&self, app_name: &str, category: DeviceCategory) -> bool {
+        self.pending_prompts
+            .contains(&(normalize_app_name(app_name), category))
     }
 
     /// Record a new access event.
@@ -241,6 +281,68 @@ mod tests {
         t.grant_one_shot(7, "firefox");
         t.grant_one_shot(7, "firefox");
         assert_eq!(t.one_shot_allowed.len(), 1);
+    }
+
+    /// b6. Prompts are Resident and never expire — decided 2026-08-23, a
+    /// permission question is a to-do item, not something that vanishes while
+    /// you are away. The consequence to contain is stacking: a browser opens
+    /// streams steadily, and each one would raise another identical popup
+    /// asking the same question.
+    #[test]
+    fn only_one_prompt_per_app_and_device_can_be_pending() {
+        let mut t = StreamTracker::new();
+        assert!(t.try_begin_prompt("Firefox", DeviceCategory::Microphone));
+        assert!(
+            !t.try_begin_prompt("Firefox", DeviceCategory::Microphone),
+            "the question is already on screen; do not ask it twice"
+        );
+        assert!(t.prompt_pending("Firefox", DeviceCategory::Microphone));
+    }
+
+    /// Normalised, so the pulse-bridge variant is the same pending question.
+    /// Without this a browser would raise one popup as `Firefox` and another as
+    /// `Firefox [pipewire-pulse]`, which is the exact stacking being prevented.
+    #[test]
+    fn a_pending_prompt_is_keyed_on_the_normalised_name() {
+        let mut t = StreamTracker::new();
+        assert!(t.try_begin_prompt("Firefox [pipewire-pulse]", DeviceCategory::Camera));
+        assert!(!t.try_begin_prompt("firefox", DeviceCategory::Camera));
+        assert!(t.prompt_pending("FIREFOX", DeviceCategory::Camera));
+    }
+
+    /// Different apps and different devices are different questions.
+    #[test]
+    fn pending_prompts_do_not_block_unrelated_questions() {
+        let mut t = StreamTracker::new();
+        assert!(t.try_begin_prompt("firefox", DeviceCategory::Microphone));
+        assert!(t.try_begin_prompt("obs", DeviceCategory::Microphone), "another app");
+        assert!(t.try_begin_prompt("firefox", DeviceCategory::Camera), "another device");
+    }
+
+    /// **The failure mode that would be invisible.** If the claim is not
+    /// released, that (app, device) is never asked about again for the life of
+    /// the daemon — no popup, no error, nothing in the log. It would look like
+    /// the tool quietly giving up on one app.
+    #[test]
+    fn answering_releases_the_claim_so_the_next_stream_can_ask() {
+        let mut t = StreamTracker::new();
+        assert!(t.try_begin_prompt("firefox", DeviceCategory::Microphone));
+        t.end_prompt("firefox", DeviceCategory::Microphone);
+        assert!(!t.prompt_pending("firefox", DeviceCategory::Microphone));
+        assert!(
+            t.try_begin_prompt("Firefox [pipewire-pulse]", DeviceCategory::Microphone),
+            "and the release must match the same normalised key it was claimed under"
+        );
+    }
+
+    /// Releasing something that was never claimed must not panic or corrupt the
+    /// set — the prompt task calls this on every exit path, including ones
+    /// where the claim was never taken.
+    #[test]
+    fn releasing_an_unclaimed_prompt_is_harmless() {
+        let mut t = StreamTracker::new();
+        t.end_prompt("never-asked", DeviceCategory::Camera);
+        assert!(!t.prompt_pending("never-asked", DeviceCategory::Camera));
     }
 
     /// The cooldown is what makes "dismiss saves nothing" bearable: without it

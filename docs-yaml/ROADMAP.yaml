@@ -133,7 +133,7 @@ blockers:
 
 b6_resident_prompt_never_times_out:
   severity: medium
-  status: "FOUND LIVE 2026-08-21 while verifying b1. NOT FIXED — the fix is a design choice, not a patch."
+  status: "FIXED 2026-08-23. Costin's ruling: the prompt STAYS until answered, and the answer governs what follows."
   found_how: >
     Verifying that an unanswered prompt writes nothing. It writes nothing, which
     is the b1 fix working. But the "ask again later" half of the documented
@@ -158,11 +158,25 @@ b6_resident_prompt_never_times_out:
     Resident + timeout has been there since the beginning. Before b1 was fixed
     this was invisible, because closing the popup wrote a deny and nobody
     examined the timeout path. Fixing b1 is what made the gap legible.
-  fix_options_not_yet_chosen:
-    - "Drop Hint::Resident(true) and let the 60s timeout close it — simplest, but the popup can then vanish while the user is reading it."
-    - "Keep Resident and wrap wait_for_action in a timeout on our side, so the daemon stops waiting even if the popup stays."
-    - "Keep Resident and accept that a prompt persists until answered — then DELETE the cooldown machinery and the contract that describes it, rather than documenting behaviour that does not occur."
-  do_not: "Do not 'fix' this by shortening the timeout. The timeout is already ignored."
+  decision_2026_08_23: >
+    A permission question is a to-do item, not a nag. The prompt stays until it
+    is answered — one that vanishes while you are away leaves the app silently
+    broken with no explanation. What gets contained is the STACKING, not the
+    persistence.
+  fix:
+    - "timeout(60000) -> Timeout::Never. The old value was a lie in two directions: Resident already overrode it, and the code downstream was written believing it did not."
+    - "One pending prompt per (app, device), keyed on the NORMALISED name. A second stream is blocked and logged, and says nothing — the question is already on screen."
+    - "The claim is released on every path out of the prompt task. Leaking it would mean that (app, device) is never asked about again for the life of the daemon: no popup, no error, nothing in the log."
+  what_did_NOT_change: >
+    The dismiss cooldown stays. It was never wrong — it simply could not be
+    reached, because the only way to reach it was a timeout that never fired.
+    Actively closing a popup still means: block, save nothing, cool down, ask
+    again. That is d-dismiss-saves-nothing, now actually reachable.
+  verified_live_2026_08_23: |
+    14:58:15  parecord -> monitor  ASKED    (left unanswered)
+    14:58:23  parecord -> monitor  DENIED   (no second popup)
+    14:58:31  parecord -> monitor  DENIED
+    Before the fix all three logged ASKED and raised three popups.
 
 policy_staleness_2026_08_21:
   label: >

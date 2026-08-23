@@ -57,6 +57,7 @@ All three are one mechanism now: `PolicyFingerprint` in `lsm_client.rs`.
 | **staleness** | s1/s2/s3 above |
 | **b3** two identical prompts | split by category — see below |
 | **allow path was silent** | `notify_allow.rs` gate + an `allowed` column in the history table |
+| **b6** *(found live)* prompts stacked forever | `Timeout::Never` said out loud, one pending prompt per (app, device) |
 | *incidental* | a test that had never run — `#[test]` was stacked twice on the function above it |
 
 ### b3: the reframe was half right
@@ -160,15 +161,7 @@ allowlisted, so opening any camera page more than a minute after login should
 produce one `Announced allowed access` line and an `allowed` count in
 `hwprivacy-ctl history`.
 
-### 5. Decide what to do about b6 (found live, not fixed)
-
-`Hint::Resident(true)` beats `timeout(60000)`, so an unanswered prompt never
-expires: the cooldown never starts, the same app re-prompts on every new stream,
-and popups stack. b1's fix holds — nothing is written — but the "ask again
-later" half of the contract does not happen. Three options in
-`ROADMAP > b6_resident_prompt_never_times_out`; all three are decisions.
-
-### 6. Then: presets → README/MISSION for publication
+### 5. Then: presets → README/MISSION for publication
 
 See `ROADMAP.yaml > next_up`.
 
@@ -234,8 +227,6 @@ Hook cost: **+13.75 ns/open**, 95 % CI `[+7.3, +20.2]`, 1.88 % of a 733 ns
 
 ## Deliberately NOT done
 
-- **b6 is not fixed** — found while verifying b1; the fix is a decision, not a
-  patch. See `ROADMAP > b6_resident_prompt_never_times_out`.
 - **The staleness fix is still unverified against a live kernel.** b1 and b3
   were verified live on 2026-08-23; the acceptance script for staleness is
   written and shellcheck-clean but needs sudo and has not been run.

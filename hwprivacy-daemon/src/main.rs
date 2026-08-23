@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[derive(Parser)]
 #[command(
@@ -569,6 +569,26 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                         s.tracker.is_in_cooldown(&app, cat, secs)
                     };
 
+                    // A prompt for this (app, device) may already be on screen
+                    // waiting for an answer. Prompts do not expire — that is
+                    // deliberate, a permission question is a to-do item — so a
+                    // second stream must not stack a second identical popup
+                    // asking the same question. Block it and stay quiet; the
+                    // answer, when it comes, governs what follows. (b6)
+                    let already_asking = !in_cooldown && {
+                        let mut s = state.write().await;
+                        !s.tracker.try_begin_prompt(&app, cat)
+                    };
+                    if already_asking {
+                        let mut s = state.write().await;
+                        s.log_denied(&app, pid, cat, inst.as_deref(), &node);
+                        debug!(
+                            "Blocked {} → {:?}; a prompt for it is already waiting for an answer",
+                            app, cat
+                        );
+                        continue;
+                    }
+
                     {
                         let mut s = state.write().await;
                         if in_cooldown {
@@ -650,6 +670,14 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                                 s.tracker.record_dismiss(&app, cat);
                             }
                         }
+
+                        // Release the claim on EVERY path out, including the
+                        // ones above that return early in spirit. Leaking it
+                        // would mean this (app, device) is never asked about
+                        // again for the life of the daemon — a silent, total
+                        // loss of prompting that would look like the tool
+                        // having given up.
+                        s.tracker.end_prompt(&app, cat);
                     });
                 }
             }

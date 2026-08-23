@@ -591,3 +591,35 @@ decisions:
       A column headed ALLOWED next to one headed DENIED reads like a scoreboard
       of things that went wrong. It is the opposite, and the footer says it
       plainly rather than leaving the reader to infer it.
+
+  - id: d-prompts-are-todo-items
+    date: "2026-08-23"
+    title: "A permission prompt stays until answered; only one per (app, device)"
+    resolves: "ROADMAP b6_resident_prompt_never_times_out"
+    context: >
+      Found live on 2026-08-21 while verifying b1. notification.rs set BOTH
+      Hint::Resident(true) and timeout(60000). Resident wins, so the popup never
+      expired, wait_for_action never returned, the dismiss cooldown never
+      started, and every new stream from the same app stacked another identical
+      popup. Nothing was written — b1's fix held — but "ask again later" simply
+      did not happen.
+    decision: >
+      Costin, 2026-08-23: "stays until answered. after answer the behaviour it
+      will follow the answer." The persistence is the feature; the stacking is
+      the defect.
+    consequences:
+      - "timeout(60000) -> Timeout::Never. Saying it out loud is what makes the code downstream honest."
+      - "One pending prompt per (app, device), keyed on the normalised name so `Firefox` and `Firefox [pipewire-pulse]` are one question."
+      - "A second stream while a prompt is pending is BLOCKED and logged, silently. The access is refused either way; the user is simply not asked twice."
+      - "The claim must be released on every exit path. A leak means that (app, device) is never asked about again for the life of the daemon — silent, total, and invisible in the log."
+    why_not_auto_expire: >
+      The alternative was dropping Resident so the 60s timer worked. Rejected:
+      with a plain `ask` rule the application may never retry, so a popup that
+      vanished while the user was away would leave the app broken with no
+      explanation and no second chance. Android's model — the question waits —
+      is the right one for a permission manager.
+    the_cooldown_survives: >
+      d-dismiss-saves-nothing is unchanged and is now actually reachable.
+      Actively closing a popup still means block, save nothing, cool down, ask
+      again. It was never wrong; the only route to it was a timeout that never
+      fired.

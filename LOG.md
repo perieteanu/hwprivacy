@@ -148,3 +148,6 @@
 23-08-2026 17:15 | Sun | hw | [add] offenders -> history, with an allowed column. Migration preserved all 115 accumulated denials; old file left in place
 23-08-2026 17:35 | Sun | hw | [note] LIVE: two allowed monitor accesses -> ONE announcement. Cooldown verified end to end
 23-08-2026 17:38 | Sun | hw | [note] added an "Announced allowed access" log line — whether a popup appeared is otherwise unassertable, which is how C4 got scored wrong twice
+23-08-2026 17:55 | Sun | hw | [decide] b6: prompts STAY until answered — a permission question is a to-do item, not a nag. The stacking is the defect, not the persistence
+23-08-2026 18:00 | Sun | hw | [fix] b6: Timeout::Never said out loud, one pending prompt per (app,device) normalised, claim released on every exit path
+23-08-2026 18:05 | Sun | hw | [note] LIVE: three repeats of the same access -> ONE ASKED then DENIED, DENIED. Before the fix all three raised a popup

@@ -78,8 +78,15 @@ notifications:
     does not know when access ends and must not imply it does. Gated by
     notify_allow.rs — see DECISIONS d-notify-on-allow for why the gate is a
     startup grace plus a cooldown rather than an allowlist of system daemons.
+  prompts_never_expire: >
+    Stage 2 uses Hint::Resident + Timeout::Never. A permission question is a
+    to-do item; one that vanishes while you are away leaves the app silently
+    broken. Only ONE prompt per (app, device) can be pending — a second stream
+    is blocked and logged silently rather than stacking another identical
+    popup. Decided 2026-08-23; see ROADMAP b6.
   dismiss_contract:
     contract: "block this attempt, save NO rule, stay quiet for policy.dismiss_cooldown_secs, ask again after it"
+    when_it_applies: "only when the user ACTIVELY closes the popup. Prompts do not expire on their own, so this is no longer reachable by simply ignoring one."
     since: "2026-08-21 — see DECISIONS.yaml d-dismiss-saves-nothing"
     history: >
       Until then a dismissal wrote a permanent `deny` rule and the cooldown code

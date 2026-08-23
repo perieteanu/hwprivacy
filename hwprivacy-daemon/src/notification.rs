@@ -305,8 +305,23 @@ pub async fn ask_user_permission(
             .icon(icon)
             .urgency(Urgency::Critical)
             .hint(Hint::Category("device".to_string()))
-            .hint(Hint::Resident(true)) // stays until user acts
-            .timeout(60000); // 60s timeout
+            // Stays until the user answers. Decided 2026-08-23: a permission
+            // question is a to-do item, not a nag — one that vanishes while you
+            // are away leaves the app silently broken with no explanation.
+            //
+            // `Timeout::Never` rather than the `timeout(60000)` that used to sit
+            // here. That was a lie in two directions: Hint::Resident already
+            // overrode it, so the 60s never elapsed, and the code downstream
+            // was written believing it did — the dismiss cooldown could
+            // therefore never start and the same app re-prompted on every new
+            // stream (b6). Saying "never" out loud is what makes the rest
+            // honest.
+            //
+            // If a notification daemon closes it anyway, that arrives as
+            // "__closed" -> PromptOutcome::Dismissed, which is handled
+            // correctly: block, save nothing, cool down, ask again.
+            .hint(Hint::Resident(true))
+            .timeout(notify_rust::Timeout::Never);
 
         if is_per_stream_c {
             notif
