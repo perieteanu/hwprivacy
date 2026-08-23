@@ -664,6 +664,11 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                                 // link arrives.
                                 if perm == Permission::WhileInUse {
                                     s.tracker.begin_session(&app, cat);
+                                    // A camera session is enforced by ADDING
+                                    // the executable to the kernel allowlist,
+                                    // so this must reach the kernel now, not at
+                                    // the next 30 s tick.
+                                    s.policy_dirty.notify_waiters();
                                 }
                                 if s.config.set_rule(&app, &cat, perm) {
                                     if let Err(e) = s.config.save() {
@@ -735,6 +740,10 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                 // notification fires, and the next thing the user sees is a
                 // prompt they may not expect.
                 info!("while_in_use session ended: {} released {:?}", app, cat);
+                // Ending a camera session REMOVES an allowlist entry. Late is
+                // worse here than for a grant: it is time the executable can
+                // still open the camera after releasing it.
+                s.policy_dirty.notify_waiters();
                 s.tracker
                     .log_event(&app, 0, cat, "", AccessAction::SessionEnded);
             }

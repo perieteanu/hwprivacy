@@ -419,16 +419,21 @@ impl Config {
         let Some(key) = sanitize_rule_name(app_name) else {
             return false;
         };
-        // The camera cannot honour a session yet, and a rule that silently
-        // behaves as `allow` is the exact defect `while_in_use` was found to
-        // be. Refuse it rather than store it — the b4 precedent.
+        // The camera accepted `while_in_use` from 2026-08-23, once the LSM
+        // program gained an `lsm/file_release` hook and the daemon could see a
+        // camera being let go. Before that it was refused, because a rule that
+        // silently behaves as `allow` is the defect this permission was
+        // rewritten to remove.
         //
-        // The obstacle is layer 2, not this function: the camera is taken
-        // through V4L2 directly, and the LSM program is attached only to
-        // `lsm/file_open`, so nothing observes the close. `bpf_lsm_file_release`
-        // IS available on Debian 13's kernel (checked 2026-08-23), so this is a
-        // "not built yet", not a "cannot be built".
-        if *category == super::DeviceCategory::Camera && perm == Permission::WhileInUse {
+        // It still needs a binary: the session is enforced by adding and
+        // removing the executable from the kernel allowlist, and there is
+        // nothing to add without an exe_path. Unlike a plain `camera = allow`,
+        // which is meaningful for a portal app on the PipeWire route, a
+        // while_in_use camera rule with no binary can do nothing at all.
+        if *category == super::DeviceCategory::Camera
+            && perm == Permission::WhileInUse
+            && self.find_rule(&key).and_then(|r| r.exe_path.clone()).is_none()
+        {
             return false;
         }
         if let Some(rule) = self.find_rule_mut(&key) {
@@ -557,6 +562,33 @@ impl Config {
         self.rules
             .iter()
             .filter(|r| r.camera == Some(Permission::Allow))
+            .filter_map(|r| r.exe_path.clone().map(|p| (p, Permission::Allow)))
+            .collect()
+    }
+
+    /// The camera allowlist including `while_in_use` rules whose session is
+    /// currently live.
+    ///
+    /// `session_live` is injected rather than read, so the safety property —
+    /// a while_in_use executable is allowlisted ONLY while its session is open
+    /// — can be tested without a daemon, a kernel, or a clock.
+    ///
+    /// This is how a camera session is enforced. There is no way to hold an
+    /// `open()` pending a human: the LSM hook must answer in nanoseconds. So
+    /// the grant is expressed as presence in the allowlist, and ending the
+    /// session means removing the entry — after which the next open is denied
+    /// again, which is exactly what "only while in use" has to mean here.
+    pub fn kernel_camera_allowlist_with_sessions<F>(&self, session_live: F) -> Vec<(String, Permission)>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.rules
+            .iter()
+            .filter(|r| match r.camera {
+                Some(Permission::Allow) => true,
+                Some(Permission::WhileInUse) => session_live(&r.app_name),
+                _ => false,
+            })
             .filter_map(|r| r.exe_path.clone().map(|p| (p, Permission::Allow)))
             .collect()
     }
@@ -1173,20 +1205,84 @@ microphone = "ask_each"
         assert!(err.contains("while_in_use"), "{err}");
     }
 
-    /// The camera cannot end a session, so it must not be offered one.
+    // -- camera sessions (d-camera-sessions-via-file-release) ---------------
+
+    /// The safety property of a camera session, stated once.
     ///
-    /// The kernel layer enforces the camera and is attached to `lsm/file_open`
-    /// only — it never observes the release. A `while_in_use` camera rule would
-    /// therefore behave exactly as `allow`, which is the defect this permission
-    /// was rewritten to remove. Refused at write time, the b4 way.
+    /// A `while_in_use` executable is in the kernel allowlist ONLY while its
+    /// session is live. There is no way to hold an open() pending a human — the
+    /// LSM hook answers in nanoseconds — so presence in the allowlist IS the
+    /// grant, and ending the session has to mean removing the entry.
     #[test]
-    fn the_camera_refuses_while_in_use() {
+    fn a_while_in_use_camera_is_allowlisted_only_during_its_session() {
         let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        c.set_rule_exe("firefox", "/bin/sh").expect("binary");
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::WhileInUse));
+
+        assert!(
+            c.kernel_camera_allowlist_with_sessions(|_| false).is_empty(),
+            "no session: the kernel must deny it"
+        );
+        assert_eq!(
+            c.kernel_camera_allowlist_with_sessions(|_| true),
+            vec![("/bin/sh".to_string(), Permission::Allow)],
+            "session live: the kernel must allow it"
+        );
+    }
+
+    /// A plain `allow` is unconditional and must not be dragged into the
+    /// session logic — it has no session and must never depend on one.
+    #[test]
+    fn a_plain_allow_camera_ignores_sessions_entirely() {
+        let mut c = Config::default();
+        assert!(c.set_rule("obs", &DeviceCategory::Camera, Permission::Allow));
+        c.set_rule_exe("obs", "/bin/sh").expect("binary");
+        for live in [true, false] {
+            assert_eq!(
+                c.kernel_camera_allowlist_with_sessions(|_| live).len(),
+                1,
+                "allow does not depend on a session"
+            );
+        }
+    }
+
+    /// The session predicate is consulted PER RULE, so one app's live session
+    /// must not allowlist another app's binary.
+    #[test]
+    fn one_apps_session_does_not_allowlist_another_app() {
+        let mut c = Config::default();
+        for app in ["firefox", "chrome"] {
+            assert!(c.set_rule(app, &DeviceCategory::Camera, Permission::Allow));
+            c.set_rule_exe(app, "/bin/sh").expect("binary");
+            assert!(c.set_rule(app, &DeviceCategory::Camera, Permission::WhileInUse));
+        }
+        let allow = c.kernel_camera_allowlist_with_sessions(|app| app == "firefox");
+        assert_eq!(allow.len(), 1, "only the app with a live session: {allow:?}");
+    }
+
+    /// A camera session is enforced by adding and removing an allowlist entry,
+    /// and there is nothing to add without a binary. Unlike a plain
+    /// `camera = allow`, which is meaningful for a portal app on the PipeWire
+    /// route, this one can do nothing at all — so it is refused.
+    #[test]
+    fn a_camera_session_without_a_binary_is_refused() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Microphone, Permission::Allow));
         assert!(
             !c.set_rule("firefox", &DeviceCategory::Camera, Permission::WhileInUse),
-            "a camera session cannot be ended, so it must not be granted"
+            "no exe_path: nothing to add to the allowlist"
         );
-        assert!(c.find_rule("firefox").is_none(), "and nothing is written");
+        assert_eq!(c.find_rule("firefox").unwrap().camera, None, "nothing written");
+    }
+
+    /// And it IS accepted once a binary is attached.
+    #[test]
+    fn a_camera_session_with_a_binary_is_accepted() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        c.set_rule_exe("firefox", "/bin/sh").expect("binary");
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::WhileInUse));
     }
 
     /// The refusal is specific to the camera. Microphone and monitor go through

@@ -6,6 +6,23 @@
 
 pub const COMM_LEN: usize = 16;
 
+/// What the kernel is reporting.
+///
+/// `Release` exists because `bpf_lsm_file_release` was available all along and
+/// nothing was attached to it. Until 2026-08-23 every doc in this repo asserted
+/// that hwprivacy "cannot tell when access ends"; for the kernel layer that was
+/// a statement about an unattached hook, not about the platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// A device node was opened.
+    Open,
+    /// The last handle an executable held on a camera was released.
+    ///
+    /// Emitted once per executable per session, not once per close: a camera
+    /// session is 13 opens, and the kernel counts them down to zero first.
+    Release,
+}
+
 /// Byte size of `struct dev_event` in devices.bpf.c.
 /// 8 + 4+4 + 4+4 + 4+4 + 4+4 + 16
 pub const EVENT_SIZE: usize = 56;
@@ -38,6 +55,8 @@ pub struct DevEvent {
     /// was emitted. One camera session is 13 opens; without this the user
     /// gets 13 identical notifications.
     pub suppressed: u32,
+    /// Open or release.
+    pub kind: EventKind,
     /// Kernel's short process name (comm), max 15 chars + NUL.
     ///
     /// Not usable as identity: Firefox's camera thread reports `VideoCapture`.
@@ -74,6 +93,13 @@ impl DevEvent {
             dev_minor: u32_at(24),
             denied: u32_at(28) != 0,
             suppressed: u32_at(32),
+            // Offset 36 was explicit padding until 2026-08-23. Reusing it kept
+            // the wire size at 56 bytes, so EVENT_SIZE is unchanged and the
+            // layout test still guards the same number.
+            kind: match u32_at(36) {
+                1 => EventKind::Release,
+                _ => EventKind::Open,
+            },
             comm,
         })
     }

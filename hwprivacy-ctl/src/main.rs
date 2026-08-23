@@ -408,11 +408,16 @@ async fn main() -> anyhow::Result<()> {
                     println!("Rule set: {} → {} = {}", app, device, permission);
                 } else if device.starts_with("cam") && permission == "while_in_use" {
                     eprintln!(
-                        "Refused: the camera cannot do while_in_use yet.\n\
+                        "Refused: a camera session needs a binary.\n\
                          \n\
-                         The kernel layer is what enforces the camera, and it is attached\n\
-                         to lsm/file_open only — it never sees the camera released, so it\n\
-                         could not end the session. Use 'allow' or 'deny'."
+                         The session is enforced by adding and removing the executable\n\
+                         from the kernel allowlist, and there is nothing to add without\n\
+                         one. Attach it first:\n\
+                         \n\
+                         \x20   hwprivacy-ctl rules denied-cameras\n\
+                         \x20   hwprivacy-ctl rules allow-camera <path> --as {}\n\
+                         \x20   hwprivacy-ctl rules set {} cam while_in_use",
+                        app, app
                     );
                     std::process::exit(2);
                 } else {

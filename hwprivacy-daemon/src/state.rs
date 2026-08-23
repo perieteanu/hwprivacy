@@ -5,6 +5,8 @@ use crate::history::History;
 use crate::notify_allow::AllowNotifier;
 use crate::stream_tracker::StreamTracker;
 use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::Notify;
 use std::time::Instant;
 
 /// Full runtime state of the daemon.
@@ -31,6 +33,15 @@ pub struct DaemonState {
     /// When the daemon started. Only used for the notify-on-allow grace window,
     /// which suppresses the camera probes every boot produces.
     pub started_at: Instant,
+    /// Raised whenever the kernel allowlist should be recomputed and re-pushed
+    /// without waiting for the next `exe_recheck_secs` tick.
+    ///
+    /// The recheck loop is a 30-second poll, which is fine for "a package
+    /// upgrade changed an inode" and useless for "the user just clicked
+    /// Allow". A `while_in_use` camera session grants access by ADDING the
+    /// executable to the allowlist, so half a minute of latency is half a
+    /// minute of the application still being denied after you said yes.
+    pub policy_dirty: Arc<Notify>,
 }
 
 impl DaemonState {
@@ -48,6 +59,7 @@ impl DaemonState {
             ),
             allow_notifier: AllowNotifier::default(),
             started_at: Instant::now(),
+            policy_dirty: Arc::new(Notify::new()),
         }
     }
 

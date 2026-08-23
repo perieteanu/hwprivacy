@@ -278,6 +278,34 @@ does not offer the button. Next step is a second BPF program on
 Live evidence: with `parecord mic = while_in_use`, opening the mic logged
 `ASKED`. The same rule before this change logged a silent `ALLOWED`.
 
+### Camera sessions — code complete, NOT yet verified against a kernel
+
+A second BPF program on `lsm/file_release`. The camera now accepts
+`while_in_use`: the session is enforced by adding the executable to the kernel
+allowlist while live and removing it on release. Presence in the allowlist IS
+the grant — there is no way to hold an `open()` pending a human.
+
+Three things worth knowing before touching it:
+
+- **Attribution keys on the file pointer**, recorded at open. `file_release`
+  runs in whatever context drops the fd, and `__fput` can be deferred to a
+  kworker, so `current` there can be the wrong task or none.
+- **A count, not a boolean.** One camera session is 13 opens; a release is
+  emitted only at zero.
+- **A duplicate release is deliberate.** BPF returns from an atomic only under
+  ISA v3, so the decrement and the zero-check are separate and can race. Ending
+  twice is a no-op; missing a release leaves the session open forever.
+
+Policy pushes became immediate (`DaemonState::policy_dirty`), because a grant
+arriving 30 s after the click reads as the click having failed. That also fixes
+`rules allow-camera`, which used to say "within exe_recheck_secs".
+
+**⚠ The BPF verifier has never seen this program.** It compiles; loading needs
+root. Run `~/projects/claude-run/hwprivacy-camera-sessions-20260823.sh` — it
+installs the helper, checks the service actually came up, and drives an
+open/close cycle with ffmpeg. A verifier rejection is the most likely failure
+and the script prints the journal for it.
+
 ### Also fixed, outside the plan
 
 `~/.config/autostart/hwprivacy-gui.desktop` pointed at

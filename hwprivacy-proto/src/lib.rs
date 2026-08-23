@@ -123,6 +123,14 @@ pub struct AccessEvent {
     /// collapsed into this one event. A Firefox camera session is 13 opens;
     /// this is how the other 12 stay visible without 13 notifications.
     pub additional_opens: u32,
+    /// This event is a RELEASE — the executable let the camera go — rather than
+    /// an open.
+    ///
+    /// `#[serde(default)]` so a helper built before 2026-08-23 still speaks to
+    /// a newer daemon: an absent field means an open, which is what every event
+    /// was until the `lsm/file_release` hook existed.
+    #[serde(default)]
+    pub released: bool,
 }
 
 impl AccessEvent {
@@ -195,6 +203,7 @@ mod tests {
                 role: "CAMERA".into(),
                 denied: true,
                 additional_opens: 12,
+                released: false,
             }),
             Reply::Pong,
             Reply::Error {
@@ -221,6 +230,7 @@ mod tests {
             role: "CAMERA".into(),
             denied: true,
             additional_opens: 0,
+            released: false,
         });
         let line = encode_line(&msg).unwrap();
         assert_eq!(
@@ -242,12 +252,14 @@ mod tests {
             role: "CAMERA".into(),
             denied: true,
             additional_opens: 0,
+            released: false,
         };
         assert_eq!(single.total_opens(), 1);
         assert!(!single.is_burst());
 
         let burst = AccessEvent {
             additional_opens: 12,
+            released: false,
             ..single
         };
         assert_eq!(burst.total_opens(), 13, "the measured Firefox session");

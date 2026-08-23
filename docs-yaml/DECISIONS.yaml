@@ -889,3 +889,54 @@ decisions:
     next: >
       Attach a second BPF program to lsm/file_release, match the same device
       inodes, and the camera can have sessions too. ROADMAP > next_up.
+
+  - id: d-camera-sessions-via-file-release
+    date: "2026-08-23"
+    title: "The kernel layer observes releases, so the camera can have sessions"
+    extends: d-while-in-use-is-a-session
+    context: >
+      `while_in_use` landed for layer 1 only, and the camera refused it, because
+      the LSM program was attached to `lsm/file_open` alone and never saw a
+      camera being let go. That was never a platform limit: `bpf_lsm_file_release`
+      and `bpf_lsm_file_free_security` are both in Debian 13's BTF. Nothing was
+      attached, and every doc in the repo repeated "hwprivacy cannot tell when
+      access ends" as though it were a fact about the kernel.
+    decision: >
+      A second BPF program on `lsm/file_release`. The camera now accepts
+      `while_in_use`, and the session is enforced by ADDING the executable to
+      the kernel allowlist while it is live and REMOVING it when the device is
+      released. There is no way to hold an open() pending a human — the hook
+      answers in nanoseconds — so presence in the allowlist IS the grant.
+    why_the_file_pointer_is_the_key: >
+      `security_file_release` runs in whatever context drops the fd, and
+      `__fput` can be deferred to a kworker entirely. Reading `current` there
+      would attribute a close to the wrong task or to none. A (file -> executable)
+      map recorded at OPEN time cannot be wrong, whoever does the closing.
+    why_a_count: >
+      One camera session is 13 opens (measured). A release is emitted only when
+      an executable's open count reaches zero, or the session would end while
+      the application is still recording.
+    the_duplicate_is_deliberate: >
+      BPF only returns a value from an atomic under ISA v3, and raising the
+      toolchain floor for one instruction was not worth it. The decrement is
+      atomic and the zero-check is a separate re-read, so two threads dropping
+      the last two handles can both emit. Ending an already-ended session is a
+      no-op; MISSING a release leaves the session open forever. Fail toward
+      ending.
+    the_push_had_to_become_immediate: >
+      The allowlist was re-pushed only on the `exe_recheck_secs` tick, default
+      30 s. Fine for "a package upgrade changed an inode"; useless for "the user
+      clicked Allow and the app is still being denied". `DaemonState` gained a
+      `policy_dirty` Notify, raised on every rule write and every session
+      change, and the lsm_client session loop selects on it. This also makes
+      `rules allow-camera` take effect at once rather than within 30 s.
+    a_camera_session_needs_a_binary: >
+      Refused at write time without one. Unlike a plain `camera = allow`, which
+      is meaningful for a portal app on the PipeWire route, a while_in_use
+      camera rule with no exe_path has nothing to add to the allowlist and could
+      do nothing at all.
+    not_verified_yet: >
+      The program compiles; the BPF VERIFIER has never seen it, because loading
+      needs root. `~/projects/claude-run/hwprivacy-camera-sessions-20260823.sh`
+      installs it and proves an open/close cycle end to end. Until that has run,
+      camera sessions are unproven against a live kernel.

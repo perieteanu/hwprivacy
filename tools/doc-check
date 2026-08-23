@@ -269,6 +269,10 @@ SENTINELS = [
      "microphone, and this function could only ever label channels — it "
      "filtered siblings by node_id, and two real microphones are two nodes. "
      "See d-one-device-one-prompt."),
+    ("kernel_camera_allowlist()\n",
+     "the session-blind allowlist is back in use. A while_in_use camera must be "
+     "allowlisted ONLY while its session is live — use "
+     "kernel_camera_allowlist_with_sessions(). See d-camera-sessions-via-file-release."),
     ("Hint::Resident(true)",
      "the action prompt stayed on screen after the user clicked an answer — the "
      "spec says resident means exactly that. Timeout::Never alone gives "

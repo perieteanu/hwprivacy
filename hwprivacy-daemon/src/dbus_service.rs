@@ -90,9 +90,9 @@ impl HwPrivacyService {
         if !state.config.set_rule(app_name, &category, perm) {
             if category == DeviceCategory::Camera && perm == Permission::WhileInUse {
                 tracing::warn!(
-                    "Rejected '{}' camera = while_in_use: the kernel layer is attached \
-                     to lsm/file_open only, so it never observes the camera being \
-                     released and could not end the session. Use allow or deny.",
+                    "Rejected '{}' camera = while_in_use: a camera session is enforced \
+                     by adding and removing the executable from the kernel allowlist, \
+                     and this rule names no exe_path. Attach one first.",
                     app_name
                 );
             } else {
@@ -109,6 +109,7 @@ impl HwPrivacyService {
             tracing::error!("Failed to save config: {}", e);
         }
 
+        state.policy_dirty.notify_waiters();
         let _ = Self::rule_changed(&ctx, app_name, device, permission).await;
         info!("Rule set: {} → {} = {}", app_name, device, permission);
 
@@ -167,6 +168,7 @@ impl HwPrivacyService {
             tracing::error!("Failed to save config: {}", e);
             return (false, format!("saved nothing: {e}"));
         }
+        state.policy_dirty.notify_waiters();
         drop(state);
 
         let _ = Self::rule_changed(&ctx, app_name, "exe_path", exe_path).await;
@@ -223,6 +225,7 @@ impl HwPrivacyService {
             tracing::error!("Failed to save config: {}", e);
             return (false, format!("saved nothing: {e}"));
         }
+        state.policy_dirty.notify_waiters();
         drop(state);
 
         let _ = Self::rule_changed(&ctx, app_name, "camera", "allow").await;
@@ -247,6 +250,7 @@ impl HwPrivacyService {
             if let Err(e) = state.config.save() {
                 tracing::error!("Failed to save config: {}", e);
             }
+            state.policy_dirty.notify_waiters();
             let _ = Self::rule_changed(&ctx, app_name, "*", "removed").await;
             info!("Rules removed for: {}", app_name);
         }

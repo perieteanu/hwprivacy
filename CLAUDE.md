@@ -154,7 +154,7 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 cargo build --release --workspace       # or: make build
 cargo check --workspace                 # 5 warnings, 0 errors
 cargo clippy                            # NOT AVAILABLE — no such command on this toolchain
-cargo test --workspace                  # 184 tests, all pass
+cargo test --workspace                  # 188 tests, all pass
 make gui-test                           # 14 checks against the RUNNING window
 ```
 
@@ -236,9 +236,17 @@ regression → only then touch the substrate.
   begins; the session ends when the device is released and the next open asks
   again. Keyed on **(app, device)**, never a node id — that is what pruned the
   old per-stream grants before they could be used.
-- **The camera REFUSES `while_in_use`** at write time. The LSM program is on
-  `lsm/file_open` only, so it never sees the release. `bpf_lsm_file_release`
-  IS available on Debian 13 — this is "not built yet", not "impossible".
+- **The camera HAS sessions** since 2026-08-23 (`d-camera-sessions-via-file-release`).
+  A second BPF program on `lsm/file_release` reports the release; the session is
+  enforced by adding/removing the executable from the kernel allowlist, so a
+  camera `while_in_use` rule REQUIRES an `exe_path` and is refused without one.
+  Attribution keys on the **file pointer** recorded at open — `current` at
+  release time can be a kworker.
+- **A camera session is 13 opens.** The kernel counts down to zero before
+  emitting a release, or the session ends mid-recording.
+- **Policy pushes are immediate**, via `DaemonState::policy_dirty`. Do not go
+  back to relying on the `exe_recheck_secs` tick for a grant: 30 s of latency
+  after clicking Allow reads as the click having failed.
 - **"hwprivacy cannot tell when access ends" is FALSE for layer 1** and was
   repeated in the docs and in notification text for months. A vanishing
   PipeWire link is the release signal, and `main.rs` has always pruned on it.

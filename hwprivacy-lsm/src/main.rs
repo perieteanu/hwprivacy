@@ -364,10 +364,10 @@ fn main() -> Result<()> {
     }
 
     skel.attach()
-        .context("failed to attach to the security_file_open LSM hook")?;
+        .context("failed to attach the LSM programs (file_open, file_release)")?;
 
     if !cli.json {
-        eprintln!("hwprivacy-lsm: attached to lsm/file_open");
+        eprintln!("hwprivacy-lsm: attached to lsm/file_open and lsm/file_release");
         eprintln!("hwprivacy-lsm: watching major 81 (video4linux) + 116 (alsa)");
         if !cli.all {
             eprintln!("hwprivacy-lsm: showing CAMERA and MIC only — pass --all for playback/control");
@@ -512,6 +512,7 @@ fn main() -> Result<()> {
                         role: role.label().to_string(),
                         denied: e.denied,
                         additional_opens: e.suppressed,
+                        released: e.kind == crate::event::EventKind::Release,
                     }));
                 }
 
@@ -892,6 +893,9 @@ fn flush_stale_bursts(
                 denied: e.denied,
                 // The whole point: the opens this summary stands for.
                 additional_opens: e.suppressed,
+                // A burst summary is always about opens. A release is emitted
+                // once, at the end, and is never coalesced.
+                released: false,
             }));
         }
 
@@ -989,8 +993,9 @@ fn print_event(e: &DevEvent, device: &str, role: DeviceRole, exe: &str, json: bo
         // content processes, repeated ffmpeg invocations).
         let cmdline = e.resolve_cmdline().unwrap_or_default();
         println!(
-            r#"{{"ts":"{}","role":"{}","device":"{}","comm":"{}","pid":{},"tgid":{},"exe":"{}","cmdline":"{}","exe_dev":{},"exe_ino":{},"denied":{}}}"#,
+            r#"{{"ts":"{}","event":"{}","role":"{}","device":"{}","comm":"{}","pid":{},"tgid":{},"exe":"{}","cmdline":"{}","exe_dev":{},"exe_ino":{},"denied":{}}}"#,
             Local::now().to_rfc3339(),
+            if e.kind == crate::event::EventKind::Release { "release" } else { "open" },
             role.label(),
             escape(device),
             escape(&e.comm),
@@ -1008,6 +1013,8 @@ fn print_event(e: &DevEvent, device: &str, role: DeviceRole, exe: &str, json: bo
         // a quiet system.
         let burst = if e.suppressed > 0 {
             format!("  (+{} more suppressed)", e.suppressed)
+        } else if e.kind == crate::event::EventKind::Release {
+            "  RELEASED".to_string()
         } else {
             String::new()
         };

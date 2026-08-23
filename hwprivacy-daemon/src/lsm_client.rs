@@ -183,9 +183,12 @@ fn stat_identity(path: &str) -> Option<(u64, u64)> {
 /// any rules that cannot reach the kernel layer.
 async fn intended_policy(state: &SharedState) -> (Vec<PolicyEntry>, bool, Vec<(String, &'static str)>) {
     let s = state.read().await;
+    let settle = Duration::from_secs(s.config.policy.while_in_use_settle_secs);
     let entries: Vec<PolicyEntry> = s
         .config
-        .kernel_camera_allowlist()
+        .kernel_camera_allowlist_with_sessions(|app| {
+            s.tracker.session_live(app, DeviceCategory::Camera, settle)
+        })
         .into_iter()
         .map(|(exe_path, _)| PolicyEntry {
             exe_path,
@@ -262,6 +265,7 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
         // zero period, and a config typo must not take the daemon down.
         s.config.policy.exe_recheck_secs
     };
+    let dirty = { state.read().await.policy_dirty.clone() };
     let mut recheck_tick = tokio::time::interval(Duration::from_secs(recheck.max(1)));
     recheck_tick.tick().await; // the first tick completes immediately
 
@@ -271,6 +275,32 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
                 Some(l) => l,
                 None => break,
             },
+            _ = dirty.notified() => {
+                // Somebody changed a rule or opened/closed a session. Pushing
+                // now rather than at the next 30 s tick is the difference
+                // between "click Allow and it works" and "click Allow and wait
+                // half a minute while the app is still denied".
+                let (entries, want_enforce, _) = intended_policy(state).await;
+                let next = PolicyFingerprint::take(&entries, want_enforce);
+                if next != fingerprint {
+                    info!(
+                        "Kernel layer: policy changed ({}); pushing {} entr(ies)",
+                        next.describe_change(&fingerprint),
+                        entries.len()
+                    );
+                    tx.write_all(
+                        encode_line(&Request::SetPolicy {
+                            entries,
+                            enforce_camera: want_enforce,
+                        })?
+                        .as_bytes(),
+                    )
+                    .await?;
+                    fingerprint = next;
+                    enforce = want_enforce;
+                }
+                continue;
+            }
             _ = recheck_tick.tick(), if recheck > 0 => {
                 let (entries, want_enforce, gaps) = intended_policy(state).await;
 
@@ -393,6 +423,35 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
         // does not forward them by default; ignore them if it ever does.
         _ => return,
     };
+
+    // A RELEASE is the end of an access, not another one. It must not be
+    // logged as an access, must not notify, and must not touch any counter —
+    // it exists to close a session.
+    if ev.released {
+        let app = short_name(&ev.exe_path);
+        let mut s = state.write().await;
+        // Ending a session that is not open is a no-op. That matters: the BPF
+        // side can emit a duplicate release when two threads drop an
+        // executable's last two handles at once, and it does so deliberately —
+        // ending twice is harmless, never ending is the bug.
+        if s.tracker.while_in_use.remove(&(
+            hwprivacy_common::normalize_app_name(&app),
+            category,
+        )).is_some()
+        {
+            info!(
+                "while_in_use session ended: {} released the camera (kernel)",
+                app
+            );
+            s.tracker.log_event(
+                &app, ev.pid, category, &ev.exe_path, AccessAction::SessionEnded,
+            );
+            s.policy_dirty.notify_waiters();
+        } else {
+            debug!("Kernel reported {} released the camera; no session was open", app);
+        }
+        return;
+    }
 
     let action = if ev.denied {
         AccessAction::Denied
@@ -795,10 +854,12 @@ mod tests {
             role: "CAMERA".into(),
             denied: true,
             additional_opens: 0,
+            released: false,
         };
         let summary = AccessEvent {
             pid: 0,
             additional_opens: 12,
+            released: false,
             ..primary.clone()
         };
         assert_eq!(denied_opens(&primary), 1, "the primary open counts once");
@@ -841,6 +902,7 @@ mod tests {
             role: "CAMERA".into(),
             denied: true,
             additional_opens: 7,
+            released: false,
         };
         assert_eq!(denied_opens(&ev), 8);
     }
@@ -858,6 +920,7 @@ mod tests {
             role: "CAMERA".into(),
             denied: false,
             additional_opens: 7,
+            released: false,
         };
         assert_eq!(denied_opens(&allowed), 0);
         let allowed_summary = AccessEvent { pid: 0, ..allowed.clone() };
@@ -881,6 +944,7 @@ mod tests {
             role: "CAMERA".into(),
             denied: true,
             additional_opens: 12,
+            released: false,
         };
         assert_eq!(summary.pid, 0, "summaries are marked with pid 0");
         assert!(summary.is_burst());
@@ -903,6 +967,7 @@ mod tests {
                 role: role.into(),
                 denied: true,
                 additional_opens: 0,
+                released: false,
             };
             assert!(
                 !matches!(ev.role.as_str(), "CAMERA" | "MIC"),
