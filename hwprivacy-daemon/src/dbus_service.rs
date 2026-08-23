@@ -29,16 +29,40 @@ impl HwPrivacyService {
             .collect()
     }
 
-    async fn get_rules(&self) -> Vec<(String, String, String)> {
+    /// One row per rule: `(app, mic, camera, monitor, exe_path, gap_note)`.
+    ///
+    /// An unset category comes back as `""`, NOT as "deny" — the frontends
+    /// render it as "follows default_action". Flattening the three categories
+    /// into three rows, as this used to, made one rule look like three and
+    /// left nowhere to report `exe_path` or the kernel-layer gap.
+    async fn get_rules(&self) -> Vec<(String, String, String, String, String, String)> {
         let state = self.state.read().await;
-        let mut result = Vec::new();
-        for rule in &state.config.rules {
-            for cat in DeviceCategory::all() {
-                let perm = rule.get_permission(cat);
-                result.push((rule.app_name.clone(), cat.to_string(), perm.to_string()));
-            }
-        }
-        result
+        let gaps = state.config.kernel_camera_gaps();
+        state
+            .config
+            .rules
+            .iter()
+            .map(|rule| {
+                let perm = |cat| {
+                    rule.get_permission(cat)
+                        .map(|p| p.to_string())
+                        .unwrap_or_default()
+                };
+                let note = gaps
+                    .iter()
+                    .find(|(app, _)| app == &rule.app_name)
+                    .map(|(_, why)| why.to_string())
+                    .unwrap_or_default();
+                (
+                    rule.app_name.clone(),
+                    perm(&DeviceCategory::Microphone),
+                    perm(&DeviceCategory::Camera),
+                    perm(&DeviceCategory::Monitor),
+                    rule.exe_path.clone().unwrap_or_default(),
+                    note,
+                )
+            })
+            .collect()
     }
 
     async fn set_rule(
@@ -78,7 +102,129 @@ impl HwPrivacyService {
 
         let _ = Self::rule_changed(&ctx, app_name, device, permission).await;
         info!("Rule set: {} → {} = {}", app_name, device, permission);
+
+        // Say so NOW if the rule just written cannot reach the layer it names.
+        //
+        // The measured failure this closes (2026-08-23): `camera = allow` was
+        // saved for firefox, and thirteen seconds later the kernel denied
+        // firefox-esr, with nothing in between. The warning existed but only
+        // ran at connect time, and the recheck loop could not fire it either —
+        // a rule with no exe_path contributes no allowlist entry, so the policy
+        // fingerprint never changed.
+        let gap = state
+            .config
+            .kernel_camera_gaps()
+            .into_iter()
+            .find(|(app, _)| hwprivacy_common::config::normalize_app_name(app)
+                == hwprivacy_common::config::normalize_app_name(app_name));
+        drop(state);
+
+        if let Some((app, why)) = gap {
+            // Logged as well as shown. A popup is invisible to every automated
+            // check, and this project has already scored a verification wrong
+            // twice because it depended on a human seeing one (C4).
+            tracing::warn!("Kernel layer gap: rule '{}' — {}", app, why);
+            info!("Announced kernel-gap warning for rule '{}'", app);
+            // Informational, no buttons, via the kernel-denial path. NEVER the
+            // action path: that one carries b1, and a new event source wired
+            // into it inherits that bug on day one.
+            crate::notification::notify_kernel_gap(&app, why).await;
+        }
+
         true
+    }
+
+    /// Attach the kernel-layer executable to an app's rule, or clear it with
+    /// `""`. Returns `(ok, message)`.
+    ///
+    /// Before this existed there was no way to set `exe_path` from any
+    /// frontend, and `kernel_camera_allowlist()` keys on nothing else — so a
+    /// camera grant made through `hwprivacy-ctl`, the TUI or the GUI could
+    /// never take effect, whatever app name you typed.
+    async fn set_rule_exe(
+        &self,
+        #[zbus(signal_context)] ctx: SignalContext<'_>,
+        app_name: &str,
+        exe_path: &str,
+    ) -> (bool, String) {
+        let mut state = self.state.write().await;
+
+        if let Err(why) = state.config.set_rule_exe(app_name, exe_path) {
+            tracing::warn!("Refused executable for '{}': {}", app_name, why);
+            return (false, why);
+        }
+
+        if let Err(e) = state.config.save() {
+            tracing::error!("Failed to save config: {}", e);
+            return (false, format!("saved nothing: {e}"));
+        }
+        drop(state);
+
+        let _ = Self::rule_changed(&ctx, app_name, "exe_path", exe_path).await;
+        let msg = if exe_path.is_empty() {
+            info!("Rule executable cleared for '{}'", app_name);
+            format!("cleared the executable for '{app_name}'")
+        } else {
+            info!("Rule executable set: {} → {}", app_name, exe_path);
+            // The push itself is the recheck loop's job: adding a path changes
+            // the policy fingerprint, which is what triggers a re-push. Naming
+            // the delay beats letting the user wonder whether it worked.
+            format!(
+                "'{app_name}' now names {exe_path}; the kernel layer picks it \
+                 up within exe_recheck_secs"
+            )
+        };
+        (true, msg)
+    }
+
+    /// Grant a camera at both layers atomically.
+    ///
+    /// Order matters and so does the single lock: `set_rule` alone leaves the
+    /// rule in the gap state that raises a warning, and doing this as two
+    /// D-Bus calls made the successful path announce a failure it was one
+    /// call away from fixing.
+    async fn allow_camera(
+        &self,
+        #[zbus(signal_context)] ctx: SignalContext<'_>,
+        app_name: &str,
+        exe_path: &str,
+    ) -> (bool, String) {
+        let mut state = self.state.write().await;
+
+        if !state
+            .config
+            .set_rule(app_name, &DeviceCategory::Camera, Permission::Allow)
+        {
+            return (
+                false,
+                format!("'{app_name}' is not a usable rule name"),
+            );
+        }
+
+        // If the binary is refused, the camera rule must not be left behind:
+        // it would be a rule that reads `allow` and denies, which is the
+        // state this whole command exists to prevent someone reaching.
+        if let Err(why) = state.config.set_rule_exe(app_name, exe_path) {
+            state.config.remove_rule(app_name);
+            tracing::warn!("Refused camera grant for '{}': {}", app_name, why);
+            return (false, why);
+        }
+
+        if let Err(e) = state.config.save() {
+            tracing::error!("Failed to save config: {}", e);
+            return (false, format!("saved nothing: {e}"));
+        }
+        drop(state);
+
+        let _ = Self::rule_changed(&ctx, app_name, "camera", "allow").await;
+        info!(
+            "Camera granted: {} → allow, binary {}",
+            app_name, exe_path
+        );
+        (
+            true,
+            format!("{app_name} → camera = allow, binary {exe_path}"),
+        )
     }
 
     async fn remove_rule(
@@ -282,23 +428,10 @@ impl HwPrivacyService {
         true
     }
 
-    /// Grant a one-shot `ask_each` allow.
-    ///
-    /// Takes the app name as well as the node id, because a node id alone is
-    /// not an identity: PipeWire reuses ids, so a grant keyed on the id only
-    /// can land on an unrelated later stream (blocker b2). The caller already
-    /// has the name — `GetActiveStreams` returns it beside the id.
-    async fn allow_stream(&self, node_id: u32, app_name: &str) -> bool {
-        let mut state = self.state.write().await;
-        state.tracker.grant_one_shot(node_id, app_name);
-        info!("One-shot allow granted: {} on node {}", app_name, node_id);
-        true
-    }
-
-    async fn deny_stream(&self, _node_id: u32) -> bool {
-        // Stream is already denied (link was destroyed); this is a no-op confirmation
-        true
-    }
+    // AllowStream / DenyStream were here until 2026-08-23, backing `ask_each`.
+    // Removed with the per-stream concept: the grant AllowStream wrote could
+    // never take effect, and DenyStream was already a no-op that returned true.
+    // See DECISIONS d-no-per-stream-grants.
 
     // -- Signals --
 

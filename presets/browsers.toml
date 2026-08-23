@@ -7,8 +7,10 @@
 # d-executable-is-the-principal; this preset cannot change that and does not
 # pretend to.
 #
-# Microphone is `ask_each` rather than `allow`: a browser is many tabs, and
-# ask_each prompts per stream. Camera has no equivalent, because the kernel hook
+# Microphone is `ask` rather than `allow`: you get one prompt and your answer
+# becomes the rule. It was `ask_each` until 2026-08-23, which promised a prompt
+# per browser tab and could not deliver one — see DECISIONS
+# d-no-per-stream-grants. Camera cannot prompt at all, because the kernel hook
 # must answer in nanoseconds and cannot wait for a human.
 #
 # Only two candidates below were verified to exist on the machine this was
@@ -21,7 +23,7 @@ description = "Firefox and Chrome — camera by executable inode, microphone per
 
 [[app]]
 name = "firefox"
-microphone = "ask_each"
+microphone = "ask"
 camera = "allow"
 monitor = "deny"
 exe_candidates = [
@@ -33,7 +35,7 @@ exe_candidates = [
 
 [[app]]
 name = "chrome"
-microphone = "ask_each"
+microphone = "ask"
 camera = "allow"
 monitor = "deny"
 exe_candidates = [

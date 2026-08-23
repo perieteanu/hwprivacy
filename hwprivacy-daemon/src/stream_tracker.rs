@@ -14,18 +14,6 @@ pub struct StreamTracker {
     pub events: Vec<AccessEvent>,
     /// Counter for blocked access attempts
     pub blocked_count: u32,
-    /// Session one-shot `ask_each` grants: node id → normalised app name.
-    ///
-    /// Keyed on BOTH halves deliberately. This was a `Vec<u32>` of node ids
-    /// that was never pruned, and PipeWire reuses node ids as soon as a node is
-    /// gone — so a grant given to one stream could silently authorise an
-    /// unrelated later one. Observed live: a Firefox microphone stream logged
-    /// ALLOWED with no prompt while the rule said `ask_each` (blocker b2).
-    ///
-    /// Pruning alone still leaves a race, because an id can be freed and reused
-    /// between two polls. Requiring the app name to match as well closes the
-    /// cross-application case, which is the half that matters for security.
-    pub one_shot_allowed: HashMap<u32, String>,
     /// Notification cooldown: (app_name, device_category) → last dismiss time.
     /// When a user dismisses a notification, suppress the same prompt for
     /// `policy.dismiss_cooldown_secs` to avoid notification spam.
@@ -51,7 +39,6 @@ impl StreamTracker {
             while_in_use_streams: HashMap::new(),
             events: Vec::new(),
             blocked_count: 0,
-            one_shot_allowed: HashMap::new(),
             dismiss_cooldowns: HashMap::new(),
             pending_prompts: HashSet::new(),
         }
@@ -118,7 +105,6 @@ impl StreamTracker {
         app_name: &str,
         pid: u32,
         category: DeviceCategory,
-        instance: Option<&str>,
         node_name: &str,
         action: AccessAction,
     ) {
@@ -132,7 +118,6 @@ impl StreamTracker {
             app_name: app_name.to_string(),
             pid,
             device_category: category,
-            device_instance: instance.map(str::to_string),
             node_name: node_name.to_string(),
             action: action.clone(),
         };
@@ -151,7 +136,7 @@ impl StreamTracker {
         }
         self.events.push(event);
 
-        if matches!(action, AccessAction::Denied | AccessAction::StreamDenied) {
+        if matches!(action, AccessAction::Denied) {
             self.blocked_count += 1;
         }
     }
@@ -181,44 +166,20 @@ impl StreamTracker {
         self.active.remove(&link_id);
     }
 
+    // is_one_shot_allowed / grant_one_shot / prune_one_shot lived here until
+    // 2026-08-23, backing `ask_each`. They are gone with it: the grant they
+    // produced could never be used. The link was destroyed before the user was
+    // asked, nothing in link_manager can create one, and the grant was keyed on
+    // a node id that got pruned the moment the torn-down stream left the graph.
+    // Measured live: allow, nothing happens, asked again — forever.
+    // See DECISIONS d-no-per-stream-grants.
+
     /// Track a while_in_use stream.
     pub fn track_while_in_use(&mut self, app_name: &str, node_id: u32) {
         self.while_in_use_streams
             .entry(app_name.to_string())
             .or_default()
             .push(node_id);
-    }
-
-    /// Check if a stream was one-shot allowed (for `ask_each`).
-    ///
-    /// The app name must match as well as the node id. A recycled id belonging
-    /// to a different application is not a grant.
-    pub fn is_one_shot_allowed(&self, node_id: u32, app_name: &str) -> bool {
-        self.one_shot_allowed
-            .get(&node_id)
-            .is_some_and(|granted_to| *granted_to == normalize_app_name(app_name))
-    }
-
-    /// Grant a one-shot allow for a stream.
-    pub fn grant_one_shot(&mut self, node_id: u32, app_name: &str) {
-        self.one_shot_allowed
-            .insert(node_id, normalize_app_name(app_name));
-    }
-
-    /// Drop grants whose node no longer exists in the graph.
-    ///
-    /// Without this a grant lives for the daemon's whole lifetime, and node ids
-    /// are reused — which is how an approved stream's permission ended up on a
-    /// later, unapproved one. Called once per poll from the monitoring loop,
-    /// where the live node set has already been captured.
-    pub fn prune_one_shot(&mut self, live_node_ids: &HashSet<u32>) {
-        let before = self.one_shot_allowed.len();
-        self.one_shot_allowed
-            .retain(|node_id, _| live_node_ids.contains(node_id));
-        let dropped = before - self.one_shot_allowed.len();
-        if dropped > 0 {
-            debug!("Expired {dropped} one-shot grant(s) whose stream is gone");
-        }
     }
 
     /// Get recent events.
@@ -236,52 +197,6 @@ impl StreamTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// b2, the security half. PipeWire reuses node ids. A grant given to
-    /// Firefox's stream must never authorise a different application that later
-    /// happens to land on the same id.
-    #[test]
-    fn a_grant_does_not_transfer_to_another_app_on_the_same_node_id() {
-        let mut t = StreamTracker::new();
-        t.grant_one_shot(42, "Firefox [pipewire-pulse]");
-
-        assert!(t.is_one_shot_allowed(42, "Firefox"), "same app, same node");
-        assert!(
-            t.is_one_shot_allowed(42, "firefox [pipewire-pulse]"),
-            "the annotation and case must not matter — normalize_app_name handles both"
-        );
-        assert!(
-            !t.is_one_shot_allowed(42, "obs"),
-            "a recycled id belonging to another app is NOT a grant"
-        );
-        assert!(!t.is_one_shot_allowed(43, "Firefox"), "different node");
-    }
-
-    /// b2, the lifetime half. The grant list was never pruned, so a grant
-    /// survived for the daemon's whole lifetime — live evidence was an
-    /// `ask_each` Firefox microphone stream logged ALLOWED with no prompt.
-    #[test]
-    fn a_grant_expires_when_its_node_leaves_the_graph() {
-        let mut t = StreamTracker::new();
-        t.grant_one_shot(42, "firefox");
-        t.grant_one_shot(43, "obs");
-
-        let live: HashSet<u32> = [43].into_iter().collect();
-        t.prune_one_shot(&live);
-
-        assert!(!t.is_one_shot_allowed(42, "firefox"), "gone node, gone grant");
-        assert!(t.is_one_shot_allowed(43, "obs"), "a live node keeps its grant");
-    }
-
-    /// Re-granting the same node must not accumulate entries — the old
-    /// `Vec<u32>` grew without bound for the process lifetime.
-    #[test]
-    fn regranting_the_same_node_does_not_accumulate() {
-        let mut t = StreamTracker::new();
-        t.grant_one_shot(7, "firefox");
-        t.grant_one_shot(7, "firefox");
-        assert_eq!(t.one_shot_allowed.len(), 1);
-    }
 
     /// b6. Prompts are Resident and never expire — decided 2026-08-23, a
     /// permission question is a to-do item, not something that vanishes while

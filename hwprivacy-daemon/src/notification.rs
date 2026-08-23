@@ -48,10 +48,6 @@ impl PromptOutcome {
 pub enum PromptAction {
     /// Write a permanent rule. Reachable ONLY from [`PromptOutcome::Chosen`].
     SavePermanentRule(Permission),
-    /// Let this one stream through, save nothing.
-    GrantThisStream,
-    /// Refuse this one stream, save nothing.
-    DenyThisStream,
     /// We still do not know what the user wants. Stay blocked, write nothing,
     /// go quiet for the cooldown, ask again after it.
     SaveNothingAndCooldown,
@@ -61,14 +57,10 @@ pub enum PromptAction {
 ///
 /// The invariant this exists to hold: no input other than
 /// [`PromptOutcome::Chosen`] can produce [`PromptAction::SavePermanentRule`].
-pub fn decide(outcome: &PromptOutcome, is_per_stream: bool) -> PromptAction {
-    let Some(perm) = outcome.permission() else {
-        return PromptAction::SaveNothingAndCooldown;
-    };
-    match (is_per_stream, perm) {
-        (true, Permission::Allow) => PromptAction::GrantThisStream,
-        (true, _) => PromptAction::DenyThisStream,
-        (false, p) => PromptAction::SavePermanentRule(p),
+pub fn decide(outcome: &PromptOutcome) -> PromptAction {
+    match outcome.permission() {
+        Some(p) => PromptAction::SavePermanentRule(p),
+        None => PromptAction::SaveNothingAndCooldown,
     }
 }
 
@@ -95,7 +87,7 @@ fn device_icon(device: DeviceCategory) -> &'static str {
 }
 
 /// Human-readable label
-fn device_label(device: DeviceCategory) -> &'static str {
+pub fn device_label(device: DeviceCategory) -> &'static str {
     match device {
         DeviceCategory::Microphone => "Microphone",
         DeviceCategory::Camera => "Camera",
@@ -103,19 +95,10 @@ fn device_label(device: DeviceCategory) -> &'static str {
     }
 }
 
-/// Label naming WHICH instance, when a node presents more than one —
-/// `Microphone (mic2)`.
-///
-/// This is blocker b3. A stereo capture device is two physical microphones, so
-/// two prompts are correct; two prompts both saying "Microphone" is what reads
-/// as broken. The category stays in the string so nothing that reads the text
-/// loses the device kind.
-pub fn device_label_for(device: DeviceCategory, instance: Option<&str>) -> String {
-    match instance {
-        Some(i) => format!("{} ({})", device_label(device), i),
-        None => device_label(device).to_string(),
-    }
-}
+// device_label_for() lived here until 2026-08-23 and appended `(mic1)`/`(mic2)`
+// to the device name. Removed with the ordinals themselves: the popup was
+// naming a channel while its buttons wrote a rule for the whole category.
+// See DECISIONS d-one-device-one-prompt.
 
 /// Stage 1: Instant "BLOCKED" notification — fire-and-forget, non-blocking.
 /// Shows immediately so the user knows something was caught.
@@ -123,10 +106,9 @@ pub async fn notify_blocked(
     app_name: &str,
     pid: u32,
     device: DeviceCategory,
-    instance: Option<&str>,
     node_name: &str,
 ) {
-    let label = device_label_for(device, instance);
+    let label = device_label(device);
     let summary = format!("BLOCKED: {} → {}", app_name, label);
     let body = format!(
         "<b>{}</b> (pid:{}) tried to access <b>{}</b>\n\
@@ -175,10 +157,9 @@ pub async fn notify_allowed(
     app_name: &str,
     pid: u32,
     device: DeviceCategory,
-    instance: Option<&str>,
     detail: &str,
 ) {
-    let label = device_label_for(device, instance);
+    let label = device_label(device);
     let summary = format!("{} used the {}", app_name, label);
     let body = format!(
         "<b>{}</b> (pid:{}) was allowed <b>{}</b> by your rules.\n\
@@ -259,6 +240,49 @@ pub async fn notify_kernel_denial(
     .ok();
 }
 
+/// A rule was just saved that cannot reach the layer it names.
+///
+/// Informational, no buttons, deliberately on the same path as
+/// [`notify_kernel_denial`] rather than the action path — the house rule is
+/// that a new event source must not be wired into the prompt path, and this
+/// one has nothing to prompt *for*: the fix is choosing an executable, which
+/// a yes/no popup cannot express.
+///
+/// Exists because of a measured silence. On 2026-08-23 `camera = allow` was
+/// saved for firefox and the kernel denied firefox-esr thirteen seconds later,
+/// with nothing said in between, while `hwprivacy-ctl rules list` reported
+/// `camera allow`. A surface claiming health over dead enforcement is the same
+/// failure class as the 2026-08-20 staleness bug.
+pub async fn notify_kernel_gap(app_name: &str, why: &str) {
+    let summary = format!("Rule saved, but not in force: {app_name}");
+    let body = format!(
+        "<b>{}</b>: {}\n\
+         <i>Pick a binary with: hwprivacy-ctl rules denied-cameras</i>",
+        app_name, why
+    );
+
+    tokio::task::spawn_blocking(move || {
+        let result = Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .icon("dialog-warning")
+            .urgency(Urgency::Normal)
+            .hint(Hint::Category("device.error".to_string()))
+            .hint(Hint::Transient(true))
+            // FIXME(hardcoded): same 8000 ms as notify_kernel_denial above.
+            // ROADMAP > debt already catalogues the notification timeouts;
+            // matching the neighbour beats inventing a third number here.
+            .timeout(8000)
+            .show();
+
+        if let Err(e) = result {
+            warn!("Failed to send kernel gap notification: {}", e);
+        }
+    })
+    .await
+    .ok();
+}
+
 /// Stage 2: Action notification — asks the user to set a permanent rule.
 ///
 /// Blocks until the user responds or the popup times out. See [`PromptOutcome`]
@@ -267,33 +291,22 @@ pub async fn ask_user_permission(
     app_name: &str,
     pid: u32,
     device: DeviceCategory,
-    instance: Option<&str>,
     node_name: &str,
-    is_per_stream: bool,
 ) -> PromptOutcome {
-    let label = device_label_for(device, instance);
+    let label = device_label(device);
     let icon = device_icon(device);
 
     let summary = format!("Set rule for {} → {}", app_name, label);
-    let body = if is_per_stream {
-        format!(
-            "<b>{}</b> (pid:{}) wants <b>{}</b> access.\n\
-             Stream: {}\n\
-             Choose how to handle <u>this stream</u>:",
-            app_name, pid, label, node_name
-        )
-    } else {
-        format!(
-            "<b>{}</b> (pid:{}) wants <b>{}</b> access.{}\n\
-             Choose a <u>permanent rule</u> for this app:",
-            app_name,
-            pid,
-            label,
-            rule_key_hint(app_name)
-        )
-    };
+    let body = format!(
+        "<b>{}</b> (pid:{}) wants <b>{}</b> access.{}
+\
+         Choose a <u>permanent rule</u> for this app:",
+        app_name,
+        pid,
+        label,
+        rule_key_hint(app_name)
+    );
 
-    let is_per_stream_c = is_per_stream;
 
     let result = tokio::task::spawn_blocking(move || -> PromptOutcome {
         let chosen = Arc::new(Mutex::new(None::<Permission>));
@@ -320,30 +333,40 @@ pub async fn ask_user_permission(
             // If a notification daemon closes it anyway, that arrives as
             // "__closed" -> PromptOutcome::Dismissed, which is handled
             // correctly: block, save nothing, cool down, ask again.
-            .hint(Hint::Resident(true))
+            //
+            // NO Hint::Resident. It was here until 2026-08-23 and it is what
+            // kept the popup on screen AFTER the user clicked an answer —
+            // reported live by Costin, and exactly what the spec says it does:
+            // "the server will not automatically remove the notification when
+            // an action has been invoked."
+            //
+            // Timeout::Never alone is what was actually wanted: stays until
+            // you answer, closes when you do. Resident meant "stays even after
+            // you answer", which reads as the click having done nothing. It
+            // survived the b6 fix because that fix was aimed at the TIMEOUT,
+            // and Resident happened to suppress that too — two hints doing
+            // overlapping jobs, only one of them intended.
             .timeout(notify_rust::Timeout::Never);
 
-        if is_per_stream_c {
-            notif
-                .action("allow_stream", "Allow Stream")
-                .action("deny_stream", "Deny Stream");
-        } else {
-            notif
-                .action("allow", "Always Allow")
-                .action("ask_each", "Ask Each Time")
-                .action("while_in_use", "While in Use")
-                .action("deny", "Always Deny");
-        }
+        // Three buttons, all of which write a permanent rule.
+        //
+        // "Ask Each Time" is gone (2026-08-23): it wrote `ask_each`, whose
+        // grant could never be used, so the honest description of that button
+        // was "ask me this again shortly". "Allow Stream"/"Deny Stream" are
+        // gone with the whole per-stream branch.
+        notif
+            .action("allow", "Always Allow")
+            .action("while_in_use", "While in Use")
+            .action("deny", "Always Deny");
 
         match notif.show() {
             Ok(handle) => {
                 let chosen_c = chosen.clone();
                 handle.wait_for_action(|action| {
                     let perm = match action {
-                        "allow" | "allow_stream" => Some(Permission::Allow),
-                        "ask_each" => Some(Permission::AskEach),
+                        "allow" => Some(Permission::Allow),
                         "while_in_use" => Some(Permission::WhileInUse),
-                        "deny" | "deny_stream" => Some(Permission::Deny),
+                        "deny" => Some(Permission::Deny),
                         "__closed" => {
                             info!("Notification dismissed — no rule saved, will ask again later");
                             None
@@ -427,13 +450,11 @@ mod tests {
             PromptOutcome::Dismissed,
             PromptOutcome::Failed("no notification daemon".into()),
         ] {
-            for is_per_stream in [true, false] {
-                assert_eq!(
-                    decide(&outcome, is_per_stream),
-                    PromptAction::SaveNothingAndCooldown,
-                    "{outcome:?} (per_stream={is_per_stream}) must write nothing"
-                );
-            }
+            assert_eq!(
+                decide(&outcome),
+                PromptAction::SaveNothingAndCooldown,
+                "{outcome:?} must write nothing"
+            );
         }
     }
 
@@ -443,11 +464,11 @@ mod tests {
     #[test]
     fn dismissing_differs_from_choosing_deny() {
         assert_ne!(
-            decide(&PromptOutcome::Dismissed, false),
-            decide(&PromptOutcome::Chosen(Permission::Deny), false)
+            decide(&PromptOutcome::Dismissed),
+            decide(&PromptOutcome::Chosen(Permission::Deny))
         );
         assert_eq!(
-            decide(&PromptOutcome::Chosen(Permission::Deny), false),
+            decide(&PromptOutcome::Chosen(Permission::Deny)),
             PromptAction::SavePermanentRule(Permission::Deny),
             "an explicit deny IS saved — that is the user's decision"
         );
@@ -458,31 +479,16 @@ mod tests {
     fn each_permanent_choice_is_saved_verbatim() {
         for p in [
             Permission::Allow,
-            Permission::AskEach,
             Permission::WhileInUse,
             Permission::Deny,
         ] {
             assert_eq!(
-                decide(&PromptOutcome::Chosen(p), false),
+                decide(&PromptOutcome::Chosen(p)),
                 PromptAction::SavePermanentRule(p)
             );
         }
     }
 
-    /// The per-stream prompt has two buttons and must never touch config —
-    /// that is the whole point of `ask_each` for a browser.
-    #[test]
-    fn a_per_stream_answer_never_writes_a_rule() {
-        assert_eq!(
-            decide(&PromptOutcome::Chosen(Permission::Allow), true),
-            PromptAction::GrantThisStream
-        );
-        for p in [Permission::Deny, Permission::AskEach, Permission::WhileInUse] {
-            assert_eq!(
-                decide(&PromptOutcome::Chosen(p), true),
-                PromptAction::DenyThisStream,
-                "{p} on a per-stream prompt must not be persisted"
-            );
-        }
-    }
+    // The per-stream tests lived here until 2026-08-23. `ask_each` is gone,
+    // so every answer now writes a rule and there is no second shape to test.
 }

@@ -178,24 +178,34 @@ struct LinkGroup {
     m: policy_engine::LinkMatch,
 }
 
-/// Collapse the links that represent ONE act of access, per category.
+/// Collapse the links that represent ONE act of access.
 ///
-/// This is blocker b3, and the two categories need opposite treatment:
+/// One device, one application, one question — whatever the channel count.
 ///
-/// * **Microphone** — a stereo capture device is two PHYSICAL microphones,
-///   exposed as `capture_FL` and `capture_FR`. Two prompts are correct, and
-///   coalescing would destroy the only handle on which one is being asked for.
-///   Measured 2026-08-19: cutting one channel mid-capture took its rms to 0.0
-///   while the other kept recording. They are separately gateable, so they are
-///   separately askable. Left alone here; `LinkMatch::instance` labels them.
+/// # Why this stopped being per-category
 ///
-/// * **Monitor** — a sink's `monitor_FL` and `monitor_FR` are two CHANNELS of
-///   one playback device. Recording what the speakers are playing is one act
-///   against one device, so two prompts are genuinely duplicates. Seen live on
-///   2026-08-21: two identical `OBS → Monitor → ALLOWED` rows in the same
-///   second. Grouped by (device, app).
+/// It was, until 2026-08-23. The microphone was deliberately NOT coalesced, on
+/// the reasoning that a stereo capture device is two physical microphones and
+/// so deserves two prompts, labelled `mic1` and `mic2`.
 ///
-/// * **Camera** — one link. Untouched.
+/// Three things were wrong with that.
+///
+/// * **The premise.** `alsa_input.pci-0000_00_1f.3.analog-stereo` is ONE device
+///   exposing `capture_FL` and `capture_FR` — two channels, structurally
+///   identical to a sink's `monitor_FL`/`monitor_FR`, which this function has
+///   always coalesced. Two *physical* microphones are two PipeWire nodes and
+///   were never affected by any of this.
+/// * **The rules could not express it.** Permissions are per category, so
+///   "allow mic1, deny mic2" was never writable. The prompt named a precision
+///   the answer could not carry.
+/// * **The second channel could never be granted.** Two links in one batch mean
+///   two decisions; the first claims the (app, device) prompt slot and the
+///   second hits the b6 guard and is denied outright. So a stereo microphone
+///   was guaranteed, on every machine, to lose one channel.
+///
+/// Costin, 2026-08-23: "just mic — the device. maybe other people does not have
+/// a mic with 2 channels." Coalescing by (device, app) is right for all three
+/// categories; the camera arrives as a single link and is unaffected.
 ///
 /// The group carries EVERY link id, not just the representative. Callers must
 /// enforce on all of them; collapsing the prompt must never collapse the
@@ -204,16 +214,13 @@ fn group_links(matches: Vec<(u32, policy_engine::LinkMatch)>) -> Vec<LinkGroup> 
     let mut groups: Vec<LinkGroup> = Vec::new();
 
     for (link_id, m) in matches {
-        let coalesce = m.device.category == DeviceCategory::Monitor;
-        let existing = coalesce.then(|| {
-            groups.iter_mut().find(|g| {
-                g.m.device.category == DeviceCategory::Monitor
-                    && g.m.device.node_name == m.device.node_name
-                    && g.m.stream.node_id == m.stream.node_id
-            })
+        let existing = groups.iter_mut().find(|g| {
+            g.m.device.category == m.device.category
+                && g.m.device.node_name == m.device.node_name
+                && g.m.stream.node_id == m.stream.node_id
         });
 
-        match existing.flatten() {
+        match existing {
             Some(g) => g.link_ids.push(link_id),
             None => groups.push(LinkGroup {
                 link_ids: vec![link_id],
@@ -231,7 +238,7 @@ mod group_tests {
     use hwprivacy_common::device::ProtectedDevice;
     use hwprivacy_common::stream::StreamInfo;
 
-    fn m(category: DeviceCategory, device_node: &str, app_node_id: u32, instance: Option<&str>)
+    fn m(category: DeviceCategory, device_node: &str, app_node_id: u32)
         -> policy_engine::LinkMatch
     {
         policy_engine::LinkMatch {
@@ -250,7 +257,6 @@ mod group_tests {
                 object_serial: 0,
                 guarded: true,
             },
-            instance: instance.map(str::to_string),
         }
     }
 
@@ -261,8 +267,8 @@ mod group_tests {
     #[test]
     fn a_sinks_two_monitor_channels_become_one_decision() {
         let groups = group_links(vec![
-            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
-            (101, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
+            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99)),
+            (101, m(DeviceCategory::Monitor, "alsa_output.analog", 99)),
         ]);
         assert_eq!(groups.len(), 1, "one prompt, not two");
     }
@@ -273,23 +279,46 @@ mod group_tests {
     #[test]
     fn a_coalesced_group_still_carries_every_link_to_destroy() {
         let groups = group_links(vec![
-            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
-            (101, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
+            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99)),
+            (101, m(DeviceCategory::Monitor, "alsa_output.analog", 99)),
         ]);
         assert_eq!(groups[0].link_ids, vec![100, 101]);
     }
 
-    /// b3 proper: two microphones are two decisions. Coalescing here would
-    /// destroy the only handle on which mic is being requested.
+    /// The reversal of b3, settled 2026-08-23 (`d-one-device-one-prompt`).
+    ///
+    /// `capture_FL` and `capture_FR` are two channels of ONE microphone, and
+    /// this is the assertion that used to say the opposite. Two prompts here
+    /// were not merely noisy: the first claimed the (app, device) prompt slot
+    /// and the second hit the b6 guard and was denied outright, so a stereo
+    /// microphone deterministically lost a channel. Costin hit exactly that on
+    /// 2026-08-23 — `mic1 ASKED` then `mic2 DENIED`, 60 ms apart, every time.
     #[test]
-    fn two_microphones_stay_two_decisions() {
+    fn a_stereo_microphones_two_channels_become_one_decision() {
         let groups = group_links(vec![
-            (100, m(DeviceCategory::Microphone, "alsa_input.analog", 99, Some("mic1"))),
-            (101, m(DeviceCategory::Microphone, "alsa_input.analog", 99, Some("mic2"))),
+            (100, m(DeviceCategory::Microphone, "alsa_input.analog", 99)),
+            (101, m(DeviceCategory::Microphone, "alsa_input.analog", 99)),
         ]);
-        assert_eq!(groups.len(), 2, "one prompt per microphone");
-        assert_eq!(groups[0].m.instance.as_deref(), Some("mic1"));
-        assert_eq!(groups[1].m.instance.as_deref(), Some("mic2"));
+        assert_eq!(groups.len(), 1, "one prompt for one microphone");
+        assert_eq!(
+            groups[0].link_ids,
+            vec![100, 101],
+            "and BOTH channels are enforced — coalescing the prompt must never \
+             coalesce the teardown"
+        );
+    }
+
+    /// Two microphones the user can actually tell apart — different devices —
+    /// stay two decisions. This is what the deleted `mic1`/`mic2` ordinal was
+    /// reaching for and could never express: a real second microphone is a
+    /// different node_name, and grouping already keys on that.
+    #[test]
+    fn two_different_microphones_stay_two_decisions() {
+        let groups = group_links(vec![
+            (100, m(DeviceCategory::Microphone, "alsa_input.analog", 99)),
+            (101, m(DeviceCategory::Microphone, "alsa_input.usb-webcam", 99)),
+        ]);
+        assert_eq!(groups.len(), 2, "one prompt per real microphone");
     }
 
     /// Two different apps tapping the same sink are two separate decisions —
@@ -297,8 +326,8 @@ mod group_tests {
     #[test]
     fn two_apps_tapping_one_sink_are_not_merged() {
         let groups = group_links(vec![
-            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
-            (101, m(DeviceCategory::Monitor, "alsa_output.analog", 77, None)),
+            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99)),
+            (101, m(DeviceCategory::Monitor, "alsa_output.analog", 77)),
         ]);
         assert_eq!(groups.len(), 2);
     }
@@ -307,8 +336,8 @@ mod group_tests {
     #[test]
     fn one_app_tapping_two_sinks_is_not_merged() {
         let groups = group_links(vec![
-            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
-            (101, m(DeviceCategory::Monitor, "alsa_output.hdmi", 99, None)),
+            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99)),
+            (101, m(DeviceCategory::Monitor, "alsa_output.hdmi", 99)),
         ]);
         assert_eq!(groups.len(), 2);
     }
@@ -316,7 +345,7 @@ mod group_tests {
     #[test]
     fn a_camera_link_is_its_own_group() {
         let groups = group_links(vec![
-            (100, m(DeviceCategory::Camera, "v4l2_input.cam", 99, None)),
+            (100, m(DeviceCategory::Camera, "v4l2_input.cam", 99)),
         ]);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].link_ids, vec![100]);
@@ -426,7 +455,6 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
             } = group;
             let stream = &m.stream;
             let device = &m.device;
-            let instance = m.instance.as_deref();
 
             // Skip if device category is not guarded
             if !s.config.devices.is_guarded(&device.category) {
@@ -442,17 +470,13 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     &stream.app_name,
                     stream.pid,
                     device.category,
-                    instance,
                     &stream.node_name,
                 );
                 continue;
             }
 
             // Evaluate policy
-            let is_one_shot = s
-                .tracker
-                .is_one_shot_allowed(stream.node_id, &stream.app_name);
-            let decision = policy_engine::evaluate(&s.config, stream, device, is_one_shot);
+            let decision = policy_engine::evaluate(&s.config, stream, device);
 
             // Act on decision
             match decision {
@@ -479,8 +503,7 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                         &stream.app_name,
                         stream.pid,
                         device.category,
-                        instance,
-                        &stream.node_name,
+                            &stream.node_name,
                     );
 
                     // Say so, if this one is worth saying. The gate is a pure
@@ -503,7 +526,6 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     }
                     let (app, pid, cat) =
                         (stream.app_name.clone(), stream.pid, device.category);
-                    let inst = m.instance.clone();
                     drop(s);
                     if announce {
                         // Logged, symmetrically with the kernel layer's
@@ -516,14 +538,13 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                         info!(
                             "Announced allowed access: {} → {}",
                             app,
-                            notification::device_label_for(cat, inst.as_deref())
+                            notification::device_label(cat)
                         );
                         notification::notify_allowed(
                             &app,
                             pid,
                             cat,
-                            inst.as_deref(),
-                            "Allowed by your rules. hwprivacy cannot tell when access ends.",
+                                    "Allowed by your rules. hwprivacy cannot tell when access ends.",
                         )
                         .await;
                     }
@@ -534,26 +555,22 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     let pid = stream.pid;
                     let cat = device.category;
                     let node = stream.node_name.clone();
-                    let inst = m.instance.clone();
 
                     drop(s);
                     link_manager::destroy_links(link_ids).await;
                     let mut s = state.write().await;
-                    s.log_denied(&app, pid, cat, inst.as_deref(), &node);
+                    s.log_denied(&app, pid, cat, &node);
                     drop(s);
 
                     // Instant notification — rule already says deny
-                    notification::notify_blocked(&app, pid, cat, inst.as_deref(), &node).await;
+                    notification::notify_blocked(&app, pid, cat, &node).await;
                 }
 
-                PolicyDecision::AskUser | PolicyDecision::AskEachStream => {
-                    let is_per_stream = matches!(decision, PolicyDecision::AskEachStream);
+                PolicyDecision::AskUser => {
                     let app = stream.app_name.clone();
                     let pid = stream.pid;
                     let cat = device.category;
                     let node = stream.node_name.clone();
-                    let node_id = stream.node_id;
-                    let inst = m.instance.clone();
 
                     // 1. Destroy the links immediately (security first).
                     //    ALL of them: coalescing the prompt must not leave a
@@ -581,7 +598,7 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     };
                     if already_asking {
                         let mut s = state.write().await;
-                        s.log_denied(&app, pid, cat, inst.as_deref(), &node);
+                        s.log_denied(&app, pid, cat, &node);
                         debug!(
                             "Blocked {} → {:?}; a prompt for it is already waiting for an answer",
                             app, cat
@@ -596,10 +613,10 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                             // blocked_count itself for a Denied action
                             // (stream_tracker.rs). An extra += 1 here counted
                             // every cooldown-suppressed block twice.
-                            s.log_denied(&app, pid, cat, inst.as_deref(), &node);
+                            s.log_denied(&app, pid, cat, &node);
                         } else {
                             s.tracker.log_event(
-                                &app, pid, cat, inst.as_deref(), &node,
+                                &app, pid, cat, &node,
                                 AccessAction::AskedUser,
                             );
                         }
@@ -611,13 +628,13 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     }
 
                     // 3. Stage 1: instant BLOCKED notification (fire-and-forget)
-                    notification::notify_blocked(&app, pid, cat, inst.as_deref(), &node).await;
+                    notification::notify_blocked(&app, pid, cat, &node).await;
 
                     // 4. Stage 2: action notification for rule setting (async)
                     let notify_state = state.clone();
                     tokio::spawn(async move {
                         let response = notification::ask_user_permission(
-                            &app, pid, cat, inst.as_deref(), &node, is_per_stream,
+                            &app, pid, cat, &node,
                         )
                         .await;
 
@@ -630,20 +647,7 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                         }
 
                         let mut s = notify_state.write().await;
-                        match notification::decide(&response, is_per_stream) {
-                            notification::PromptAction::GrantThisStream => {
-                                s.tracker.grant_one_shot(node_id, &app);
-                                s.tracker.log_event(
-                                    &app, pid, cat, inst.as_deref(), &node,
-                                    AccessAction::StreamAllowed,
-                                );
-                            }
-                            notification::PromptAction::DenyThisStream => {
-                                s.tracker.log_event(
-                                    &app, pid, cat, inst.as_deref(), &node,
-                                    AccessAction::StreamDenied,
-                                );
-                            }
+                        match notification::decide(&response) {
                             notification::PromptAction::SavePermanentRule(perm) => {
                                 if s.config.set_rule(&app, &cat, perm) {
                                     if let Err(e) = s.config.save() {
@@ -702,7 +706,6 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
             for lid in stale {
                 s.tracker.remove_connection(lid);
             }
-            s.tracker.prune_one_shot(&current_node_ids);
         }
     }
 }

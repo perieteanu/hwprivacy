@@ -12,7 +12,7 @@ current_state:
     unpredictable.
 
   verified_working:
-    - "Cargo workspace, 7 crates, 10181 LOC, 132 tests, builds clean (5 trivial warnings, 0 errors) — verified 2026-08-21"
+    - "Cargo workspace, 7 crates, 12234 LOC, 172 tests, builds clean (trivial warnings, 0 errors) — verified 2026-08-23"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"
@@ -61,7 +61,7 @@ blockers:
     severity: critical
     status: "FIXED 2026-08-21."
     what: "`ask_each` streams got silently ALLOWED with no prompt."
-    where: "hwprivacy-daemon/src/stream_tracker.rs grant_one_shot()"
+    where: "hwprivacy-daemon/src/stream_tracker.rs (grant_one_shot(), removed 2026-08-23 with ask_each)"
     effect: "one_shot_allowed: Vec<u32> was never pruned and was keyed on the PipeWire node id, which PipeWire recycles. An old grant leaked onto an unrelated later stream."
     evidence: "live event log — 'Firefox [pipewire-pulse] microphone ALLOWED' while config says microphone = ask_each"
     the_camouflage: >
@@ -142,6 +142,35 @@ blockers:
       would make all future matching fuzzier to repair a write-time mistake.
       Sanitising happens once, on input, where a bad result is visible in
       config.toml immediately instead of being silently wrong forever.
+
+  while_in_use_is_not_implemented:
+    severity: high
+    status: "OPEN — found 2026-08-23, undecided."
+    what: >
+      `while_in_use` is offered in the config, on the CLI, in the GUI dropdown
+      and as a button on every permission prompt, and it does nothing that
+      `allow` does not.
+    measured: >
+      `StreamTracker::while_in_use_streams` is declared, initialised and written
+      to by track_while_in_use() — and read NOWHERE in the tree.
+      `AccessAction::RevokedOnDisconnect` exists with a Display impl and is
+      emitted NOWHERE. policy_engine::evaluate maps WhileInUse -> Allow, under a
+      comment that claimed "we allow but track the client lifecycle".
+    why_it_is_worse_than_a_missing_feature: >
+      It is a surface that lies, which is the defect class this project spent
+      2026-08-23 removing everywhere else. A user picking "While in Use" over
+      "Always Allow" believes they chose the narrower grant. They did not.
+    the_hard_part: >
+      Removing `ask_each` also removed the only grant machinery that could have
+      made it distinguishable. hwprivacy cannot see when access ENDS — stated in
+      the notify_allowed body text — so "revoke when no longer in use" has no
+      event to hang on. Making it real needs a way to observe a client going
+      away, and then something to revoke; with rules re-evaluated per link,
+      there is currently no lingering grant to take back.
+    options:
+      - "Remove it. Three honest states: allow / ask / deny."
+      - "Implement it: watch the app's PipeWire client node, and destroy its links when the node disappears."
+      - "Keep it as an alias for allow and say so in the UI — the weakest option, since the label still implies a narrower grant."
 
 b6_resident_prompt_never_times_out:
   severity: medium
@@ -604,8 +633,10 @@ kernel_layer:
   b1_scope_correction_2026_08_19:
     finding: >
       b1 is narrower than every doc states. Dismissing writes a permanent deny
-      only on the PLAIN `ask` path. On `ask_each` the per-stream branch calls
-      grant_one_shot() or logs StreamDenied and NEVER calls config.set_rule().
+      only on the PLAIN `ask` path. On `ask_each` the per-stream branch called
+      grant_one_shot() or logged StreamDenied and never called config.set_rule().
+      Historical: `ask_each` and the whole per-stream branch were removed on
+      2026-08-23, so `ask` is now the only prompting path.
     evidence: >
       Four mic prompts were dismissed during the 2026-08-19 call with firefox
       microphone = ask_each; config.toml was unchanged, mtime untouched, all 8
@@ -1035,3 +1066,4 @@ if_revisiting_cold:
   - "`journalctl --user -u hwprivacy --since today` — the defects are visible in the logs, not just the code."
   - "Remember the daemon runs from target/release/. `cargo build --release` swaps the binary under a live service."
   - "Do not trust README's 'What Has Been Implemented' on BEHAVIOUR. It is accurate on scope and wrong on dismiss handling and on the D-Bus signals."
+

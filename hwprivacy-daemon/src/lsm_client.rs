@@ -19,6 +19,7 @@
 //! kernel layer is an addition, never a dependency.
 
 use crate::dbus_service::SharedState;
+use hwprivacy_common::short_name;
 use hwprivacy_common::stream::AccessAction;
 use hwprivacy_common::{DeviceCategory, Permission};
 use hwprivacy_proto::{
@@ -196,6 +197,29 @@ async fn intended_policy(state: &SharedState) -> (Vec<PolicyEntry>, bool, Vec<(S
     (entries, enforce, s.config.kernel_camera_gaps())
 }
 
+/// What changed between two gap reports: newly opened, and newly closed.
+///
+/// Pure, and separate from the loop, so the "only on change" rule can be
+/// tested. The rule matters: `exe_recheck_secs` fires every 30 s by default,
+/// and a warning repeated 2 880 times a day is one nobody reads. It is also
+/// the only part of this that a test can reach — everything around it is a
+/// `select!` over a live socket.
+fn gap_delta<'a>(
+    prev: &[(String, &'static str)],
+    next: &'a [(String, &'static str)],
+) -> (Vec<&'a (String, &'static str)>, Vec<String>) {
+    let opened = next
+        .iter()
+        .filter(|(app, why)| !prev.iter().any(|(a, w)| a == app && w == why))
+        .collect();
+    let closed = prev
+        .iter()
+        .filter(|(app, _)| !next.iter().any(|(a, _)| a == app))
+        .map(|(app, _)| app.clone())
+        .collect();
+    (opened, closed)
+}
+
 /// One connection: handshake, push policy, then stream events until it drops —
 /// re-pushing whenever the intended policy or the files behind it change.
 async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> {
@@ -217,6 +241,10 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
     for (app, why) in &gaps {
         warn!("Kernel layer gap: rule '{}' — {}", app, why);
     }
+    if let Some(why) = state.read().await.config.global_camera_gap() {
+        warn!("Kernel layer gap: {}", why);
+    }
+    let mut last_gaps = gaps;
 
     let mut fingerprint = PolicyFingerprint::take(&entries, enforce);
     tx.write_all(
@@ -244,7 +272,27 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
                 None => break,
             },
             _ = recheck_tick.tick(), if recheck > 0 => {
-                let (entries, want_enforce, _) = intended_policy(state).await;
+                let (entries, want_enforce, gaps) = intended_policy(state).await;
+
+                // Report gaps here as well as at connect time. The connect-time
+                // pass alone could never catch the case that actually bit: a
+                // rule with `camera = allow` and no exe_path contributes no
+                // allowlist entry, so the fingerprint below does not change,
+                // no re-push happens, and nothing is said. Measured 2026-08-23
+                // — thirteen seconds of silence between saving the rule and
+                // the kernel denying the binary it was meant to allow.
+                //
+                // Only on CHANGE. Re-warning every exe_recheck_secs would
+                // flood the journal and train the reader to skip the line.
+                let (opened, closed) = gap_delta(&last_gaps, &gaps);
+                for (app, why) in &opened {
+                    warn!("Kernel layer gap: rule '{}' — {}", app, why);
+                }
+                for app in &closed {
+                    info!("Kernel layer gap closed for rule '{}'", app);
+                }
+                last_gaps = gaps;
+
                 let next = PolicyFingerprint::take(&entries, want_enforce);
                 if next != fingerprint {
                     info!(
@@ -392,7 +440,7 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
         s.tracker
             // No instance: the kernel layer sees a device NODE (/dev/video0),
             // not a PipeWire port, so it has nothing to disambiguate with.
-            .log_event(&app, ev.pid, category, None, &ev.exe_path, action);
+            .log_event(&app, ev.pid, category, &ev.exe_path, action);
 
         // denied_opens() is the single statement of how much this event is
         // worth. log_event() has ALREADY added one for a Denied action, so add
@@ -504,7 +552,6 @@ async fn notify_allowed_kernel(
         app,
         ev.pid,
         category,
-        None,
         "Allowed by your rules. hwprivacy cannot tell when access ends — \
          the kernel hook fires on open, not on close.",
     )
@@ -591,16 +638,6 @@ pub fn denied_opens(ev: &AccessEvent) -> u32 {
     1 + ev.additional_opens
 }
 
-/// Last path component, for a readable event log. `/usr/lib/firefox-esr/firefox-esr`
-/// becomes `firefox-esr`.
-fn short_name(exe_path: &str) -> String {
-    exe_path
-        .rsplit('/')
-        .next()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(exe_path)
-        .to_string()
-}
 
 /// Permission the kernel layer would apply, for display purposes.
 pub fn kernel_permission_for(allowed: bool) -> Permission {
@@ -785,9 +822,9 @@ mod tests {
         use hwprivacy_common::DeviceCategory;
         let mut t = crate::stream_tracker::StreamTracker::new();
         assert_eq!(t.blocked_count, 0);
-        t.log_event("x", 1, DeviceCategory::Camera, None, "/dev/video0", AccessAction::Denied);
+        t.log_event("x", 1, DeviceCategory::Camera, "/dev/video0", AccessAction::Denied);
         assert_eq!(t.blocked_count, 1, "log_event counts exactly one denial");
-        t.log_event("x", 1, DeviceCategory::Camera, None, "/dev/video0", AccessAction::Allowed);
+        t.log_event("x", 1, DeviceCategory::Camera, "/dev/video0", AccessAction::Allowed);
         assert_eq!(t.blocked_count, 1, "an allowed event must not count");
     }
 
@@ -872,5 +909,69 @@ mod tests {
                 "{role} must not be treated as capture"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // gap_delta — "warn only on change".
+    // ---------------------------------------------------------------------
+
+    fn g(app: &str, why: &'static str) -> (String, &'static str) {
+        (app.to_string(), why)
+    }
+
+    /// The rule that matters. `exe_recheck_secs` fires every 30 s; re-warning
+    /// each time would print the same line 2 880 times a day, which is the
+    /// same as not printing it.
+    #[test]
+    fn an_unchanged_gap_set_reports_nothing() {
+        let prev = vec![g("firefox", "no exe_path")];
+        let next = vec![g("firefox", "no exe_path")];
+        let (opened, closed) = gap_delta(&prev, &next);
+        assert!(opened.is_empty(), "{opened:?}");
+        assert!(closed.is_empty(), "{closed:?}");
+    }
+
+    /// The measured failure: a rule is saved that cannot reach the kernel
+    /// layer, and nothing is said. This is the line that would have said it.
+    #[test]
+    fn a_new_gap_is_reported_once() {
+        let next = vec![g("firefox", "no exe_path")];
+        let (opened, closed) = gap_delta(&[], &next);
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].0, "firefox");
+        assert!(closed.is_empty());
+    }
+
+    /// Attaching a binary closes the gap, and that is worth saying too — it is
+    /// the confirmation that a grant took effect.
+    #[test]
+    fn a_closed_gap_is_reported() {
+        let prev = vec![g("firefox", "no exe_path")];
+        let (opened, closed) = gap_delta(&prev, &[]);
+        assert!(opened.is_empty());
+        assert_eq!(closed, vec!["firefox".to_string()]);
+    }
+
+    /// A gap that changes REASON on the same app is a new thing to say: the
+    /// rule went from `camera = allow` with no binary to a prompting
+    /// permission, which fails differently.
+    #[test]
+    fn a_gap_whose_reason_changed_is_reported_again() {
+        let prev = vec![g("firefox", "no exe_path")];
+        let next = vec![g("firefox", "prompting permissions have no kernel equivalent")];
+        let (opened, closed) = gap_delta(&prev, &next);
+        assert_eq!(opened.len(), 1, "the reason changed, so say so");
+        assert!(closed.is_empty(), "the app still has a gap; it did not close");
+    }
+
+    /// One app closing while another opens must not mask either.
+    #[test]
+    fn one_opening_and_one_closing_are_both_reported() {
+        let prev = vec![g("firefox", "no exe_path")];
+        let next = vec![g("chrome", "no exe_path")];
+        let (opened, closed) = gap_delta(&prev, &next);
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].0, "chrome");
+        assert_eq!(closed, vec!["firefox".to_string()]);
     }
 }

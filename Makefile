@@ -1,7 +1,7 @@
 PREFIX ?= /usr
 DESTDIR ?=
 
-.PHONY: build install install-lsm clean deb doc-check check
+.PHONY: build install install-lsm clean deb doc-check gui-test check
 
 build:
 	cargo build --release --workspace
@@ -12,6 +12,15 @@ build:
 # that actually occurred in this repo.
 doc-check:
 	@tools/doc-check
+
+# Drive the running GUI over AT-SPI and assert what the window actually says.
+#
+# NOT part of `check`, on purpose. It needs a session bus, a running daemon and
+# a MAPPED hwprivacy-gui window — a gate that fails on a headless box teaches
+# you to skip the gate, which is the failure mode tools/doc-check exists to
+# prevent. Run it deliberately, after touching the GUI.
+gui-test:
+	@tools/gui-test
 
 check: doc-check
 	cargo test --workspace

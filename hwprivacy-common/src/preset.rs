@@ -165,11 +165,16 @@ impl Preset {
                 continue;
             }
 
+            // A preset states all three categories (`PresetApp` defaults each
+            // to deny), so every one is a deliberate opinion and is wrapped in
+            // `Some`. This is the one place a full three-category rule is
+            // still correct to write — a preset is a rule set, not a
+            // single-category grant.
             let rule = AppRule {
                 app_name: key.clone(),
-                microphone: app.microphone,
-                camera: app.camera,
-                monitor: app.monitor,
+                microphone: Some(app.microphone),
+                camera: Some(app.camera),
+                monitor: Some(app.monitor),
                 exe_path: resolved.clone(),
             };
             entries.push((key, Outcome::Added { exe_path: resolved }, Some(rule)));
@@ -339,8 +344,15 @@ microphone = "allow"
         let plan = p.plan(nothing_exists, no_rules);
         assert_eq!(plan.entries[0].1, Outcome::Added { exe_path: None });
         let rule = plan.entries[0].2.as_ref().unwrap();
-        assert_eq!(rule.microphone, Permission::Allow);
-        assert_eq!(rule.camera, Permission::Deny, "unset categories default to deny");
+        assert_eq!(rule.microphone, Some(Permission::Allow));
+        // A preset states every category, so an omitted one is a deliberate
+        // deny written by PresetApp's default — NOT the `None` that a
+        // single-category `set_rule` now leaves behind.
+        assert_eq!(
+            rule.camera,
+            Some(Permission::Deny),
+            "a category omitted from a preset is a deliberate deny"
+        );
     }
 
     /// **The property that matters most.** An import must never broaden a

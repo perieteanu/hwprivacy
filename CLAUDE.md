@@ -5,7 +5,7 @@ Android-style hardware permission manager for the Linux desktop. Gates native
 **playback monitor** across **two enforcement layers**: the PipeWire graph, and
 an eBPF LSM in the kernel.
 
-Rust workspace, **7 crates, 10181 LOC** (BPF C included; generated `vmlinux.h`
+Rust workspace, **7 crates, 12234 LOC** (BPF C included; generated `vmlinux.h`
 excluded). Debian 13 / PipeWire / KDE + GNOME.
 Registered in project-tracker as `hwprivacy`, short name `hw`.
 
@@ -154,7 +154,8 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 cargo build --release --workspace       # or: make build
 cargo check --workspace                 # 5 warnings, 0 errors
 cargo clippy                            # NOT AVAILABLE — no such command on this toolchain
-cargo test --workspace                  # 152 tests, all pass
+cargo test --workspace                  # 169 tests, all pass
+make gui-test                           # 14 checks against the RUNNING window
 ```
 
 Binaries (5): `hwprivacy-daemon` (layer 1 enforcer + policy owner),
@@ -167,10 +168,12 @@ Test coverage is **not** evenly spread:
 | crate | tests |
 |---|---|
 | hwprivacy-lsm | 49 |
-| hwprivacy-daemon | 62 |
-| hwprivacy-common | 35 |
+| hwprivacy-daemon | 72 |
+| hwprivacy-common | 43 |
 | hwprivacy-proto | 6 |
-| hwprivacy-ctl / -tui / -gui | 0 |
+| hwprivacy-ctl | 2 |
+| hwprivacy-gui | 1 (widget-level; needs a display) |
+| hwprivacy-tui | 0 |
 
 `classify_link()` was covered on 2026-08-21 — 14 tests, including the one that
 had never existed: that ordinary playback into a sink is **not** classified as a
@@ -218,11 +221,19 @@ regression → only then touch the substrate.
 - **MSRV is whatever Debian 13 ships (rustc 1.85.0).** `notify-rust` is pinned
   to `=4.11.3` for this reason. Do not bump pinned crates or adopt newer
   language features without checking Debian.
-- **Two prompts are not always a bug — it depends on the category.** Two mic
-  links are two physical microphones and get one prompt each, labelled
-  `mic1`/`mic2`. Two monitor links are two channels of one sink and get a
-  single coalesced prompt. Applying either rule to the other category is what
-  made b3 look unfixable. See `d-per-microphone-identity` + ROADMAP b3.
+- **One device, one app, one prompt** — whatever the channel count.
+  `capture_FL`/`capture_FR` and `monitor_FL`/`monitor_FR` are both CHANNELS, and
+  both coalesce. Two *physical* microphones are two nodes and still get two
+  prompts. The `mic1`/`mic2` ordinals were deleted 2026-08-23: they could only
+  ever label channels, and no rule could act on one. See
+  `d-one-device-one-prompt`.
+- **`ask_each` no longer exists** (`d-no-per-stream-grants`). The string still
+  parses, to `ask`, so old configs load. Do not reintroduce per-stream grants
+  without first giving `link_manager` a way to CREATE a link — the whole reason
+  it failed is that the deny path destroys what the allow path cannot restore.
+- **`while_in_use` is NOT implemented.** It is a synonym for `allow`;
+  `while_in_use_streams` is written and never read. Do not describe it as
+  working. ROADMAP > blockers > `while_in_use_is_not_implemented`.
 - **When you coalesce a prompt, never coalesce the teardown.** `LinkGroup`
   carries every link id for exactly this reason.
 - **The allow path is as important as the deny path.** `hwprivacy-ctl history`
@@ -237,21 +248,44 @@ regression → only then touch the substrate.
   `hwprivacy-ctl preset import <name> --apply`. Preview is the default because
   a preset is a grant. An import never touches a rule you already have — see
   `d-presets-are-data`.
-- **`pipewire [pipewire-pulse]` in the live config is NOT a dead rule**, despite
-  what four months of docs said. It normalises to `pipewire`, matches, and has
-  denied 24 times. It also blocks `preset import desktop-baseline`, so removing
-  it is a prerequisite there rather than tidying.
+- **`pipewire [pipewire-pulse]` was NOT a dead rule**, despite what four months
+  of docs said — it normalised to `pipewire`, matched, and denied 24 times.
+  Retired 2026-08-23: the live config now carries a clean `pipewire` rule with
+  an `exe_path`. Kept here because the reasoning still applies to any rule that
+  *looks* dead: normalise it before believing that.
 - **Prove a new test fails against the bug it catches**, before keeping it. Every
   test added on 2026-08-21 was run against the deliberately reintroduced defect
   and observed to fail. A test that passes both ways is worthless.
+- **`tools/gui-test` drives the live GUI over AT-SPI.** Needs a running daemon
+  and a **mapped** window — GTK4 does not build a notebook page, or its a11y
+  subtree, until the page is selected, so an unmapped window walks as EMPTY and
+  every assertion would vacuously pass. The script refuses to report a pass on
+  an empty tree. Select a page with `Atspi.Selection.select_child`, not
+  `do_action` — a page tab exposes no action. Not part of `make check`, because
+  a gate that fails on a headless box teaches you to skip the gate.
+- **A placeholder is not a label.** GTK exposes it as the object attribute
+  `placeholder-text`. A check that scans `label` nodes only will pass with the
+  `screen` placeholder bug fully present — observed 2026-08-23.
 - **`tools/doc-check` carries regression SENTINELS** — source patterns that must
   never reappear. Add one only after a defect has actually shipped.
+- **A rule carries TWO identities and one text field cannot hold both.**
+  `app_name` is what PipeWire's client declares about itself (`firefox`);
+  `exe_path` is what the kernel matches by inode
+  (`/usr/lib/firefox-esr/firefox-esr`, short name `firefox-esr`).
+  `kernel_camera_allowlist()` reads **only** `exe_path` — so a `camera = allow`
+  with no binary grants nothing to a non-sandboxed app, whatever name you typed.
+  Grant one with `hwprivacy-ctl rules allow-camera <path> --as <rule>`; find the
+  path with `rules denied-cameras`. See `d-camera-grants-need-a-binary-and-say-so`.
+- **A rule has no opinion until you give it one.** The three categories are
+  `Option<Permission>`; unset falls through to `default_action` and prints as
+  `—`, never `deny`. Setting one category writes one category. See
+  `d-a-rule-has-no-opinion-by-default`.
 - **Write rules as the bare lowercase app name** (`firefox`, `obs`). Since
   2026-08-21 `set_rule()` sanitises this for you — a pasted `(pid:N)` label is
   cleaned, and a name that cannot become a key is REFUSED rather than stored.
   The **matcher** (`normalize_app_name`) is deliberately unchanged; only writes
-  are sanitised. **Three dead rules still sit in the live config** — cleaning
-  them is a manual step with the daemon stopped.
+  are sanitised. The three dead rules were cleaned out of the live config on
+  2026-08-23; `pipewire`/`wireplumber` now carry proper `exe_path` entries.
 - **Two `dev_t` encodings.** glibc's `stat()` and the kernel's are different
   layouts. Decoding one with the other's rules yields major 0 and silently
   matches *nothing* — while unit tests pass. This bit twice. All conversion

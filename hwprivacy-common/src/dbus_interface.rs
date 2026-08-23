@@ -12,11 +12,42 @@ pub trait HwPrivacy {
     /// Get all discovered protected devices: (category, name, description, guarded)
     fn get_devices(&self) -> zbus::Result<Vec<(String, String, String, bool)>>;
 
-    /// Get all rules: (app_name, device_category, permission)
-    fn get_rules(&self) -> zbus::Result<Vec<(String, String, String)>>;
+    /// Get all rules, ONE ROW PER RULE:
+    /// `(app_name, microphone, camera, monitor, exe_path, gap_note)`
+    ///
+    /// A permission is `""` when the rule has no opinion about that category,
+    /// which means it follows `default_action` — not that it is denied.
+    /// `exe_path` is `""` when absent. `gap_note` is `""` when the rule can
+    /// reach every layer it names, and otherwise says why it cannot.
+    ///
+    /// This used to return three rows per rule with the categories flattened,
+    /// so one rule rendered as three in every frontend and there was nowhere
+    /// to put `exe_path` — which is the field that decides whether a camera
+    /// grant does anything at all.
+    fn get_rules(&self) -> zbus::Result<Vec<(String, String, String, String, String, String)>>;
 
     /// Set a rule for an app + device. Returns true on success.
+    ///
+    /// Touches ONLY the named category. The other two are left as they were,
+    /// or absent on a new rule.
     fn set_rule(&self, app_name: &str, device: &str, permission: &str) -> zbus::Result<bool>;
+
+    /// Attach the kernel-layer executable to an app's rule, or clear it with
+    /// `""`. Returns `(ok, message)`; `message` says why on failure.
+    ///
+    /// The kernel layer allowlists by executable inode and never looks at
+    /// `app_name`, so this — not [`set_rule`] — is what makes a camera grant
+    /// take effect for a non-sandboxed application.
+    fn set_rule_exe(&self, app_name: &str, exe_path: &str) -> zbus::Result<(bool, String)>;
+
+    /// Grant a camera at BOTH layers in one step: `camera = allow` on the rule
+    /// plus the executable the kernel layer matches on.
+    ///
+    /// One method rather than two calls, because the halfway state — a rule
+    /// reading `allow` with no binary — is precisely the thing that warns, and
+    /// doing it in two calls raises that warning for an operation that is
+    /// about to complete successfully. Returns `(ok, message)`.
+    fn allow_camera(&self, app_name: &str, exe_path: &str) -> zbus::Result<(bool, String)>;
 
     /// Remove all rules for an app. Returns true if rules existed.
     fn remove_rule(&self, app_name: &str) -> zbus::Result<bool>;
@@ -58,15 +89,7 @@ pub trait HwPrivacy {
     /// Restore to saved rules
     fn unblock_all(&self) -> zbus::Result<bool>;
 
-    /// One-shot allow a pending stream.
-    ///
-    /// Both arguments are required: a PipeWire node id is reused once its node
-    /// is gone, so the app name is what stops a grant migrating to an unrelated
-    /// stream. `GetActiveStreams` returns both.
-    fn allow_stream(&self, node_id: u32, app_name: &str) -> zbus::Result<bool>;
-
-    /// One-shot deny a pending stream by node id
-    fn deny_stream(&self, node_id: u32) -> zbus::Result<bool>;
+    // AllowStream / DenyStream removed 2026-08-23 with `ask_each`.
 
     // -- Signals --
 

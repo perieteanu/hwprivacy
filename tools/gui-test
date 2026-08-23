@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+"""
+hwprivacy — drive the GTK4 GUI over AT-SPI and assert what it actually shows.
+
+WHY THIS EXISTS
+---------------
+On 2026-08-23 Costin deleted every rule, tried a Firefox video call, and could
+not grant the camera back. Four defects, and the GUI carried three of them:
+
+  * app and device were bare `gtk::Entry` while permission got a dropdown, so
+    the two fields with the fewest valid values had the least help;
+  * the device placeholder advertised "screen", which DeviceCategory::from_str
+    REJECTS — the UI told the user to type a value that could not work;
+  * a rule rendered as three rows with nowhere to show `exe_path`, the field
+    that decides whether a camera grant does anything at all.
+
+None of it was caught, because the three frontends had zero tests between them
+and "look at the window" is not a check that fails. This file is that check.
+
+WHY AT-SPI AND NOT A SCREENSHOT
+-------------------------------
+A screenshot diff answers "did the pixels move", which is the question nobody
+asked. The accessibility tree answers "does the window SAY the right thing",
+which is what every one of those defects got wrong. It is also what a screen
+reader sees, so a test that passes here is a window that can be used.
+
+WHAT IT CANNOT SEE, AND SO DOES NOT CLAIM
+-----------------------------------------
+Whether a desktop notification actually appeared; whether video reaches the
+screen; whether two labels overlap. Those stay human, and HANDOFF.md says so
+rather than letting a green run here imply they were covered.
+
+REQUIREMENTS
+------------
+A running session bus, a running hwprivacy-daemon, a mapped hwprivacy-gui
+window, and python3-gi with Atspi 2.0. The window must be VISIBLE: GTK4 does
+not populate the a11y tree for an unmapped window, and this script says so
+instead of reporting an empty tree as a pass.
+
+Usage:
+    tools/gui-test           human
+    tools/gui-test --json    for Claude
+
+Writes to the live config only inside `rules set testapp` / `rules remove
+testapp`, and restores what it found. Exits non-zero on any failure, so it
+works as a gate.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import time
+
+import gi
+
+gi.require_version("Atspi", "2.0")
+from gi.repository import Atspi, Gio  # noqa: E402
+
+APP_NAME = "hwprivacy-gui"
+CTL = os.environ.get("HWPRIVACY_CTL", "hwprivacy-ctl")
+
+# A scratch rule name that no real application will ever declare. Used to make
+# a kernel-layer gap on purpose and then removed again.
+PROBE_APP = "hwprivacy-guitest-probe"
+
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append({"name": name, "ok": bool(ok), "detail": detail})
+    return ok
+
+
+def ctl(*args):
+    """Run hwprivacy-ctl and return (rc, stdout). Used only to CHANGE state."""
+    p = subprocess.run([CTL, *args], capture_output=True, text=True)
+    return p.returncode, p.stdout
+
+
+def daemon(method):
+    """Call the daemon directly. The authority for what the GUI should show.
+
+    Deliberately NOT scraped from `hwprivacy-ctl` output. The first draft did
+    that and mis-parsed "No rules configured." into a rule named "No", so the
+    harness reported a GUI defect that did not exist — a test lying about the
+    thing it exists to check is worse than no test.
+    """
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    reply = bus.call_sync(
+        "org.hwprivacy.Daemon",
+        "/org/hwprivacy/Daemon",
+        "org.hwprivacy.Daemon",
+        method,
+        None,
+        None,
+        Gio.DBusCallFlags.NONE,
+        5000,
+        None,
+    )
+    return reply.unpack()[0]
+
+
+# --------------------------------------------------------------------------
+# AT-SPI helpers
+# --------------------------------------------------------------------------
+
+def app_root():
+    d = Atspi.get_desktop(0)
+    for i in range(d.get_child_count()):
+        try:
+            a = d.get_child_at_index(i)
+            if a.get_name() == APP_NAME:
+                return a
+        except Exception:
+            continue
+    return None
+
+
+def findall(node, pred, depth=0, out=None, maxdepth=14):
+    if out is None:
+        out = []
+    if depth > maxdepth:
+        return out
+    try:
+        if pred(node):
+            out.append(node)
+    except Exception:
+        pass
+    for i in range(node.get_child_count()):
+        try:
+            findall(node.get_child_at_index(i), pred, depth + 1, out, maxdepth)
+        except Exception:
+            pass
+    return out
+
+
+def labels(node):
+    return [n.get_name() for n in findall(node, lambda x: x.get_role_name() == "label")]
+
+
+def every_string(node):
+    """Every string a user can read, INCLUDING entry placeholders.
+
+    Placeholders are not `label` nodes — GTK exposes them as the object
+    attribute `placeholder-text`. The first draft of this file scanned labels
+    only, so reintroducing the exact `screen` placeholder that started all of
+    this produced a GREEN run. Observed 2026-08-23; the check now looks where
+    the defect actually lives.
+    """
+    out = []
+    for n in findall(node, lambda _x: True):
+        try:
+            if n.get_name():
+                out.append(n.get_name())
+            if n.get_description():
+                out.append(n.get_description())
+            attrs = n.get_attributes()
+            if attrs:
+                ph = dict(attrs).get("placeholder-text")
+                if ph:
+                    out.append(ph)
+        except Exception:
+            continue
+    return out
+
+
+def by_role(node, role):
+    return findall(node, lambda n: n.get_role_name() == role)
+
+
+def click(node):
+    """Activate a node's default action. Returns True if it fired."""
+    iface = Atspi.Accessible.get_action_iface(node)
+    if iface is None or Atspi.Action.get_n_actions(iface) == 0:
+        return False
+    return bool(Atspi.Action.do_action(iface, 0))
+
+
+def frame_titled(title):
+    d = Atspi.get_desktop(0)
+    for i in range(d.get_child_count()):
+        try:
+            a = d.get_child_at_index(i)
+        except Exception:
+            continue
+        for j in range(a.get_child_count()):
+            try:
+                f = a.get_child_at_index(j)
+                if f.get_role_name() in ("frame", "dialog", "window") and f.get_name() == title:
+                    return f
+            except Exception:
+                continue
+    return None
+
+
+def rules_page(root):
+    """The Rules notebook page, with its tab selected so GTK realises it.
+
+    Selection, not a click: a GtkNotebook page tab exposes no Action interface,
+    so `do_action` is a no-op on it, and GTK4 does not build a page's widgets —
+    or its a11y subtree — until the page is shown. Walking an unselected
+    notebook therefore returns an EMPTY page and every assertion below it would
+    vacuously pass. The tab list's Selection interface is what actually
+    switches it.
+    """
+    tablist = next(iter(by_role(root, "page tab list")), None)
+    if tablist is None:
+        return None
+    names = [
+        tablist.get_child_at_index(i).get_name()
+        for i in range(tablist.get_child_count())
+    ]
+    if "Rules" not in names:
+        return None
+    sel = Atspi.Accessible.get_selection_iface(tablist)
+    if sel is not None:
+        Atspi.Selection.select_child(sel, names.index("Rules"))
+        time.sleep(0.8)
+
+    pages = [n for n in by_role(root, "panel") if n.get_name().startswith("Page ")]
+    for p in pages:
+        if any("Camera denials" in t for t in labels(p)):
+            return p
+    return None
+
+
+def refresh(root):
+    btn = next((b for b in by_role(root, "button") if b.get_name() == "Refresh"), None)
+    if btn is not None:
+        click(btn)
+    time.sleep(1.2)
+
+
+# --------------------------------------------------------------------------
+# The checks
+# --------------------------------------------------------------------------
+
+def main():
+    as_json = "--json" in sys.argv
+
+    root = app_root()
+    if root is None:
+        print(f"{APP_NAME} is not on the accessibility bus. Start it first.", file=sys.stderr)
+        return 2
+
+    if root.get_child_count() == 0:
+        # Stated rather than reported as a pass: an unmapped GTK4 window has an
+        # empty a11y tree, and every assertion below would vacuously succeed.
+        print(
+            f"{APP_NAME} exposes no window. It is running but its window is not\n"
+            f"mapped — restore it from the tray and re-run. Refusing to report a\n"
+            f"pass on an empty tree.",
+            file=sys.stderr,
+        )
+        return 2
+
+    page = rules_page(root)
+    if page is None:
+        print("Could not find the Rules page. Has the tab been renamed?", file=sys.stderr)
+        return 2
+
+    all_text = " | ".join(every_string(root))
+
+    # -- the placeholder that lied ----------------------------------------
+    # "screen" is not a DeviceCategory. The old placeholder advertised it.
+    check(
+        "no UI text offers 'screen' as a device",
+        "screen" not in all_text.lower(),
+        all_text[:200],
+    )
+
+    # -- the three combos --------------------------------------------------
+    combos = by_role(page, "combo box")
+    check("the add-rule form has three dropdowns", len(combos) == 3, f"found {len(combos)}")
+
+    if len(combos) == 3:
+        def editable(c):
+            return len(by_role(c, "text")) > 0
+
+        # App is editable so a name the daemon has never seen is still typeable;
+        # device and permission are closed sets and must not be.
+        check("app dropdown is editable", editable(combos[0]))
+        check("device dropdown is a closed list", not editable(combos[1]))
+        check("permission dropdown is a closed list", not editable(combos[2]))
+
+    # -- one rule, one row -------------------------------------------------
+    daemon_rules = [r[0] for r in daemon("GetRules")]
+    lists = by_role(page, "list")
+    rule_rows = by_role(lists[0], "list item") if lists else []
+    check(
+        "one row per rule, not one per category",
+        len(rule_rows) == len(daemon_rules),
+        f"gui={len(rule_rows)} daemon={len(daemon_rules)} {daemon_rules}",
+    )
+
+    # -- unset renders as a dash ------------------------------------------
+    # The phantom-deny bug, seen at the UI. A rule that says nothing about a
+    # category must not be drawn as denying it.
+    if rule_rows:
+        row_text = " ".join(labels(rule_rows[0]))
+        has_dash = "—" in row_text
+        check(
+            "an unset category shows as '—', never 'deny'",
+            has_dash or ": deny" not in row_text,
+            row_text[:160],
+        )
+        check(
+            "a rule row names its binary",
+            "binary:" in row_text or "!" in row_text,
+            row_text[:160],
+        )
+
+    # -- the denial list ---------------------------------------------------
+    daemon_denials = [
+        h[0]
+        for h in daemon("GetHistory")
+        if h[2] == "kernel" and h[1] == "camera" and h[3] > 0
+    ]
+    denial_rows = by_role(lists[1], "list item") if len(lists) > 1 else []
+    check(
+        "the denial list matches what the daemon reports",
+        len(denial_rows) >= len(daemon_denials),
+        f"gui={len(denial_rows)} daemon={len(daemon_denials)}",
+    )
+    check(
+        "every denial row offers a one-click grant",
+        denial_rows
+        and all(
+            any(b.get_name() == "Allow camera" for b in by_role(r, "button"))
+            for r in denial_rows
+        ),
+        f"{len(denial_rows)} rows",
+    )
+
+    # -- the gap must be visible -------------------------------------------
+    # Reproduces the 2026-08-23 failure inside the GUI: a camera rule with no
+    # binary reads `allow` and is denied by the kernel. The window must say so.
+    had_probe = False
+    try:
+        ctl("rules", "set", PROBE_APP, "cam", "allow")
+        had_probe = True
+        refresh(root)
+        page = rules_page(root)
+        lists = by_role(page, "list")
+        rows = by_role(lists[0], "list item") if lists else []
+        probe_row = next(
+            (r for r in rows if any(PROBE_APP in t for t in labels(r))), None
+        )
+        if probe_row is None:
+            check("a rule with no binary is flagged in the window", False, "probe row not found")
+        else:
+            txt = " ".join(labels(probe_row))
+            check(
+                "a rule with no binary is flagged in the window",
+                "!" in txt and "kernel" in txt.lower(),
+                txt[:200],
+            )
+    finally:
+        if had_probe:
+            ctl("rules", "remove", PROBE_APP)
+            refresh(root)
+
+    # -- the grant dialog --------------------------------------------------
+    # The two-identities fix: the dialog must pre-fill the BINARY's own name and
+    # offer the rule names that already exist, so one rule can carry both.
+    page = rules_page(root)
+    lists = by_role(page, "list")
+    denial_rows = by_role(lists[1], "list item") if len(lists) > 1 else []
+    target = None
+    for r in denial_rows:
+        for t in labels(r):
+            if t.startswith("/"):
+                target = (r, t.split()[0])
+                break
+        if target:
+            break
+
+    if target is None:
+        check("grant dialog opens with the binary's own name", False, "no denial row to click")
+    else:
+        row, path = target
+        expected = path.rstrip("/").rsplit("/", 1)[-1]
+        btn = next(b for b in by_role(row, "button") if b.get_name() == "Allow camera")
+        before = open(os.path.expanduser("~/.config/hwprivacy/config.toml")).read()
+        click(btn)
+        time.sleep(1.0)
+        dlg = frame_titled("Allow camera")
+        check("clicking a denial opens the grant dialog", dlg is not None)
+        if dlg is not None:
+            texts = by_role(dlg, "text")
+            prefilled = ""
+            if texts:
+                try:
+                    ti = texts[0].queryText() if hasattr(texts[0], "queryText") else None
+                    if ti:
+                        prefilled = ti.getText(0, ti.characterCount)
+                except Exception:
+                    pass
+                if not prefilled:
+                    ti = Atspi.Accessible.get_text_iface(texts[0])
+                    if ti:
+                        prefilled = Atspi.Text.get_text(ti, 0, Atspi.Text.get_character_count(ti))
+            check(
+                "the dialog pre-fills the binary's own name",
+                prefilled == expected,
+                f"got {prefilled!r} want {expected!r}",
+            )
+            check(
+                "the dialog names the binary it is about",
+                any(path in t for t in labels(dlg)),
+                " | ".join(labels(dlg))[:200],
+            )
+            cancel = next((b for b in by_role(dlg, "button") if b.get_name() == "Cancel"), None)
+            check("the dialog has a Cancel", cancel is not None)
+            if cancel is not None:
+                click(cancel)
+                time.sleep(0.6)
+            after = open(os.path.expanduser("~/.config/hwprivacy/config.toml")).read()
+            # A dialog that acted on OPEN rather than on confirm would be a
+            # grant nobody made. The config is the only honest witness.
+            check("cancelling writes nothing", before == after)
+
+    # -- report ------------------------------------------------------------
+    failed = [r for r in results if not r["ok"]]
+    if as_json:
+        print(json.dumps({"results": results, "failed": len(failed)}, indent=2))
+    else:
+        print(f"hwprivacy gui-test — {len(results)} checks against the live window\n")
+        for r in results:
+            mark = "ok  " if r["ok"] else "FAIL"
+            print(f"  {mark}  {r['name']}")
+            if not r["ok"] and r["detail"]:
+                print(f"        {r['detail']}")
+        print()
+        if failed:
+            print(f"{len(failed)} failure(s).")
+        else:
+            print("No failures.")
+            print()
+            print("NOT covered here, and still human: whether a notification")
+            print("actually appeared, whether video reached the screen, and")
+            print("whether any label overlaps or is cut off.")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

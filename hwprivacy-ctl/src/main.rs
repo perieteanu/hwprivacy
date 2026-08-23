@@ -70,7 +70,7 @@ enum RulesAction {
         app: String,
         /// Device: mic, cam, monitor
         device: String,
-        /// Permission: allow, ask_each, while_in_use, ask, deny
+        /// Permission: allow, while_in_use, ask, deny
         permission: String,
     },
     /// Remove all rules for an app
@@ -78,6 +78,66 @@ enum RulesAction {
         /// App name
         app: String,
     },
+    /// Binaries the KERNEL layer has denied a camera — the source for
+    /// `allow-camera`.
+    ///
+    /// The kernel layer matches an executable by inode and never looks at an
+    /// app name, so this list, not guesswork, is where a camera grant starts.
+    DeniedCameras,
+    /// Allow a binary the camera at BOTH layers: sets `camera = allow` and
+    /// attaches the executable the kernel layer needs.
+    AllowCamera {
+        /// Absolute path to the real binary, from `denied-cameras`.
+        /// On Debian that is /usr/lib/firefox-esr/firefox-esr, never
+        /// /usr/bin/firefox — the latter is a shell script.
+        path: String,
+        /// Rule to attach it to. Defaults to the binary's own name.
+        ///
+        /// Use this to land the executable on a rule you already have: the
+        /// PipeWire layer knows Firefox as `firefox`, while the binary is
+        /// called `firefox-esr`. Without --as you get two rules for one app.
+        #[arg(long = "as")]
+        as_app: Option<String>,
+    },
+    /// Attach (or clear, with "") the kernel-layer executable for an app.
+    SetExe {
+        /// App name of an existing rule
+        app: String,
+        /// Absolute path, or "" to clear
+        path: String,
+    },
+}
+
+/// How one permission cell prints.
+///
+/// An empty string means the rule says nothing about that category, so it
+/// follows `default_action`. It must NOT print as "deny": until 2026-08-23
+/// every rule carried all three categories and a camera grant silently wrote
+/// two denies, so "deny" was both what the file said and what the table
+/// showed. Now the file can be honest, and so must this.
+fn perm_cell(p: &String) -> String {
+    if p.is_empty() {
+        "—".to_string()
+    } else {
+        p.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::perm_cell;
+
+    #[test]
+    fn an_unset_category_renders_as_a_dash_not_as_deny() {
+        assert_eq!(perm_cell(&String::new()), "—");
+        assert_ne!(perm_cell(&String::new()), "deny");
+    }
+
+    #[test]
+    fn a_set_category_renders_verbatim() {
+        assert_eq!(perm_cell(&"ask_each".to_string()), "ask_each");
+        assert_eq!(perm_cell(&"deny".to_string()), "deny");
+    }
 }
 
 #[tokio::main]
@@ -101,6 +161,20 @@ async fn main() -> anyhow::Result<()> {
             println!("  Active rules:     {}", rules);
             println!("  Blocked attempts: {}", blocked);
             println!("  Active streams:   {}", streams);
+
+            // A rule that cannot reach the layer it names belongs on the
+            // status surface, not only in the journal. Reported here as well
+            // as in `rules list` because `status` is what gets checked when
+            // something "isn't working".
+            if let Ok(rules) = proxy.get_rules().await {
+                let gaps = rules.iter().filter(|r| !r.5.is_empty()).count();
+                if gaps > 0 {
+                    println!(
+                        "  Rules not in force: {}  <- see: hwprivacy-ctl rules list",
+                        gaps
+                    );
+                }
+            }
 
             // Kernel layer. Reported separately and always — "not connected"
             // is real information, not an absence worth hiding.
@@ -228,19 +302,104 @@ async fn main() -> anyhow::Result<()> {
                 if rules.is_empty() {
                     println!("No rules configured. Default policy: deny/ask.");
                 } else {
-                    // Group by app
-                    let mut current_app = String::new();
-                    println!("{:<25} {:<12} {}", "App", "Device", "Permission");
-                    println!("{}", "-".repeat(50));
-                    for (app, device, perm) in &rules {
-                        if *app != current_app {
-                            if !current_app.is_empty() {
-                                println!();
-                            }
-                            current_app = app.clone();
+                    // One line per rule. This used to print one line per
+                    // (rule, category), so a single rule looked like three
+                    // separate ones and there was nowhere to show the
+                    // executable — the field that decides whether a camera
+                    // grant does anything.
+                    println!(
+                        "{:<20} {:<11} {:<9} {:<9} {}",
+                        "App", "Mic", "Camera", "Monitor", "Executable"
+                    );
+                    println!("{}", "-".repeat(78));
+                    let mut any_unset = false;
+                    let mut gaps = Vec::new();
+                    for (app, mic, cam, mon, exe, note) in &rules {
+                        // An empty permission means the rule says nothing
+                        // about that category, so it follows default_action.
+                        // Rendering it as "deny" would be a lie, and was.
+                        any_unset |= mic.is_empty() || cam.is_empty() || mon.is_empty();
+                        let cell = perm_cell;
+                        let exe_cell = if exe.is_empty() { "(none)" } else { exe.as_str() };
+                        println!(
+                            "{:<20} {:<11} {:<9} {:<9} {}{}",
+                            app,
+                            cell(mic),
+                            cell(cam),
+                            cell(mon),
+                            exe_cell,
+                            if note.is_empty() { "" } else { "   <- see below" }
+                        );
+                        if !note.is_empty() {
+                            gaps.push((app.clone(), note.clone()));
                         }
-                        println!("{:<25} {:<12} {}", app, device, perm);
                     }
+                    if any_unset {
+                        println!();
+                        println!("—  no rule for that device; follows default_action.");
+                    }
+                    // The whole point of this change: a rule that cannot reach
+                    // the layer it names must say so on the surface that shows
+                    // it. On 2026-08-23 this table reported `camera allow`
+                    // while the kernel denied every open.
+                    for (app, note) in &gaps {
+                        println!();
+                        println!("!  {}: {}", app, note);
+                        println!("   Fix: hwprivacy-ctl rules denied-cameras");
+                    }
+                }
+            }
+            RulesAction::DeniedCameras => {
+                let rows = proxy.get_history().await?;
+                let denied: Vec<_> = rows
+                    .iter()
+                    .filter(|(_, device, source, denied, ..)| {
+                        source == "kernel" && device == "camera" && *denied > 0
+                    })
+                    .collect();
+                if denied.is_empty() {
+                    println!("The kernel layer has denied no camera opens.");
+                    println!(
+                        "Nothing to allow yet — a binary appears here once it has tried."
+                    );
+                } else {
+                    println!("{:<52} {:>7}  {}", "EXECUTABLE", "DENIED", "LAST");
+                    println!("{}", "-".repeat(84));
+                    for (identity, _, _, denied, _, _, last) in &denied {
+                        println!("{:<52} {:>7}  {}", identity, denied, last);
+                    }
+                    println!();
+                    println!("Allow one with:");
+                    println!(
+                        "    hwprivacy-ctl rules allow-camera {} [--as <existing-rule>]",
+                        denied[0].0
+                    );
+                }
+            }
+            RulesAction::AllowCamera { path, as_app } => {
+                // Derive the same suggestion the GUI shows, so the two agree.
+                let app = as_app.unwrap_or_else(|| hwprivacy_common::short_name(&path));
+
+                // One call, not two. Setting the rule and then the binary
+                // leaves a moment where the rule reads `allow` with nothing
+                // behind it — which correctly raises the gap warning, for an
+                // operation that is about to succeed. The daemon does both
+                // under one lock and rolls the rule back if the path is bad.
+                let (ok, msg) = proxy.allow_camera(&app, &path).await?;
+                if !ok {
+                    eprintln!("Nothing was written: {}", msg);
+                    std::process::exit(2);
+                }
+                println!("{}", msg);
+                println!("The kernel layer picks it up within exe_recheck_secs.");
+            }
+            RulesAction::SetExe { app, path } => {
+                let (ok, msg) = proxy.set_rule_exe(&app, &path).await?;
+                if ok {
+                    println!("{}", msg);
+                } else {
+                    eprintln!("{}", msg);
+                    std::process::exit(2);
                 }
             }
             RulesAction::Set { app, device, permission } => {

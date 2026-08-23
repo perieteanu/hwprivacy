@@ -45,6 +45,8 @@ decisions:
     status: "SUPERSEDED IN INTENT by d-event-driven-substrate. Still the shipped code."
 
   - id: d-per-stream-gating
+    superseded_by: d-no-per-stream-grants
+    superseded_on: "2026-08-23"
     renamed_from: d-two-layer-model
     renamed_on: "2026-08-19"
     rename_reason: >
@@ -307,6 +309,8 @@ decisions:
     status: "Phases 1-3 landed and substantially proven. Phase 4 (systemd unit for the helper) and Phase 5 (audio backstop) not started. This is the project's current direction."
 
   - id: d-per-microphone-identity
+    superseded_by: d-one-device-one-prompt
+    superseded_on: "2026-08-23"
     date: "2026-08-19"
     title: "Two mic prompts are CORRECT — they are two microphones. Label them, do not coalesce."
     context: >
@@ -473,6 +477,8 @@ decisions:
     what_is_done_instead: "notify on ALLOWED opens, so a silent grant is at least visible. See ROADMAP > next_up > notify-on-allow."
 
   - id: d-coalesce-by-category
+    superseded_by: d-one-device-one-prompt
+    superseded_on: "2026-08-23"
     date: "2026-08-21"
     title: "Two links are duplicates or not depending on the CATEGORY"
     refines: d-per-microphone-identity
@@ -665,3 +671,166 @@ decisions:
         Not included: the portal delegates to PipeWire, and it is `pipewire`
         that opens the device. No evidence the portal binary opens /dev/video*
         itself, so no grant.
+
+  - id: d-a-rule-has-no-opinion-by-default
+    date: "2026-08-23"
+    title: "A rule's categories are optional; setting one writes only that one"
+    supersedes_behaviour_of: "Config::set_rule, which filled all three categories with Deny"
+    context: >
+      Measured live 2026-08-23. Costin deleted every rule, then granted firefox
+      the camera through hwprivacy-ctl. Three things went wrong at once and all
+      three were the same shape — the tool writing or reporting an opinion
+      nobody expressed. AppRule carried three non-optional Permission fields
+      defaulting to Deny, so the grant also wrote `microphone = "deny"` and
+      `monitor = "deny"`. With default_action = "ask", that silently downgraded
+      the microphone from a prompt to a hard deny. GetRules then flattened each
+      rule into three D-Bus rows, so one rule rendered as three in every
+      frontend and there was nowhere to report exe_path.
+    decision: >
+      microphone/camera/monitor become Option<Permission>. None means "this rule
+      has no opinion", and the category falls through to default_action exactly
+      as an unruled app does. set_rule writes one category; the other two stay
+      absent. Frontends render an unset category as "—", never as "deny".
+    migration: >
+      None, deliberately. An existing `microphone = "deny"` deserialises to
+      Some(Deny) and stays a deny. A bare deny written by the old code cannot be
+      told apart from a deliberate one, and loosening it on load would relax a
+      rule the user may have meant, without asking. Costin chose this over
+      stripping them, 2026-08-23.
+    consequences:
+      - "serde skip_serializing_if keeps unset categories out of the file — which matters because the daemon rewrites config.toml wholesale on every rule change."
+      - "AppRule::get_permission returns Option; Config::get_permission resolves it. The two questions — what did the user write, and what happens now — stop being the same call."
+      - "GetRules returns one row per rule: (app, mic, camera, monitor, exe_path, gap_note)."
+      - "A preset still states all three categories and is still written as Some(_). A preset is a rule set, not a single-category grant."
+
+  - id: d-camera-grants-need-a-binary-and-say-so
+    date: "2026-08-23"
+    title: "exe_path is writable from the frontends, and a rule that cannot reach a layer announces it"
+    context: >
+      kernel_camera_allowlist() keys purely on exe_path and never looks at
+      app_name, but nothing outside a preset could write one: ctl rules set,
+      the GUI form and D-Bus SetRule all carried three fields. So no string a
+      user could type would ever grant a camera to a non-sandboxed application,
+      and the only route was hand-editing config.toml with the daemon stopped.
+      Measured 2026-08-23 — `Rule set: firefox → camera = allow` at 16:05:23,
+      `Kernel layer DENIED firefox-esr` at 16:05:36, nothing said in between,
+      while `hwprivacy-ctl rules list` reported `camera allow`. The warning
+      already existed in kernel_camera_gaps() but ran only at connect time, and
+      the recheck loop could not fire it either: a rule with no exe_path
+      contributes no allowlist entry, so PolicyFingerprint never changed.
+    decision: >
+      Costin, 2026-08-23, chose the denial list over a manual path field. The
+      kernel already logged the exact executable when it denied it, so that
+      history IS the picker. `hwprivacy-ctl rules denied-cameras` lists them and
+      `rules allow-camera <path> [--as <app>]` grants one; the GUI shows the
+      same list with an Allow button. Gaps are reported as a notification at the
+      moment the rule is saved AND annotated in rules list / status.
+    the_two_identities: >
+      The reason a single text field could never work. The PipeWire layer keys
+      on a name the application declares about itself ("firefox"); the kernel
+      layer keys on an executable (/usr/lib/firefox-esr/firefox-esr, short name
+      "firefox-esr"). --as, and the GUI's rule dropdown, let one rule carry both
+      instead of leaving two rules for one application.
+    consequences:
+      - "New D-Bus: SetRuleExe(app, path) and AllowCamera(app, path). AllowCamera is atomic because the halfway state is exactly what warns — two calls made a successful grant announce a failure it was one call away from fixing, and a refused path rolls the rule back."
+      - "set_rule_exe refuses a relative path, a path that does not exist, and an unknown app — the b4 precedent: refuse rather than store something that can never work."
+      - "A `camera = allow` with NO exe_path is still legal and is never refused. It is the correct rule for a portal/Flatpak app that takes the camera through PipeWire. It warns; it is not blocked."
+      - "gap_delta() reports only what CHANGED. exe_recheck_secs fires every 30s; a warning printed 2880 times a day is one nobody reads."
+      - "default_action = allow is a GLOBAL camera gap — every unruled app is allowed at layer 1 and denied at layer 2, which has no executable for it. Reported once at startup, not once per rule."
+    not_done: >
+      Pre-authorising a binary that has never been denied still needs a preset
+      or a hand-edit — a consequence of choosing the denial list over a manual
+      path field. presets/browsers.toml already covers Firefox and Chrome.
+
+  - id: d-one-device-one-prompt
+    date: "2026-08-23"
+    title: "One device, one application, one prompt — no channel ordinals"
+    supersedes: ["d-per-microphone-identity", "d-coalesce-by-category"]
+    context: >
+      b3 was "two identical microphone prompts". The fix taken on 2026-08-19
+      assumed the two links were two physical microphones and labelled them
+      `mic1`/`mic2`, deliberately exempting the microphone from the coalescing
+      the monitor already got. Four days of use showed the premise was wrong
+      three separate ways.
+
+      First, the hardware. `alsa_input.pci-0000_00_1f.3.analog-stereo` is ONE
+      device exposing `capture_FL` and `capture_FR` — two channels, exactly the
+      shape of a sink's `monitor_FL`/`monitor_FR`, which was always coalesced.
+      Read out of pw-dump 2026-08-23: the machine has exactly one Audio/Source.
+
+      Second, the code could not have done what the ADR claimed. device_instance()
+      filtered sibling ports by node_id, so two PHYSICAL microphones — separate
+      nodes, separate ProtectedDevices, separate rows in `hwprivacy-ctl devices`
+      — could never reach it. The only thing it could ever label was channels.
+
+      Third, and worst, the exemption broke the microphone outright. Two links
+      in one batch are two decisions; the first claims the (app, device) prompt
+      slot and the second hits the b6 guard and is denied. Measured repeatedly
+      on 2026-08-23: `mic1 ASKED` then `mic2 DENIED`, 60 ms apart, on every
+      single attempt. A stereo microphone was guaranteed to lose a channel.
+    decision: >
+      Costin, 2026-08-23: "no more mic1 or mic2 or mic left or mic right. just
+      mic — the device. remove all the other. maybe other people does not have a
+      mic with 2 channels." device_instance() is deleted, LinkMatch::instance and
+      AccessEvent::device_instance are deleted, device_label_for() is deleted,
+      and group_links() coalesces by (category, device node, stream node) for
+      ALL categories rather than exempting the microphone.
+    consequences:
+      - "One prompt per (device, application), whatever the channel count. The camera arrives as a single link and is unaffected."
+      - "The group still carries EVERY link id. Coalescing the prompt must never coalesce the teardown, or a channel keeps flowing while the popup says BLOCKED."
+      - "Two REAL microphones stay two prompts — they are different node_names and grouping already keys on that. This is what the ordinal was reaching for and could never express."
+      - "Prompts stop promising precision the rules cannot deliver: permissions are per category, so `Microphone (mic1)` was decorating a button that wrote `microphone = allow` for every channel."
+      - "History rows and the event log lose the `(mic1)` suffix. AccessEvent::device_display() now returns the bare category."
+    per_device_rules_are_still_not_a_thing: >
+      Unchanged and still out of scope. If per-device rules are ever wanted, the
+      key is the device NODE NAME — which is stable, already carried, and
+      already what grouping uses — never a port ordinal.
+
+  - id: d-no-per-stream-grants
+    date: "2026-08-23"
+    title: "`ask_each` and the whole per-stream concept are removed"
+    supersedes: ["d-per-stream-gating"]
+    context: >
+      `ask_each` promised a prompt per PipeWire stream — per browser tab, in
+      effect — and could not deliver one. Costin tested it end to end on
+      2026-08-23 and reported "i feel that i have almost no control over
+      streams". The journal shows why, twice in ninety seconds:
+
+        17:59:49  link 96 destroyed  -> microphone ASKED
+        17:59:55  microphone STREAM_ALLOWED     <- answered Allow
+        18:00:28  link 109 destroyed -> microphone ASKED   <- asked again
+        18:00:31  microphone STREAM_ALLOWED     <- answered Allow
+
+      Two independent reasons, both structural. The link is destroyed BEFORE the
+      user is asked (correct — security first), and link_manager has only
+      destroy_link/destroy_links/destroy_all_links_to_node: nothing in the tree
+      can create a link, so answering "allow" had nothing to reattach. And the
+      grant was keyed on a PipeWire node id, which prune_one_shot drops as soon
+      as the torn-down stream leaves the graph — so even a retry found nothing.
+    decision: >
+      Costin, 2026-08-23: "no more ask_each." Permission::AskEach,
+      PolicyDecision::AskEachStream, the one_shot_allowed map with
+      grant_one_shot/is_one_shot_allowed/prune_one_shot, PromptAction's
+      GrantThisStream/DenyThisStream, AccessAction's StreamAllowed/StreamDenied,
+      the AllowStream/DenyStream D-Bus methods and the two per-stream
+      notification buttons are all deleted. Four permissions remain in the enum,
+      three of them offered on a prompt: allow, while_in_use, deny.
+    compatibility: >
+      The STRING `ask_each` still parses, to `ask`. Existing configs and the
+      shipped browsers preset contain it, and a hard parse error would stop the
+      daemon starting on an install that was working yesterday. `ask` is the
+      honest survivor: the user wanted to be asked, and that is the remaining
+      way to be asked. It is accepted but no longer OFFERED — the FromStr error
+      message no longer lists it. Two tests cover the alias, one through serde
+      and one through the CLI parser.
+    what_this_costs: >
+      Per-tab microphone control, which never worked. A browser is now one
+      decision for the whole application, which is what
+      d-executable-is-the-principal already said about the camera.
+    it_also_undermines_while_in_use: >
+      This removed the only grant machinery that could have made `while_in_use`
+      distinguishable from `allow`. That permission was ALREADY not implemented
+      — while_in_use_streams is written and never read — and is now harder to
+      implement rather than easier. See ROADMAP blockers
+      while_in_use_is_not_implemented; Costin asked to keep it pending a
+      decision.

@@ -12,8 +12,7 @@ pub enum PolicyDecision {
     Deny,
     /// Ask the user (first time for this app) — destroy link, send notification
     AskUser,
-    /// Ask for this specific stream (browser mode) — destroy link, send notification
-    AskEachStream,
+    // AskEachStream removed 2026-08-23 with the per-stream concept.
 }
 
 /// Evaluate policy for a new link connecting a stream to a protected device.
@@ -21,22 +20,12 @@ pub fn evaluate(
     config: &Config,
     stream: &StreamInfo,
     device: &ProtectedDevice,
-    is_one_shot_allowed: bool,
 ) -> PolicyDecision {
     // Check if device category is guarded
     if !config.devices.is_guarded(&device.category) {
         debug!(
             "Device {:?} is not guarded, allowing {} → {}",
             device.category, stream.app_name, device.node_name
-        );
-        return PolicyDecision::Allow;
-    }
-
-    // Check one-shot allows (for ask_each streams that were already approved)
-    if is_one_shot_allowed {
-        debug!(
-            "Stream {} (node:{}) has one-shot allow",
-            stream.app_name, stream.node_id
         );
         return PolicyDecision::Allow;
     }
@@ -52,11 +41,11 @@ pub fn evaluate(
     match permission {
         Permission::Allow => PolicyDecision::Allow,
         Permission::Deny => PolicyDecision::Deny,
-        Permission::AskEach => PolicyDecision::AskEachStream,
-        Permission::WhileInUse => {
-            // For while_in_use, we allow but track the client lifecycle
-            PolicyDecision::Allow
-        }
+        // NOT IMPLEMENTED, and the comment that used to sit here said it
+        // was. `while_in_use_streams` is written and never read; nothing ever
+        // emits AccessAction::RevokedOnDisconnect. Today this is a synonym for
+        // Allow. See ROADMAP > while_in_use_is_not_implemented.
+        Permission::WhileInUse => PolicyDecision::Allow,
         Permission::Ask => PolicyDecision::AskUser,
     }
 }
@@ -66,14 +55,6 @@ pub fn evaluate(
 pub struct LinkMatch {
     pub stream: StreamInfo,
     pub device: ProtectedDevice,
-    /// Which instance of the device, when one node presents several — `mic1`,
-    /// `mic2`. `None` when the node has only one port of that direction, which
-    /// is the common case and needs no ordinal.
-    ///
-    /// Deliberately NOT a field on [`ProtectedDevice`]: that type is one row
-    /// per node, is handed out over D-Bus, and does not know which port a
-    /// particular link used.
-    pub instance: Option<String>,
 }
 
 /// Given a new link (output_node → input_node), determine which side is the
@@ -106,15 +87,7 @@ pub fn classify_link(
                 "Monitor tap detected: {} (pid:{}) reading from sink {}",
                 stream.app_name, stream.pid, device.node_name
             );
-            // No instance label. A sink's monitor_FL and monitor_FR are two
-            // CHANNELS of one playback device, not two devices — labelling
-            // them would invent a second speaker that does not exist. The two
-            // links are coalesced into one prompt instead; see main.rs.
-            return Some(LinkMatch {
-                stream,
-                device,
-                instance: None,
-            });
+            return Some(LinkMatch { stream, device });
         }
     }
 
@@ -124,12 +97,7 @@ pub fn classify_link(
         // Skip if this is a normal playback link (Stream/Output → Audio/Sink)
         if device.category != DeviceCategory::Monitor {
             let stream = node_to_stream_info(input_node);
-            let instance = device_instance(output_node_id, output_port_id, ports, device.category);
-            return Some(LinkMatch {
-                stream,
-                device,
-                instance,
-            });
+            return Some(LinkMatch { stream, device });
         }
     }
 
@@ -137,69 +105,27 @@ pub fn classify_link(
     if let Some(device) = find_device_by_node_id(input_node_id, nodes, devices) {
         if device.category != DeviceCategory::Monitor {
             let stream = node_to_stream_info(output_node);
-            let instance = device_instance(input_node_id, input_port_id, ports, device.category);
-            return Some(LinkMatch {
-                stream,
-                device,
-                instance,
-            });
+            return Some(LinkMatch { stream, device });
         }
     }
 
     None
 }
 
-/// Which of a device node's several inputs this link used — `mic1`, `mic2`.
-///
-/// # Why ordinals and not left/right
-///
-/// Decided 2026-08-21 (`CONVENTIONS.yaml > multiple_devices_of_one_kind`).
-/// Which physical microphone maps to `capture_FL` depends on codec wiring and
-/// was never determined here. "mic1" claims only that it is the first one,
-/// which is true by construction; "left microphone" is a claim about the
-/// chassis that we would be making up.
-///
-/// # Why sorted by NAME
-///
-/// The ordinal has to survive a reboot or a rule referring to it silently moves
-/// to a different microphone. PipeWire allocates port **ids** per session;
-/// port **names** (`capture_FL`, `capture_FR`) persist. Never sort by id,
-/// discovery order, or arrival order.
-///
-/// Returns `None` when there is nothing to disambiguate, or when the data is
-/// not good enough to be sure — a missing ordinal is honest, a wrong one is
-/// not.
-pub fn device_instance(
-    device_node_id: u32,
-    port_id: u32,
-    ports: &std::collections::HashMap<u32, super::pipewire_monitor::PortInfo>,
-    category: DeviceCategory,
-) -> Option<String> {
-    // The monitor case never gets here (see classify_link), but state the rule
-    // where the naming happens as well as where it is skipped.
-    let prefix = match category {
-        DeviceCategory::Microphone => "mic",
-        DeviceCategory::Camera => "cam",
-        DeviceCategory::Monitor => return None,
-    };
-
-    let used = ports.get(&port_id)?;
-
-    // Only ports on the same node, facing the same way. A sink has both
-    // playback_* and monitor_* ports and they are not the same population.
-    let mut siblings: Vec<&super::pipewire_monitor::PortInfo> = ports
-        .values()
-        .filter(|p| p.node_id == device_node_id && p.direction == used.direction)
-        .collect();
-
-    if siblings.len() < 2 {
-        return None; // nothing to disambiguate
-    }
-
-    siblings.sort_by(|a, b| a.name.cmp(&b.name));
-    let idx = siblings.iter().position(|p| p.id == port_id)?;
-    Some(format!("{prefix}{}", idx + 1))
-}
+// device_instance() lived here until 2026-08-23. It labelled a link `mic1` or
+// `mic2` from the sorted port name, on the belief that a stereo capture device
+// is two physical microphones.
+//
+// It was wrong twice over. It filtered sibling ports by `node_id`, so two
+// PHYSICAL microphones — which are two different nodes, two ProtectedDevices,
+// two rows in `hwprivacy-ctl devices` — could never reach it: the only thing it
+// could ever label was two CHANNELS of one device. And the rules it decorated
+// are per category, so `mic1`/`mic2` promised a precision no rule could
+// express; clicking "Always Allow" on a popup headed `Microphone (mic1)` wrote
+// `microphone = allow` for both.
+//
+// Costin, 2026-08-23: "no more mic1 or mic2 or mic left or mic right. just mic
+// — the device." See DECISIONS d-one-device-one-prompt.
 
 fn find_device_by_node_id(
     node_id: u32,
@@ -321,116 +247,70 @@ mod tests {
         let m = classify_link(36, 61, 99, 0, &nodes, &ports, &devices).expect("tap");
         assert_eq!(m.device.category, DeviceCategory::Monitor);
         assert_eq!(m.stream.app_name, "Firefox");
-        assert_eq!(
-            m.instance, None,
-            "monitor_FL/FR are two channels of ONE sink — labelling them would \
-             invent a second speaker"
-        );
     }
 
-    /// b3. Two links, two microphones, two distinguishable labels.
+    /// The reversal of b3, settled 2026-08-23 (`d-one-device-one-prompt`).
+    ///
+    /// `capture_FL` and `capture_FR` are two CHANNELS of one microphone. They
+    /// used to be labelled `mic1`/`mic2` on the belief that they were two
+    /// physical devices. Both links must now classify to the same device with
+    /// nothing distinguishing them — `group_links` then collapses them into a
+    /// single prompt.
     #[test]
-    fn the_two_microphones_are_told_apart() {
+    fn a_stereo_microphones_two_channels_are_one_device() {
         let (nodes, ports, devices) = graph();
         let fl = classify_link(46, 64, 99, 0, &nodes, &ports, &devices).expect("FL");
         let fr = classify_link(46, 65, 99, 0, &nodes, &ports, &devices).expect("FR");
 
         assert_eq!(fl.device.category, DeviceCategory::Microphone);
         assert_eq!(fr.device.category, DeviceCategory::Microphone);
-        assert_eq!(fl.instance.as_deref(), Some("mic1"));
-        assert_eq!(fr.instance.as_deref(), Some("mic2"));
-        assert_ne!(
-            fl.instance, fr.instance,
-            "two prompts that read the same are what made b3 look broken"
+        assert_eq!(
+            fl.device.node_name, fr.device.node_name,
+            "both channels belong to the same capture device"
+        );
+        assert_eq!(
+            fl.stream.node_id, fr.stream.node_id,
+            "and to the same asking stream — so they are one question"
         );
     }
 
-    /// The stability constraint from CONVENTIONS. Port IDs are allocated per
-    /// session; names persist. If the ordinal followed the id, a rule or a
-    /// habit built around "mic2" would silently point at the other microphone
-    /// after a reboot.
+    /// Two PHYSICAL microphones stay distinguishable, and always did — they are
+    /// separate PipeWire nodes and separate ProtectedDevices. This is what the
+    /// deleted ordinal could never have helped with: `device_instance` compared
+    /// sibling ports *within one node*, so it could only ever see channels.
     #[test]
-    fn ordinals_follow_the_port_name_not_the_port_id() {
-        let (nodes, _, devices) = graph();
-        // Same two microphones, ids swapped as a fresh session might allocate
-        // them: capture_FL now has the HIGHER id.
-        let ports = HashMap::from([
-            (65, port(65, 46, "capture_FL", "out")),
-            (64, port(64, 46, "capture_FR", "out")),
-        ]);
-        let fl = classify_link(46, 65, 99, 0, &nodes, &ports, &devices).expect("FL");
-        let fr = classify_link(46, 64, 99, 0, &nodes, &ports, &devices).expect("FR");
-        assert_eq!(fl.instance.as_deref(), Some("mic1"), "capture_FL is still mic1");
-        assert_eq!(fr.instance.as_deref(), Some("mic2"), "capture_FR is still mic2");
-    }
+    fn two_real_microphones_are_still_two_devices() {
+        let (nodes, ports, devices) = graph();
+        let mut nodes = nodes;
+        let mut ports = ports;
+        let mut devices = devices;
+        // A second capture device: its own node, its own port.
+        nodes.insert(70, node(70, "Audio/Source", "alsa_input.usb-webcam", "usb mic"));
+        ports.insert(80, port(80, 70, "capture_MONO", "out"));
+        devices.push(ProtectedDevice {
+            category: DeviceCategory::Microphone,
+            node_name: "alsa_input.usb-webcam".into(),
+            description: "USB webcam mic".into(),
+            object_serial: 70,
+            guarded: true,
+        });
 
-    /// A single-microphone machine must not be told about "mic1". An ordinal
-    /// with nothing to disambiguate is noise.
-    #[test]
-    fn a_lone_port_gets_no_ordinal() {
-        let (nodes, _, devices) = graph();
-        let ports = HashMap::from([(64, port(64, 46, "capture_MONO", "out"))]);
-        let m = classify_link(46, 64, 99, 0, &nodes, &ports, &devices).expect("mic");
-        assert_eq!(m.instance, None);
+        let built_in = classify_link(46, 64, 99, 0, &nodes, &ports, &devices).expect("built-in");
+        let usb = classify_link(70, 80, 99, 0, &nodes, &ports, &devices).expect("usb");
+        assert_ne!(
+            built_in.device.node_name, usb.device.node_name,
+            "two microphones are two devices, told apart by node — never by an ordinal"
+        );
     }
 
     /// A sink's playback_* and monitor_* ports face opposite ways and are not
     /// one population. Counting them together would make a stereo sink look
     /// like it had four of something.
-    /// Only ports facing the SAME WAY as the one used may be counted. A duplex
-    /// node has two populations and merging them shifts every ordinal.
-    ///
-    /// This test deliberately does NOT use this laptop's sink, even though that
-    /// is the real duplex device in the graph. There, the in-ports are
-    /// `playback_*` and the out-ports are `monitor_*` — and `monitor` sorts
-    /// before `playback`, so mixing the two populations happens to produce the
-    /// right answer anyway. A test built on that hardware passes whether or not
-    /// the filter exists, which was the first version of this test and it was
-    /// worthless. Verified: removing the direction filter did not fail it.
-    ///
-    /// So: an in-port whose name sorts FIRST, where the coincidence cannot save
-    /// the wrong implementation.
     #[test]
-    fn opposite_facing_ports_are_not_counted_together() {
-        let ports = HashMap::from([
-            (10, port(10, 46, "aux_in", "in")),      // sorts before both
-            (11, port(11, 46, "capture_FL", "out")),
-            (12, port(12, 46, "capture_FR", "out")),
-        ]);
-        assert_eq!(
-            device_instance(46, 11, &ports, DeviceCategory::Microphone).as_deref(),
-            Some("mic1"),
-            "capture_FL is the FIRST capture port; aux_in faces the other way \
-             and must not be counted, which would make this mic2"
-        );
-        assert_eq!(
-            device_instance(46, 12, &ports, DeviceCategory::Microphone).as_deref(),
-            Some("mic2")
-        );
-    }
-
-    /// The single in-port must also not be given an ordinal of its own by
-    /// borrowing the out-ports for the count.
-    #[test]
-    fn a_lone_port_facing_its_own_way_gets_no_ordinal() {
-        let ports = HashMap::from([
-            (10, port(10, 46, "aux_in", "in")),
-            (11, port(11, 46, "capture_FL", "out")),
-            (12, port(12, 46, "capture_FR", "out")),
-        ]);
-        assert_eq!(
-            device_instance(46, 10, &ports, DeviceCategory::Microphone),
-            None,
-            "one port facing in — nothing to disambiguate it from"
-        );
-    }
-
-    #[test]
-    fn a_camera_capture_is_classified_and_needs_no_ordinal() {
+    fn a_camera_capture_is_classified() {
         let (nodes, ports, devices) = graph();
         let m = classify_link(70, 71, 97, 0, &nodes, &ports, &devices).expect("camera");
         assert_eq!(m.device.category, DeviceCategory::Camera);
-        assert_eq!(m.instance, None, "one capture port, nothing to disambiguate");
     }
 
     #[test]
@@ -459,14 +339,4 @@ mod tests {
         assert!(classify_link(46, 64, 4242, 0, &nodes, &ports, &devices).is_none());
     }
 
-    /// The monitor category never carries an ordinal, stated at the naming
-    /// function too — not only where classify_link skips it.
-    #[test]
-    fn the_monitor_category_is_never_given_an_ordinal() {
-        let (_, ports, _) = graph();
-        assert_eq!(
-            device_instance(36, 61, &ports, DeviceCategory::Monitor),
-            None
-        );
-    }
 }

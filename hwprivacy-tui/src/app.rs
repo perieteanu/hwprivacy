@@ -42,9 +42,19 @@ pub struct App {
     // Cached data from daemon
     pub devices: Vec<(String, String, String, bool)>,
     pub streams: Vec<(String, u32, String, String, String, String, bool)>,
-    pub rules: Vec<(String, String, String)>,
+    /// (app, mic, camera, monitor, exe_path, gap_note) — one entry per rule.
+    /// A permission is "" when the rule says nothing about that category.
+    pub rules: Vec<(String, String, String, String, String, String)>,
     pub events: Vec<(String, String, String, String)>,
     pub status: (bool, u32, u32, u32, u32),
+
+    /// Which category column the Rules panel is pointing at: 0 mic, 1 camera,
+    /// 2 monitor.
+    ///
+    /// Needed since a row became one RULE rather than one (rule, category)
+    /// pair. Without it `a`/`d`/`e`/`w` have no device to act on — the old
+    /// code read the device out of the row, which no longer names one.
+    pub selected_device: usize,
 }
 
 impl App {
@@ -70,6 +80,7 @@ impl App {
             rules: Vec::new(),
             events: Vec::new(),
             status: (false, 0, 0, 0, 0),
+            selected_device: 0,
         };
 
         app.refresh().await;
@@ -92,6 +103,12 @@ impl App {
         if let Ok(s) = self.proxy.get_status().await {
             self.status = s;
         }
+    }
+
+    /// The category the Rules panel's column cursor is on.
+    pub fn selected_category(&self) -> &'static str {
+        const CATEGORIES: [&str; 3] = ["microphone", "camera", "monitor"];
+        CATEGORIES[self.selected_device.min(2)]
     }
 
     pub fn max_rows(&self) -> usize {

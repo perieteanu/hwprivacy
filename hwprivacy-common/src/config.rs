@@ -8,11 +8,17 @@ use std::path::PathBuf;
 pub enum Permission {
     /// All streams auto-allowed (trusted app)
     Allow,
-    /// Prompt for every new stream (ideal for browsers)
-    AskEach,
     /// Allowed while app's PipeWire client is active
     WhileInUse,
-    /// Prompt once, remember for session
+    /// Prompt once, remember for session.
+    ///
+    /// `ask_each` is accepted as an alias so that configs and presets written
+    /// before 2026-08-23 keep loading. It meant "prompt for every new stream"
+    /// and was removed with the whole per-stream concept — the grant it
+    /// produced could never be used, so answering it did nothing. Mapping it
+    /// to `ask` preserves the user's evident intent (they wanted to be asked)
+    /// rather than silently widening or narrowing the rule.
+    #[serde(alias = "ask_each")]
     Ask,
     /// Always blocked
     Deny,
@@ -22,7 +28,6 @@ impl std::fmt::Display for Permission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Permission::Allow => write!(f, "allow"),
-            Permission::AskEach => write!(f, "ask_each"),
             Permission::WhileInUse => write!(f, "while_in_use"),
             Permission::Ask => write!(f, "ask"),
             Permission::Deny => write!(f, "deny"),
@@ -36,11 +41,12 @@ impl std::str::FromStr for Permission {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "allow" => Ok(Permission::Allow),
-            "ask_each" => Ok(Permission::AskEach),
+            // Accepted, not offered: see the `Ask` variant.
+            "ask_each" => Ok(Permission::Ask),
             "while_in_use" => Ok(Permission::WhileInUse),
             "ask" => Ok(Permission::Ask),
             "deny" => Ok(Permission::Deny),
-            _ => Err(format!("Unknown permission: '{}'. Valid: allow, ask_each, while_in_use, ask, deny", s)),
+            _ => Err(format!("Unknown permission: '{}'. Valid: allow, while_in_use, ask, deny", s)),
         }
     }
 }
@@ -51,15 +57,32 @@ impl std::str::FromStr for Permission {
 /// PipeWire's self-declared `application.name`; `exe_path` is matched by the
 /// kernel against the calling task's executable inode. They answer different
 /// questions and neither replaces the other — see `docs-yaml/ARCHITECTURE.yaml`.
+///
+/// # Why every category is optional
+///
+/// `None` means "this rule has no opinion here" and the category falls through
+/// to `policy.default_action`. It is NOT the same as `Some(Deny)`.
+///
+/// Before 2026-08-23 the three fields were plain `Permission` defaulting to
+/// `Deny`, so `set_rule()` could not express a one-category grant: allowing
+/// firefox the camera also wrote `microphone = "deny"` and `monitor = "deny"`,
+/// which the user never asked for and which silently downgraded the microphone
+/// from `ask` to a hard deny. Measured live that day.
+///
+/// Existing config files are unaffected and deliberately so. An explicit
+/// `microphone = "deny"` written by the old code still deserialises to
+/// `Some(Deny)`, because a bare deny cannot be told apart from a deliberate
+/// one — loosening it on load would relax a rule the user may have meant,
+/// without asking.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppRule {
     pub app_name: String,
-    #[serde(default = "default_deny")]
-    pub microphone: Permission,
-    #[serde(default = "default_deny")]
-    pub camera: Permission,
-    #[serde(default = "default_deny")]
-    pub monitor: Permission,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub microphone: Option<Permission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<Permission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monitor: Option<Permission>,
 
     /// Absolute path to the REAL executable, for the kernel (eBPF LSM) layer.
     ///
@@ -77,12 +100,15 @@ pub struct AppRule {
     pub exe_path: Option<String>,
 }
 
-fn default_deny() -> Permission {
-    Permission::Deny
-}
-
 impl AppRule {
-    pub fn get_permission(&self, category: &super::DeviceCategory) -> Permission {
+    /// This rule's opinion, or `None` if it has none for this category.
+    ///
+    /// Callers that need a decision want [`Config::get_permission`], which
+    /// resolves `None` against `default_action`. Returning the `Option` here
+    /// is deliberate: the two questions ("what did the user write" and "what
+    /// happens now") have different answers and conflating them is the bug
+    /// this type was changed to prevent.
+    pub fn get_permission(&self, category: &super::DeviceCategory) -> Option<Permission> {
         match category {
             super::DeviceCategory::Microphone => self.microphone,
             super::DeviceCategory::Camera => self.camera,
@@ -92,9 +118,27 @@ impl AppRule {
 
     pub fn set_permission(&mut self, category: &super::DeviceCategory, perm: Permission) {
         match category {
-            super::DeviceCategory::Microphone => self.microphone = perm,
-            super::DeviceCategory::Camera => self.camera = perm,
-            super::DeviceCategory::Monitor => self.monitor = perm,
+            super::DeviceCategory::Microphone => self.microphone = Some(perm),
+            super::DeviceCategory::Camera => self.camera = Some(perm),
+            super::DeviceCategory::Monitor => self.monitor = Some(perm),
+        }
+    }
+
+    /// A rule with no opinion about anything. Used by [`Config::set_rule`], so
+    /// that setting one category writes exactly one category.
+    pub fn empty(app_name: String) -> Self {
+        AppRule {
+            app_name,
+            microphone: None,
+            camera: None,
+            monitor: None,
+            // A rule created from a PipeWire prompt knows no executable.
+            // The kernel layer therefore ignores it until a path is attached —
+            // which is correct: guessing a binary from a self-declared
+            // application.name would be exactly the kind of silent mismatch
+            // this project keeps getting bitten by. `set_rule_exe` is how a
+            // path gets here; see `Config::set_rule_exe`.
+            exe_path: None,
         }
     }
 }
@@ -325,12 +369,14 @@ impl Config {
     }
 
     /// Get effective permission for an app + device combo.
+    ///
+    /// Two ways to reach `default_action`, and both must: no rule at all, and a
+    /// rule that says nothing about this category. Collapsing the second into
+    /// `Deny` is what made a camera grant silently mute the microphone.
     pub fn get_permission(&self, app_name: &str, category: &super::DeviceCategory) -> Permission {
-        if let Some(rule) = self.find_rule(app_name) {
-            rule.get_permission(category)
-        } else {
-            self.policy.default_action
-        }
+        self.find_rule(app_name)
+            .and_then(|rule| rule.get_permission(category))
+            .unwrap_or(self.policy.default_action)
     }
 
     /// Set a rule. Creates a new entry if the app is not found.
@@ -357,22 +403,53 @@ impl Config {
         if let Some(rule) = self.find_rule_mut(&key) {
             rule.set_permission(category, perm);
         } else {
-            let mut rule = AppRule {
-                app_name: key,
-                microphone: Permission::Deny,
-                camera: Permission::Deny,
-                monitor: Permission::Deny,
-                // A rule created from a PipeWire prompt knows no executable.
-                // The kernel layer therefore ignores it until a path is added
-                // by hand — which is correct: guessing a binary from a
-                // self-declared application.name would be exactly the kind of
-                // silent mismatch this project keeps getting bitten by.
-                exe_path: None,
-            };
+            let mut rule = AppRule::empty(key);
             rule.set_permission(category, perm);
             self.rules.push(rule);
         }
         true
+    }
+
+    /// Attach the kernel-layer executable to an existing rule, or clear it with
+    /// an empty string.
+    ///
+    /// This is the only way `exe_path` reaches a rule from outside a preset.
+    /// Until 2026-08-23 there was none: `hwprivacy-ctl rules set`, the GUI form
+    /// and D-Bus `set_rule` all carried three fields, and
+    /// [`Config::kernel_camera_allowlist`] keys purely on `exe_path` — so no
+    /// string typeable in the app-name field could ever grant a camera, and
+    /// the only route was hand-editing `config.toml` with the daemon stopped.
+    ///
+    /// Refuses rather than stores, the same way [`Config::set_rule`] refuses an
+    /// unusable name (b4). A relative path can never match — the kernel
+    /// resolves by inode from an absolute path — and a path that does not
+    /// exist cannot be stat'ed into one. Both would sit in the config looking
+    /// like protection.
+    ///
+    /// `Err` carries the reason so the caller can log or show it; the caller
+    /// is expected to treat any `Err` as "nothing was written".
+    pub fn set_rule_exe(&mut self, app_name: &str, exe_path: &str) -> Result<(), String> {
+        let Some(rule) = self.find_rule_mut(app_name) else {
+            return Err(format!("no rule for '{app_name}' — create one first"));
+        };
+        if exe_path.is_empty() {
+            rule.exe_path = None;
+            return Ok(());
+        }
+        if !exe_path.starts_with('/') {
+            return Err(format!(
+                "'{exe_path}' is not an absolute path; the kernel layer matches \
+                 an executable by inode and cannot resolve a relative path"
+            ));
+        }
+        if !super::preset::path_exists(exe_path) {
+            return Err(format!(
+                "'{exe_path}' does not exist; a path that cannot be stat'ed \
+                 would sit in the config looking like protection"
+            ));
+        }
+        rule.exe_path = Some(exe_path.to_string());
+        Ok(())
     }
 
     /// Apply an import plan, returning how many rules were added.
@@ -418,10 +495,14 @@ impl Config {
     pub fn rules_map(&self) -> HashMap<String, HashMap<super::DeviceCategory, Permission>> {
         let mut map = HashMap::new();
         for rule in &self.rules {
+            // Only categories the rule has an opinion about. An absent entry
+            // means "ask default_action", which is not the same as Deny.
             let mut devmap = HashMap::new();
-            devmap.insert(super::DeviceCategory::Microphone, rule.microphone);
-            devmap.insert(super::DeviceCategory::Camera, rule.camera);
-            devmap.insert(super::DeviceCategory::Monitor, rule.monitor);
+            for cat in super::DeviceCategory::all() {
+                if let Some(perm) = rule.get_permission(cat) {
+                    devmap.insert(*cat, perm);
+                }
+            }
             map.insert(normalize_app_name(&rule.app_name), devmap);
         }
         map
@@ -436,7 +517,7 @@ impl Config {
     /// process either may open `/dev/video0` or may not — so the prompting
     /// levels have no meaning there:
     ///
-    /// * `ask` / `ask_each` cannot be honoured: an LSM hook returns a verdict
+    /// * `ask` cannot be honoured: an LSM hook returns a verdict
     ///   in nanoseconds and cannot wait for a human. Treated as deny.
     /// * `while_in_use` has no kernel equivalent either. Treated as deny.
     ///
@@ -444,8 +525,8 @@ impl Config {
     pub fn kernel_camera_allowlist(&self) -> Vec<(String, Permission)> {
         self.rules
             .iter()
-            .filter(|r| r.camera == Permission::Allow)
-            .filter_map(|r| r.exe_path.clone().map(|p| (p, r.camera)))
+            .filter(|r| r.camera == Some(Permission::Allow))
+            .filter_map(|r| r.exe_path.clone().map(|p| (p, Permission::Allow)))
             .collect()
     }
 
@@ -460,18 +541,50 @@ impl Config {
             .iter()
             .filter(|r| r.exe_path.is_none())
             .filter_map(|r| match r.camera {
-                Permission::Allow => Some((
+                Some(Permission::Allow) => Some((
                     r.app_name.clone(),
                     "camera = allow but no exe_path — the kernel layer will still deny it",
                 )),
-                Permission::Ask | Permission::AskEach | Permission::WhileInUse => Some((
+                Some(Permission::Ask | Permission::WhileInUse) => Some((
                     r.app_name.clone(),
                     "prompting permissions have no kernel equivalent; treated as deny there",
                 )),
-                Permission::Deny => None,
+                // A rule with no opinion about the camera is not a gap: it
+                // falls through to default_action like any unruled app, and
+                // flagging it would put every mic-only rule in the warning.
+                Some(Permission::Deny) | None => None,
             })
             .collect()
     }
+
+    /// The one gap that is not per-rule: `default_action = "allow"` means every
+    /// app without a camera rule is allowed at layer 1 and denied at layer 2,
+    /// because the kernel allowlist is built from `exe_path` and an unruled app
+    /// has none. Reported once at startup rather than once per rule.
+    pub fn global_camera_gap(&self) -> Option<&'static str> {
+        (self.policy.default_action == Permission::Allow).then_some(
+            "default_action = allow: apps with no camera rule are allowed by the \
+             PipeWire layer but still denied by the kernel layer, which has no \
+             executable to allowlist for them",
+        )
+    }
+}
+
+/// Last path component of an executable. `/usr/lib/firefox-esr/firefox-esr`
+/// becomes `firefox-esr`.
+///
+/// Lives here, beside [`normalize_app_name`], because the two are the project's
+/// two identities and are easiest to keep straight when read together: the
+/// PipeWire layer keys on a name an application declares about itself, the
+/// kernel layer keys on an executable. `short_name` is only ever a *suggested*
+/// rule name for a binary — never a match key.
+pub fn short_name(exe_path: &str) -> String {
+    exe_path
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(exe_path)
+        .to_string()
 }
 
 /// See [`Config::normalized_key`]. Free function so internal callers can use
@@ -545,9 +658,9 @@ mod tests {
     fn rule(app: &str, cam: Permission, exe: Option<&str>) -> AppRule {
         AppRule {
             app_name: app.into(),
-            microphone: Permission::Deny,
-            camera: cam,
-            monitor: Permission::Deny,
+            microphone: Some(Permission::Deny),
+            camera: Some(cam),
+            monitor: Some(Permission::Deny),
             exe_path: exe.map(str::to_string),
         }
     }
@@ -576,7 +689,7 @@ mod tests {
             rule("firefox", Permission::Allow, Some("/usr/lib/firefox-esr/firefox-esr")),
             rule("obs", Permission::Allow, None),                 // no path -> skipped
             rule("discord", Permission::Deny, Some("/usr/bin/discord")),
-            rule("zoom", Permission::AskEach, Some("/usr/bin/zoom")),
+            rule("zoom", Permission::Ask, Some("/usr/bin/zoom")),
         ];
         let allow = c.kernel_camera_allowlist();
         assert_eq!(allow.len(), 1, "{allow:?}");
@@ -588,7 +701,7 @@ mod tests {
     /// allow.
     #[test]
     fn prompting_permissions_never_become_a_kernel_allow() {
-        for p in [Permission::Ask, Permission::AskEach, Permission::WhileInUse] {
+        for p in [Permission::Ask, Permission::WhileInUse] {
             let mut c = Config::default();
             c.rules = vec![rule("x", p, Some("/usr/bin/x"))];
             assert!(
@@ -741,8 +854,8 @@ exe_candidates = ["/bin/sh"]
         let plan = preset(P).plan(|p| p == "/bin/sh", |a| c.find_rule(a).is_some());
         assert_eq!(c.apply_preset(&plan), 1);
         let r = c.find_rule("firefox").expect("imported");
-        assert_eq!(r.camera, Permission::Allow);
-        assert_eq!(r.microphone, Permission::AskEach);
+        assert_eq!(r.camera, Some(Permission::Allow));
+        assert_eq!(r.microphone, Some(Permission::Ask));
         assert_eq!(r.exe_path.as_deref(), Some("/bin/sh"));
     }
 
@@ -773,7 +886,7 @@ exe_candidates = ["/bin/sh"]
         assert_eq!(c.apply_preset(&plan), 0, "the plan is stale and must not win");
         assert_eq!(
             c.find_rule("firefox").unwrap().camera,
-            Permission::Deny,
+            Some(Permission::Deny),
             "the user's decision stands"
         );
         assert!(c.find_rule("firefox").unwrap().exe_path.is_none());
@@ -798,7 +911,245 @@ exe_candidates = ["/bin/sh"]
         assert!(c.set_rule("Firefox [pipewire-pulse] (pid:1)", &DeviceCategory::Camera, Permission::Allow));
         assert!(c.set_rule("firefox", &DeviceCategory::Microphone, Permission::Deny));
         assert_eq!(c.rules.len(), 1, "{:?}", c.rules);
-        assert_eq!(c.rules[0].camera, Permission::Allow);
-        assert_eq!(c.rules[0].microphone, Permission::Deny);
+        assert_eq!(c.rules[0].camera, Some(Permission::Allow));
+        assert_eq!(c.rules[0].microphone, Some(Permission::Deny));
+    }
+
+    // ---------------------------------------------------------------------
+    // Optional categories, and the executable a camera grant needs.
+    // Added 2026-08-23 after a live failure: deleting all rules and then
+    // allowing firefox the camera produced a rule that read `allow` while the
+    // kernel denied every open, and silently wrote two deny rules nobody
+    // asked for. Every test below was run against the reintroduced defect and
+    // observed to FAIL before being kept.
+    // ---------------------------------------------------------------------
+
+    /// Setting one category must write ONE category.
+    ///
+    /// The old constructor filled all three with `Deny`, so granting a camera
+    /// also wrote `microphone = "deny"` and `monitor = "deny"` — which, with
+    /// `default_action = "ask"`, silently downgraded the microphone from a
+    /// prompt to a hard deny.
+    #[test]
+    fn set_rule_touches_exactly_one_category() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        let r = c.find_rule("firefox").expect("created");
+        assert_eq!(r.camera, Some(Permission::Allow));
+        assert_eq!(r.microphone, None, "microphone was never asked about");
+        assert_eq!(r.monitor, None, "monitor was never asked about");
+    }
+
+    /// A category the rule says nothing about follows `default_action`.
+    /// Treating `None` as `Deny` is the same bug seen from the read side.
+    #[test]
+    fn an_unset_category_follows_the_default_action() {
+        let mut c = Config::default();
+        c.policy.default_action = Permission::Ask;
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        assert_eq!(
+            c.get_permission("firefox", &DeviceCategory::Microphone),
+            Permission::Ask,
+            "an unset category is not a deny"
+        );
+        assert_eq!(
+            c.get_permission("firefox", &DeviceCategory::Camera),
+            Permission::Allow
+        );
+    }
+
+    /// What is not written must not appear in the FILE.
+    ///
+    /// The daemon rewrites `config.toml` wholesale on every rule change, so
+    /// this is where a phantom deny would become permanent. Guards the same
+    /// mechanism as `set_rule_touches_exactly_one_category` one layer out —
+    /// proven by reintroducing that defect, not by touching serde: `toml`
+    /// cannot represent `None` and omits it whatever `skip_serializing_if`
+    /// says, so the attribute alone is not what this test is about.
+    #[test]
+    fn an_unset_category_is_not_serialised() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        let text = toml::to_string_pretty(&c).expect("serialise");
+        // Scoped to the rule block. `[devices]` legitimately carries
+        // `microphone = true`, so searching the whole file would pass or fail
+        // for the wrong reason.
+        let rule_block = text
+            .split("[[rules]]")
+            .nth(1)
+            .expect("a rule was written");
+        assert!(rule_block.contains("camera = \"allow\""), "{rule_block}");
+        assert!(
+            !rule_block.contains("microphone"),
+            "microphone leaked into the rule:\n{rule_block}"
+        );
+        assert!(
+            !rule_block.contains("monitor"),
+            "monitor leaked into the rule:\n{rule_block}"
+        );
+    }
+
+    /// The agreed migration: existing files are left alone. A `deny` written
+    /// by the old code cannot be told apart from a deliberate one, so it stays
+    /// a deny — loosening it on load would relax a rule without asking.
+    #[test]
+    fn an_existing_explicit_deny_still_loads_as_a_deny() {
+        let c: Config = toml::from_str(
+            r#"
+[[rules]]
+app_name = "obs"
+microphone = "deny"
+camera = "allow"
+monitor = "deny"
+"#,
+        )
+        .expect("parse");
+        let r = c.find_rule("obs").expect("loaded");
+        assert_eq!(r.microphone, Some(Permission::Deny), "not silently unset");
+        assert_eq!(r.camera, Some(Permission::Allow));
+    }
+
+    /// A rule with no opinion about the camera is not a kernel-layer gap — it
+    /// falls through to `default_action` like any unruled app. Flagging it
+    /// would put every microphone-only rule in the warning and make the
+    /// warning worthless.
+    #[test]
+    fn a_rule_with_no_camera_opinion_is_not_a_gap() {
+        let mut c = Config::default();
+        assert!(c.set_rule("recorder", &DeviceCategory::Microphone, Permission::Allow));
+        assert!(c.kernel_camera_gaps().is_empty(), "{:?}", c.kernel_camera_gaps());
+    }
+
+    /// The failure this whole change exists for: `camera = allow` with no
+    /// binary reads as protection and denies at the kernel layer.
+    #[test]
+    fn a_camera_allow_without_a_binary_is_reported_as_a_gap() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        let gaps = c.kernel_camera_gaps();
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        assert_eq!(gaps[0].0, "firefox");
+        assert!(c.kernel_camera_allowlist().is_empty(), "nothing to allowlist");
+    }
+
+    /// And once a binary is attached, the gap closes and the allowlist has it.
+    #[test]
+    fn attaching_a_binary_closes_the_gap() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        // /bin/sh, because it exists everywhere this will ever be run and a
+        // hardcoded inode has a half-life of one `apt upgrade`.
+        c.set_rule_exe("firefox", "/bin/sh").expect("accepted");
+        assert!(c.kernel_camera_gaps().is_empty());
+        assert_eq!(
+            c.kernel_camera_allowlist(),
+            vec![("/bin/sh".to_string(), Permission::Allow)]
+        );
+    }
+
+    // Refuse rather than store, the same way `set_rule` refuses an unusable
+    // name (b4). Each guard gets its OWN test: the three overlap — a relative
+    // path also fails to exist — so a single test asserting all three passes
+    // with any one of them removed, and proves nothing about that one.
+
+    #[test]
+    fn set_rule_exe_refuses_an_app_with_no_rule() {
+        let mut c = Config::default();
+        assert!(c.set_rule_exe("firefox", "/bin/sh").is_err());
+        assert!(c.find_rule("firefox").is_none(), "no rule conjured");
+    }
+
+    /// The kernel resolves an executable by inode from an absolute path. A
+    /// relative one can never match. Uses a path that DOES exist relative to
+    /// nothing in particular, so the existence guard cannot be what fails it.
+    #[test]
+    fn set_rule_exe_refuses_a_relative_path() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        let err = c
+            .set_rule_exe("firefox", "bin/sh")
+            .expect_err("a relative path cannot be resolved to an inode");
+        assert!(err.contains("absolute"), "wrong reason: {err}");
+        assert_eq!(c.find_rule("firefox").unwrap().exe_path, None, "wrote nothing");
+    }
+
+    /// An absolute path that does not exist — so the absolute-path guard
+    /// cannot be what fails it.
+    #[test]
+    fn set_rule_exe_refuses_a_path_that_does_not_exist() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        let err = c
+            .set_rule_exe("firefox", "/nonexistent/binary")
+            .expect_err("a path that cannot be stat'ed is not a binary");
+        assert!(err.contains("does not exist"), "wrong reason: {err}");
+        assert_eq!(c.find_rule("firefox").unwrap().exe_path, None, "wrote nothing");
+    }
+
+    /// Clearing is explicit and separate from failing.
+    #[test]
+    fn set_rule_exe_clears_with_an_empty_string() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        c.set_rule_exe("firefox", "/bin/sh").expect("accepted");
+        c.set_rule_exe("firefox", "").expect("cleared");
+        assert_eq!(c.find_rule("firefox").unwrap().exe_path, None);
+    }
+
+    /// `default_action = allow` allows every unruled app at the PipeWire layer
+    /// and denies it at the kernel layer, which has no executable for it. That
+    /// is one global gap, not one per rule.
+    #[test]
+    fn allow_by_default_is_reported_as_a_global_gap() {
+        let mut c = Config::default();
+        assert!(c.global_camera_gap().is_none(), "deny-by-default is no gap");
+        c.policy.default_action = Permission::Allow;
+        assert!(c.global_camera_gap().is_some());
+    }
+
+    /// Configs and presets written before 2026-08-23 say `ask_each`. The
+    /// variant is gone; the STRING must still load, or the daemon refuses to
+    /// start on an existing install. Mapped to `ask` — the user wanted to be
+    /// asked, and that is the surviving way to be asked.
+    #[test]
+    fn an_old_ask_each_config_still_loads() {
+        let c: Config = toml::from_str(
+            r#"
+[[rules]]
+app_name = "firefox"
+microphone = "ask_each"
+"#,
+        )
+        .expect("a config with ask_each must not break the daemon");
+        assert_eq!(
+            c.find_rule("firefox").unwrap().microphone,
+            Some(Permission::Ask)
+        );
+    }
+
+    /// The same string, through the CLI/D-Bus parser rather than serde.
+    #[test]
+    fn the_ask_each_string_still_parses_to_ask() {
+        assert_eq!("ask_each".parse::<Permission>().unwrap(), Permission::Ask);
+    }
+
+    /// And it is no longer OFFERED — the error message must not advertise a
+    /// permission that no longer exists.
+    #[test]
+    fn ask_each_is_not_advertised_as_valid() {
+        let err = "nonsense".parse::<Permission>().unwrap_err();
+        assert!(!err.contains("ask_each"), "{err}");
+        assert!(err.contains("while_in_use"), "{err}");
+    }
+
+    /// The suggested rule name for a binary. Only ever a suggestion — the
+    /// PipeWire layer knows Firefox as `firefox` while the binary is
+    /// `firefox-esr`, which is exactly why the GUI offers a choice.
+    #[test]
+    fn short_name_is_the_last_path_component() {
+        assert_eq!(short_name("/usr/lib/firefox-esr/firefox-esr"), "firefox-esr");
+        assert_eq!(short_name("/opt/google/chrome/chrome"), "chrome");
+        assert_eq!(short_name("bare"), "bare");
+        assert_eq!(short_name("/trailing/"), "/trailing/", "no empty name");
     }
 }

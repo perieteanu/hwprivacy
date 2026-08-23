@@ -153,25 +153,62 @@ fn draw_streams(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
-    let header = Row::new(vec!["App", "Device", "Permission"])
-        .style(Style::default().bold().fg(Color::Cyan))
-        .bottom_margin(1);
+    // Mark which category column the a/d/e/w keys will act on. Without this
+    // the column cursor is invisible and the keys are a guess.
+    let mark = |idx: usize, label: &str| {
+        if app.selected_device == idx {
+            format!("[{label}]")
+        } else {
+            format!(" {label} ")
+        }
+    };
+    let header = Row::new(vec![
+        "App".to_string(),
+        mark(0, "Mic"),
+        mark(1, "Camera"),
+        mark(2, "Monitor"),
+        "Executable".to_string(),
+    ])
+    .style(Style::default().bold().fg(Color::Cyan))
+    .bottom_margin(1);
 
     let rows: Vec<Row> = app
         .rules
         .iter()
         .enumerate()
-        .map(|(i, (app_name, dev, perm))| {
+        .map(|(i, (app_name, mic, cam, mon, exe, note))| {
             let style = if i == app.selected_row {
                 Style::default().bg(Color::DarkGray)
             } else {
                 Style::default()
             };
-            let perm_style = permission_color(perm);
+            // "—" means the rule says nothing about that category, so it
+            // follows default_action. Showing "deny" there would be a lie.
+            // Owned, so the closure's return does not borrow its argument.
+            let cell = |p: &String| {
+                if p.is_empty() {
+                    Cell::from("—").style(Style::default().fg(Color::DarkGray))
+                } else {
+                    Cell::from(p.clone()).style(permission_color(p))
+                }
+            };
+            // A rule that cannot reach the layer it names is marked here as
+            // well as in the CLI — this pane is where a reader looks to
+            // confirm a grant took effect.
+            let exe_cell = if !note.is_empty() {
+                Cell::from(format!("! {}", if exe.is_empty() { "(none)" } else { exe.as_str() }))
+                    .style(Style::default().fg(Color::Yellow))
+            } else if exe.is_empty() {
+                Cell::from("(none)").style(Style::default().fg(Color::DarkGray))
+            } else {
+                Cell::from(exe.as_str())
+            };
             Row::new(vec![
                 Cell::from(app_name.as_str()),
-                Cell::from(dev.as_str()),
-                Cell::from(perm.as_str()).style(perm_style),
+                cell(mic),
+                cell(cam),
+                cell(mon),
+                exe_cell,
             ])
             .style(style)
         })
@@ -180,13 +217,19 @@ fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(25),
+            Constraint::Length(20),
             Constraint::Length(12),
-            Constraint::Min(15),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Min(20),
         ],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title(" App Rules "));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" App Rules  (←/→ pick device, a/d/w set, x remove) "),
+    );
 
     f.render_widget(table, area);
 }
@@ -243,7 +286,7 @@ fn draw_events(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_help(f: &mut Frame, area: Rect, _app: &App) {
     let help = Paragraph::new(
-        " Tab:panel  ↑↓:navigate  a:allow  d:deny  e:ask_each  w:while_in_use  x:delete  r:refresh  q:quit",
+        " Tab:panel  ↑↓:navigate  ←→:device  a:allow  d:deny  w:while_in_use  x:delete  r:refresh  q:quit",
     )
     .style(Style::default().fg(Color::DarkGray));
 
@@ -254,7 +297,6 @@ fn permission_color(perm: &str) -> Style {
     match perm {
         "allow" => Style::default().fg(Color::Green),
         "deny" => Style::default().fg(Color::Red),
-        "ask_each" => Style::default().fg(Color::Yellow),
         "while_in_use" => Style::default().fg(Color::Blue),
         "ask" => Style::default().fg(Color::Yellow),
         _ => Style::default(),
