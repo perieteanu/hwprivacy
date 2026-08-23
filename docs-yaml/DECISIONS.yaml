@@ -623,3 +623,45 @@ decisions:
       Actively closing a popup still means block, save nothing, cool down, ask
       again. It was never wrong; the only route to it was a timeout that never
       fired.
+
+  - id: d-presets-are-data
+    date: "2026-08-23"
+    title: "Rule sets are importable data files, never code"
+    context: >
+      A rule that grants the camera at the kernel layer needs an exe_path, and
+      SetRule over D-Bus cannot carry one — so the only way to allowlist a
+      binary was to stop the daemon and hand-edit a file it rewrites wholesale.
+      Separately, a fresh install has no camera at all, because /usr/bin/pipewire
+      is denied /dev/video0 and PipeWire therefore creates no camera node.
+      Costin, 2026-08-21: "yes. both. and better - proposed optional config list
+      to be imported somehow."
+    decision: >
+      TOML presets in ~/.config/hwprivacy/presets (user) and
+      /usr/share/hwprivacy/presets (shipped), user shadowing system by name.
+      The MECHANISM is generic; the CONTENT is data. A third party contributes a
+      file, never a patch — which is the only shape compatible with
+      d-executable-is-the-principal.
+    the_baseline_is_just_a_preset: >
+      `hwprivacy-daemon install` imports desktop-baseline rather than carrying
+      hardcoded rules. Config::default() stays empty, so every test that asserts
+      on an empty config keeps meaning what it meant.
+    safety_properties:
+      candidate_lists: "each entry names several paths; the first that EXISTS wins and the report says which. /usr/lib/firefox-esr/firefox-esr is Debian's path — one hardcoded path would be wrong everywhere else."
+      never_widen: "if a rule for that app exists, the entry is skipped ENTIRELY. Not merged, and above all not given an exe_path — adding a path to an existing `camera = allow` would grant kernel access nobody asked for."
+      rechecked_at_apply: "the existence check runs again when applying, not only when planning. A preview may be minutes old and the user may have written a rule since."
+      no_guessed_camera_grants: "an entry with `camera = allow` and no resolvable candidate is SKIPPED, and the report names every path tried. Importing it would create exactly the state kernel_camera_gaps() warns about — reads `allow`, denied by the kernel, looks like a broken allowlist."
+      preview_is_the_default: "`preset import X` writes nothing; `--apply` commits. A preset is a GRANT, so the safe outcome is the one you get by forgetting the flag."
+    only_verified_paths_are_shipped: >
+      Two presets, desktop-baseline and browsers. Every candidate marked as
+      known-good was checked on the machine this was written on. Unverified
+      candidates for other distributions are listed too, and are safe precisely
+      because an unresolvable one is skipped rather than guessed at.
+    deliberately_excluded:
+      v4l_id: >
+        Denied at every boot and it is udev's camera-capability probe. Whether
+        that denial breaks anything is UNKNOWN, and granting on a hunch is the
+        wrong direction. Left as an open question.
+      xdg_desktop_portal: >
+        Not included: the portal delegates to PipeWire, and it is `pipewire`
+        that opens the device. No evidence the portal binary opens /dev/video*
+        itself, so no grant.

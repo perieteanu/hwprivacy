@@ -112,11 +112,23 @@ blockers:
   b4_dead_rules_in_config:
     severity: medium
     status: "CODE FIXED 2026-08-21. The live config still holds the three dead rules — cleaning them is a manual step with the daemon stopped."
-    what: "Three of the 9 live rules can never match anything."
+    what: "TWO of the 9 live rules can never match anything. The third was miscounted."
     detail:
-      - "app_name = '' — no stream is ever named empty (parse_node falls back to 'unknown')"
-      - "app_name = 'Firefox [pipewire-pulse] (pid:2332)' — ends with ')', so normalize_app_name strips nothing"
-      - "app_name = 'pipewire [pipewire-pulse]' — a self-reference artefact of the dismiss defect"
+      - "app_name = '' — DEAD. No stream is ever named empty (parse_node falls back to 'unknown')."
+      - "app_name = 'Firefox [pipewire-pulse] (pid:2332)' — DEAD. Ends with ')', so normalize_app_name strips nothing."
+    correction_2026_08_23: >
+      'pipewire [pipewire-pulse]' was listed here as the third dead rule since
+      2026-08-04. It is NOT dead. normalize_app_name strips a trailing " [...]",
+      so it normalises to the key "pipewire" and matches perfectly. It is live
+      and it is denying: the history table shows 16 monitor and 8 microphone
+      denials attributed to "pipewire", and with default_action = "ask" an
+      UNMATCHED app would have been ASKED, not DENIED. Those denials are the
+      rule firing.
+    consequence_found_2026_08_23: >
+      That rule occupies the "pipewire" key, so `preset import desktop-baseline`
+      skips both of its entries on this machine — correctly, because an import
+      never changes a rule the user already has. Removing the rule is therefore
+      a PREREQUISITE for the baseline here, not just tidying.
     root_cause: "notification bodies render '{app} (pid:{n})' and users paste that string into the rule form"
     fix: >
       config::sanitize_rule_name() runs on WRITE — it strips a trailing

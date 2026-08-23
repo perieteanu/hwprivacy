@@ -41,6 +41,17 @@ pub trait HwPrivacy {
     /// ring buffer.
     fn get_history(&self) -> zbus::Result<Vec<(String, String, String, u32, u32, String, String)>>;
 
+    /// Importable presets: (name, description, entry_count, source_path)
+    fn get_presets(&self) -> zbus::Result<Vec<(String, String, u32, String)>>;
+
+    /// Plan (apply = false) or apply (apply = true) a preset import.
+    /// Returns (app, outcome_line, was_added) per entry.
+    ///
+    /// `apply = false` writes NOTHING — a preset is a grant, so previewing is
+    /// what you get by forgetting the flag.
+    fn import_preset(&self, name: &str, apply: bool)
+        -> zbus::Result<Vec<(String, String, bool)>>;
+
     /// Emergency: deny everything immediately
     fn block_all(&self) -> zbus::Result<bool>;
 

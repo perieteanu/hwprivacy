@@ -52,6 +52,7 @@ crates:
       device.rs:         "DeviceCategory (Microphone|Camera|Monitor), ProtectedDevice"
       stream.rs:         "StreamInfo, ActiveConnection, AccessEvent, AccessAction"
       dbus_interface.rs: "#[zbus::proxy] trait HwPrivacy — the client side of the API"
+      preset.rs:         "importable rule sets: parsing, candidate-path resolution, and the import PLAN. Pure — the safety properties are testable without a filesystem."
 
   hwprivacy-daemon:
     loc: 2095
@@ -246,7 +247,7 @@ dbus_api:
   service: "org.hwprivacy.Daemon"
   path: "/org/hwprivacy/Daemon"
   bus: "session"
-  methods: 11
+  methods: 14
   method_list:
     - "GetDevices() -> a(sssb)              (category, node, description, guarded)"
     - "GetRules() -> a(sss)                 (app, device, permission)"
@@ -256,6 +257,8 @@ dbus_api:
     - "GetStatus() -> (buuuu)               (running, devices, rules, blocked, streams)"
     - "GetEvents(last_n) -> a(ssss)         (timestamp, app, device, action) — device carries the b3 instance, e.g. 'microphone (mic2)'"
     - "GetHistory() -> a(sssuuss)            (identity, device, source, denied, allowed, first, last) — was GetOffenders until 2026-08-21"
+    - "GetPresets() -> a(ssus)                (name, description, entry_count, source_path)"
+    - "ImportPreset(name, apply) -> a(ssb)    (app, outcome, was_added). apply=false plans and writes NOTHING."
     - "BlockAll() -> b"
     - "UnblockAll() -> b"
     - "AllowStream(node_id, app_name) -> b   (both: a node id alone is not an identity)"

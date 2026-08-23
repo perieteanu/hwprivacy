@@ -154,7 +154,7 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 cargo build --release --workspace       # or: make build
 cargo check --workspace                 # 5 warnings, 0 errors
 cargo clippy                            # NOT AVAILABLE — no such command on this toolchain
-cargo test --workspace                  # 132 tests, all pass
+cargo test --workspace                  # 152 tests, all pass
 ```
 
 Binaries (5): `hwprivacy-daemon` (layer 1 enforcer + policy owner),
@@ -168,7 +168,7 @@ Test coverage is **not** evenly spread:
 |---|---|
 | hwprivacy-lsm | 49 |
 | hwprivacy-daemon | 62 |
-| hwprivacy-common | 15 |
+| hwprivacy-common | 35 |
 | hwprivacy-proto | 6 |
 | hwprivacy-ctl / -tui / -gui | 0 |
 
@@ -202,8 +202,9 @@ the wrong trade for a security tool.
 
 Layer-1 ordering, updated 2026-08-23: posture is **settled (deny)**, b1–b4 are
 **all fixed**, `classify_link()` is covered, and notify-on-allow has landed.
-What remains: **b6** (a prompt never expires — needs a decision) → presets →
-README/MISSION for publication → only then touch the substrate.
+b6 and presets have landed too. What remains: **README/MISSION for
+publication** (both still say things that are flatly wrong) → the CPU
+regression → only then touch the substrate.
 
 ---
 
@@ -232,6 +233,14 @@ README/MISSION for publication → only then touch the substrate.
 - **Notifications are invisible to any automated check**, so a code path that
   decides to show one must also log that it did. C4 was scored wrong twice
   because verification depended on a human seeing a popup.
+- **Rule sets are DATA.** `presets/*.toml`, imported with
+  `hwprivacy-ctl preset import <name> --apply`. Preview is the default because
+  a preset is a grant. An import never touches a rule you already have — see
+  `d-presets-are-data`.
+- **`pipewire [pipewire-pulse]` in the live config is NOT a dead rule**, despite
+  what four months of docs said. It normalises to `pipewire`, matches, and has
+  denied 24 times. It also blocks `preset import desktop-baseline`, so removing
+  it is a prerequisite there rather than tidying.
 - **Prove a new test fails against the bug it catches**, before keeping it. Every
   test added on 2026-08-21 was run against the deliberately reintroduced defect
   and observed to fail. A test that passes both ways is worthless.

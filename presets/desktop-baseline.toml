@@ -1,0 +1,42 @@
+# Desktop baseline — the audio/video server itself.
+#
+# WHY THIS EXISTS
+#
+# The kernel layer denies /dev/video0 to everything not allowlisted, and
+# /usr/bin/pipewire is what opens the camera on behalf of every application
+# that goes through PipeWire. Without this, PipeWire never creates a camera
+# node, the camera disappears from `hwprivacy-ctl devices` entirely, and any
+# portal or Flatpak app finds no camera at all. It reads as a broken install.
+#
+# WHAT IT COSTS
+#
+# Allowing the servers hands the PipeWire camera route back to LAYER 1, which
+# gates it per application. It does not open the route the kernel layer exists
+# to guard: Firefox and Chrome take the camera through V4L2 directly, and they
+# are still matched by executable inode. The two layers cover one route each.
+#
+# Microphone and monitor stay `deny` here. This grants the camera route and
+# changes nothing else.
+
+name = "desktop-baseline"
+description = "PipeWire and WirePlumber — without these the camera has no PipeWire node at all"
+
+[[app]]
+name = "pipewire"
+microphone = "deny"
+camera = "allow"
+monitor = "deny"
+exe_candidates = [
+  "/usr/bin/pipewire",
+  "/usr/local/bin/pipewire",
+]
+
+[[app]]
+name = "wireplumber"
+microphone = "deny"
+camera = "allow"
+monitor = "deny"
+exe_candidates = [
+  "/usr/bin/wireplumber",
+  "/usr/local/bin/wireplumber",
+]

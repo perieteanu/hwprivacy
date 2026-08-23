@@ -24,6 +24,8 @@ install:
 	install -D -m 0644 debian/hwprivacy-daemon.service $(DESTDIR)$(PREFIX)/lib/systemd/user/hwprivacy-daemon.service
 	install -D -m 0644 dbus/org.hwprivacy.Daemon.service $(DESTDIR)$(PREFIX)/share/dbus-1/services/org.hwprivacy.Daemon.service
 	install -D -m 0644 debian/hwprivacy-gui.desktop $(DESTDIR)$(PREFIX)/share/applications/hwprivacy-gui.desktop
+	install -d $(DESTDIR)$(PREFIX)/share/hwprivacy/presets
+	install -m 0644 presets/*.toml $(DESTDIR)$(PREFIX)/share/hwprivacy/presets/
 
 # The kernel layer, installed separately and ON PURPOSE.
 #

@@ -751,12 +751,58 @@ fn install_service() -> anyhow::Result<()> {
     std::fs::write(&dbus_path, DBUS_SERVICE)?;
     println!("Installed: {}", dbus_path.display());
 
-    // Create default config if it doesn't exist
+    // Create default config if it doesn't exist, with the desktop baseline.
+    //
+    // The baseline is imported here rather than baked into Config::default()
+    // because it is DATA — a preset anyone can read, correct, or replace — and
+    // because Default is used throughout the tests, where an empty config is
+    // the thing being asserted on.
+    //
+    // Auto-import at install, opt-in everywhere else. Without it, a fresh
+    // install has no camera at all: the kernel layer denies /dev/video0 to
+    // /usr/bin/pipewire, so PipeWire creates no camera node and the device
+    // vanishes from `hwprivacy-ctl devices`. That reads as a broken install,
+    // not as a policy decision.
     let config_path = hwprivacy_common::Config::user_config_path();
     if !config_path.exists() {
-        let config = hwprivacy_common::Config::default();
-        config.save()?;
-        println!("Created:   {}", config_path.display());
+        let mut config = hwprivacy_common::Config::default();
+
+        let dirs = hwprivacy_common::preset::preset_dirs();
+        match hwprivacy_common::preset::load("desktop-baseline", &dirs) {
+            Ok(preset) => {
+                let plan = preset.plan(hwprivacy_common::preset::path_exists, |app| {
+                    config.find_rule(app).is_some()
+                });
+                let added = config.apply_preset(&plan);
+                config.save()?;
+                println!("Created:   {}", config_path.display());
+                println!(
+                    "Baseline:  imported 'desktop-baseline' — {} rule(s):",
+                    added
+                );
+                for (app, outcome, _) in &plan.entries {
+                    println!("             {:<16} {}", app, outcome.describe());
+                }
+                if added == 0 {
+                    println!(
+                        "           NOTE: nothing resolved, so the camera will have no \
+                         PipeWire node.\n           Cameras used directly (Firefox, Chrome) \
+                         are unaffected."
+                    );
+                }
+            }
+            Err(e) => {
+                // Not fatal: the daemon works, the camera just will not appear
+                // as a PipeWire device. Saying so beats a silent gap.
+                config.save()?;
+                println!("Created:   {}", config_path.display());
+                println!(
+                    "Baseline:  SKIPPED — {e:#}\n\
+                                Without it the camera has no PipeWire node. Fix with:\n\
+                                hwprivacy-ctl preset import desktop-baseline --apply"
+                );
+            }
+        }
     }
 
     // Reload and enable

@@ -58,6 +58,7 @@ All three are one mechanism now: `PolicyFingerprint` in `lsm_client.rs`.
 | **b3** two identical prompts | split by category — see below |
 | **allow path was silent** | `notify_allow.rs` gate + an `allowed` column in the history table |
 | **b6** *(found live)* prompts stacked forever | `Timeout::Never` said out loud, one pending prompt per (app, device) |
+| **presets** | importable TOML rule sets + a desktop baseline `install` imports |
 | *incidental* | a test that had never run — `#[test]` was stacked twice on the function above it |
 
 ### b3: the reframe was half right
@@ -161,9 +162,17 @@ allowlisted, so opening any camera page more than a minute after login should
 produce one `Announced allowed access` line and an `allowed` count in
 `hwprivacy-ctl history`.
 
-### 5. Then: presets → README/MISSION for publication
+### 5. Remove the rule that blocks the baseline
 
-See `ROADMAP.yaml > next_up`.
+`preset import desktop-baseline` skips both entries here, correctly — an import
+never changes a rule you already have, and `pipewire [pipewire-pulse]` occupies
+the `pipewire` key. **That rule is NOT dead**, despite four months of docs
+saying so: it normalises to `pipewire`, matches, and has denied 24 times.
+Removing it is a prerequisite for the baseline, not tidying.
+
+### 6. Then: README/MISSION for publication
+
+See `ROADMAP.yaml > next_up`. This is the publication blocker.
 
 ---
 
@@ -234,7 +243,11 @@ Hook cost: **+13.75 ns/open**, 95 % CI `[+7.3, +20.2]`, 1.88 % of a 733 ns
   the existing three need a manual clean with the daemon stopped.
 - **The live config still says `default_action = "ask"`.** The code default is
   now deny; his file sets it explicitly, so nothing changed underneath him.
-- **Presets** — next tranche, by agreement.
+- **`preset import --apply` was never run against the live config.** Previewed
+  only. Applying it changes which processes may open the camera — Costin's
+  call, not mine.
+- **`v4l_id`** is denied at every boot and is deliberately NOT in the baseline.
+  Whether that denial breaks anything is unknown.
 - **The tray in-use indicator.** notify-on-allow ships without it: there is no
   "camera released" event, so a dot would light and never go out.
 - **Per-device rules.** b3 labels the microphones; it does not let you write

@@ -45,6 +45,13 @@ config_file:
     poll_interval_ms: "500. Raising it buys CPU by widening the race window — the wrong trade for a security tool."
     dismiss_cooldown_secs: "60. How long one (app, device) stays quiet after its prompt was dismissed."
     exe_recheck_secs: "30, 0 disables. How often the daemon re-stats the kernel allowlist's executables to notice a package upgrade changed an inode. See DECISIONS d-policy-fingerprint."
+  presets:
+    where: "~/.config/hwprivacy/presets/*.toml (user), /usr/share/hwprivacy/presets/*.toml (shipped). User shadows system by name."
+    why_they_exist: "SetRule cannot carry an exe_path, so a kernel-layer grant was hand-editing only. See DECISIONS d-presets-are-data."
+    candidate_paths: "each entry lists several; the first that EXISTS wins. Never hardcode one path — /usr/lib/firefox-esr/firefox-esr is Debian's."
+    never_widens: "an entry whose app already has a rule is skipped entirely, at plan time AND again at apply time."
+    preview_is_the_default: "`preset import X` writes nothing; `--apply` commits."
+    only_ship_verified_paths: "a candidate you cannot check is fine to LIST — unresolvable ones are skipped, not guessed at — but never claim it is known-good."
   rule_names_are_sanitised_on_write: >
     set_rule() runs config::sanitize_rule_name(), which strips a trailing
     "(pid:N)", normalises, and REFUSES anything that cannot become a key —

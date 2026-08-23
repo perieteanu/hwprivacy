@@ -34,10 +34,30 @@ enum Commands {
     },
     /// What has touched a device, how often, and since when (survives restarts)
     History,
+    /// Importable rule sets
+    #[command(subcommand)]
+    Preset(PresetAction),
     /// Emergency: deny everything immediately
     BlockAll,
     /// Restore to saved rules
     UnblockAll,
+}
+
+#[derive(Subcommand)]
+enum PresetAction {
+    /// List available presets
+    List,
+    /// Show what a preset contains
+    Show {
+        name: String,
+    },
+    /// Preview a preset import. Writes nothing unless --apply is given.
+    Import {
+        name: String,
+        /// Actually write the rules. Without this, nothing is changed.
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -327,6 +347,62 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+
+        Commands::Preset(action) => match action {
+            PresetAction::List => {
+                let rows = proxy.get_presets().await?;
+                if rows.is_empty() {
+                    println!("No presets found in ~/.config/hwprivacy/presets/ or /usr/share/hwprivacy/presets/.");
+                } else {
+                    println!("{:<20} {:>7}  {}", "NAME", "RULES", "DESCRIPTION");
+                    println!("{}", "-".repeat(96));
+                    for (name, desc, count, _path) in &rows {
+                        println!("{:<20} {:>7}  {}", name, count, desc);
+                    }
+                    println!();
+                    println!("`hwprivacy-ctl preset show <name>` to see what one contains.");
+                }
+            }
+
+            PresetAction::Show { name } => {
+                // Shown as a PLAN rather than as the file's contents, because
+                // what matters is what would happen on THIS machine — which
+                // binary resolves, and what is already ruled on.
+                let rows = proxy.import_preset(&name, false).await?;
+                println!("Preset '{}' on this machine:\n", name);
+                for (app, outcome, _) in &rows {
+                    println!("  {:<24} {}", app, outcome);
+                }
+            }
+
+            PresetAction::Import { name, apply } => {
+                let rows = proxy.import_preset(&name, apply).await?;
+                let added = rows.iter().filter(|(_, _, a)| *a).count();
+
+                for (app, outcome, _) in &rows {
+                    println!("  {:<24} {}", app, outcome);
+                }
+                println!();
+
+                if apply {
+                    if added == 0 {
+                        println!("Nothing was added — every entry was skipped for the reason above.");
+                    } else {
+                        println!("Imported {} rule(s) from '{}'.", added, name);
+                    }
+                } else {
+                    // Said outright. A preset is a grant, and the one thing a
+                    // user must never be unsure about is whether it took
+                    // effect.
+                    println!(
+                        "PREVIEW ONLY — nothing was written.\n\
+                         Re-run with --apply to add the {} rule(s) marked 'added':\n\
+                         \n    hwprivacy-ctl preset import {} --apply",
+                        added, name
+                    );
+                }
+            }
+        },
 
         Commands::BlockAll => {
             proxy.block_all().await?;

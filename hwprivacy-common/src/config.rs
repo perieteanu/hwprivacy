@@ -375,6 +375,27 @@ impl Config {
         true
     }
 
+    /// Apply an import plan, returning how many rules were added.
+    ///
+    /// Only entries the plan marked `Added` are written, and the plan already
+    /// refused to touch an app that has a rule. This re-checks anyway: the plan
+    /// may have been computed for a preview and the config could have changed
+    /// since. A preview that disagrees with the apply would be the worst
+    /// possible bug in a feature whose whole safety story is "look before you
+    /// commit".
+    pub fn apply_preset(&mut self, plan: &super::preset::ImportPlan) -> usize {
+        let mut added = 0;
+        for (_, _, rule) in &plan.entries {
+            let Some(rule) = rule else { continue };
+            if self.find_rule(&rule.app_name).is_some() {
+                continue; // appeared since the plan was made
+            }
+            self.rules.push(rule.clone());
+            added += 1;
+        }
+        added
+    }
+
     /// Remove all rules for an app.
     pub fn remove_rule(&mut self, app_name: &str) -> bool {
         let key = normalize_app_name(app_name);
@@ -699,6 +720,74 @@ monitor = "deny"
         assert_eq!(sanitize_rule_name("Foo (pid:)").as_deref(), Some("foo (pid:)"));
         assert_eq!(sanitize_rule_name("Foo (pid:abc)").as_deref(), Some("foo (pid:abc)"));
         assert_eq!(sanitize_rule_name("obs").as_deref(), Some("obs"));
+    }
+
+    fn preset(toml_src: &str) -> crate::preset::Preset {
+        crate::preset::Preset::parse(toml_src).expect("preset parses")
+    }
+
+    const P: &str = r#"
+name = "t"
+[[app]]
+name = "firefox"
+microphone = "ask_each"
+camera = "allow"
+exe_candidates = ["/bin/sh"]
+"#;
+
+    #[test]
+    fn applying_a_plan_writes_the_rule_with_its_resolved_binary() {
+        let mut c = Config::default();
+        let plan = preset(P).plan(|p| p == "/bin/sh", |a| c.find_rule(a).is_some());
+        assert_eq!(c.apply_preset(&plan), 1);
+        let r = c.find_rule("firefox").expect("imported");
+        assert_eq!(r.camera, Permission::Allow);
+        assert_eq!(r.microphone, Permission::AskEach);
+        assert_eq!(r.exe_path.as_deref(), Some("/bin/sh"));
+    }
+
+    /// The whole safety story of `preset import` is "look before you commit".
+    /// A preview that added nothing and an apply that added something would be
+    /// the worst possible bug in it.
+    #[test]
+    fn a_plan_that_adds_nothing_writes_nothing() {
+        let mut c = Config::default();
+        // camera = allow, no candidate resolves -> skipped
+        let plan = preset(P).plan(|_| false, |a| c.find_rule(a).is_some());
+        assert_eq!(plan.added_count(), 0);
+        assert_eq!(c.apply_preset(&plan), 0);
+        assert!(c.rules.is_empty());
+    }
+
+    /// Re-checked at apply time, not just at plan time: a preview may be
+    /// minutes old and the user may have written a rule in between. An import
+    /// must never overwrite a decision, however it arrived.
+    #[test]
+    fn a_rule_created_after_the_preview_is_still_not_overwritten() {
+        let mut c = Config::default();
+        let plan = preset(P).plan(|p| p == "/bin/sh", |_| false); // planned against an empty config
+
+        // ...meanwhile the user decides firefox must never have the camera.
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Deny));
+
+        assert_eq!(c.apply_preset(&plan), 0, "the plan is stale and must not win");
+        assert_eq!(
+            c.find_rule("firefox").unwrap().camera,
+            Permission::Deny,
+            "the user's decision stands"
+        );
+        assert!(c.find_rule("firefox").unwrap().exe_path.is_none());
+    }
+
+    #[test]
+    fn importing_twice_adds_nothing_the_second_time() {
+        let mut c = Config::default();
+        let p = preset(P);
+        let plan1 = p.plan(|_| true, |a| c.find_rule(a).is_some());
+        assert_eq!(c.apply_preset(&plan1), 1);
+        let plan2 = p.plan(|_| true, |a| c.find_rule(a).is_some());
+        assert_eq!(c.apply_preset(&plan2), 0);
+        assert_eq!(c.rules.len(), 1);
     }
 
     /// Setting a second category on a pasted label must find the rule the first

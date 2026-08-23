@@ -151,3 +151,10 @@
 23-08-2026 17:55 | Sun | hw | [decide] b6: prompts STAY until answered — a permission question is a to-do item, not a nag. The stacking is the defect, not the persistence
 23-08-2026 18:00 | Sun | hw | [fix] b6: Timeout::Never said out loud, one pending prompt per (app,device) normalised, claim released on every exit path
 23-08-2026 18:05 | Sun | hw | [note] LIVE: three repeats of the same access -> ONE ASKED then DENIED, DENIED. Before the fix all three raised a popup
+23-08-2026 18:30 | Sun | hw | [add] presets: importable TOML rule sets. Mechanism generic, content data — a third party ships a file, not a patch
+23-08-2026 18:32 | Sun | hw | [decide] candidate path LISTS per entry, first that exists wins. One hardcoded path would be wrong on every non-Debian machine
+23-08-2026 18:34 | Sun | hw | [decide] preview is the default, --apply commits. A preset is a GRANT: the safe outcome is what you get by forgetting the flag
+23-08-2026 18:36 | Sun | hw | [decide] an import NEVER touches an existing rule — not merged, and never given an exe_path, which would grant kernel access nobody asked for
+23-08-2026 18:40 | Sun | hw | [add] desktop-baseline preset (pipewire+wireplumber) auto-imported by `daemon install` — without it a fresh install has no camera at all
+23-08-2026 18:45 | Sun | hw | [note] CORRECTION: 'pipewire [pipewire-pulse]' is NOT dead. It normalises to 'pipewire', matches, and has 24 denials. Docs said dead since 2026-08-04
+23-08-2026 18:47 | Sun | hw | [note] that live rule blocks `preset import desktop-baseline` on this machine — removing it is a prerequisite, not tidying

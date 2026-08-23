@@ -177,6 +177,77 @@ impl HwPrivacyService {
             .collect()
     }
 
+    /// List importable presets: (name, description, entry_count, source_path).
+    async fn get_presets(&self) -> Vec<(String, String, u32, String)> {
+        let dirs = hwprivacy_common::preset::preset_dirs();
+        hwprivacy_common::preset::discover(&dirs)
+            .into_iter()
+            .filter_map(|(name, path)| {
+                let p = hwprivacy_common::preset::load(&name, &dirs).ok()?;
+                Some((
+                    p.name,
+                    p.description,
+                    p.apps.len() as u32,
+                    path.display().to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    /// Plan or apply a preset import: (app, outcome_line, was_added).
+    ///
+    /// # Why the daemon and not the client
+    ///
+    /// The daemon owns `config.toml` and rewrites it wholesale, so a client
+    /// writing to it would race the next rule change. More to the point,
+    /// `SetRule` cannot carry an `exe_path` — which is the entire reason
+    /// presets exist.
+    ///
+    /// # Why `apply` is a parameter and not the default
+    ///
+    /// A preset granting camera access to a list of binaries is a GRANT. The
+    /// safe outcome is the one you get by forgetting the flag, so
+    /// `apply = false` plans and writes nothing.
+    async fn import_preset(
+        &self,
+        #[zbus(signal_context)] ctx: SignalContext<'_>,
+        name: &str,
+        apply: bool,
+    ) -> Vec<(String, String, bool)> {
+        let dirs = hwprivacy_common::preset::preset_dirs();
+        let preset = match hwprivacy_common::preset::load(name, &dirs) {
+            Ok(p) => p,
+            Err(e) => return vec![(name.to_string(), format!("error: {e:#}"), false)],
+        };
+
+        let mut state = self.state.write().await;
+        let plan = preset.plan(
+            hwprivacy_common::preset::path_exists,
+            |app| state.config.find_rule(app).is_some(),
+        );
+
+        let report: Vec<(String, String, bool)> = plan
+            .entries
+            .iter()
+            .map(|(app, outcome, _)| (app.clone(), outcome.describe(), outcome.added()))
+            .collect();
+
+        if apply {
+            let added = state.config.apply_preset(&plan);
+            if added > 0 {
+                if let Err(e) = state.config.save() {
+                    tracing::error!("Failed to save config after preset import: {}", e);
+                }
+                info!("Imported preset '{}': {} rule(s) added", name, added);
+                let _ = Self::rule_changed(&ctx, name, "*", "preset-imported").await;
+            } else {
+                info!("Preset '{}' added nothing — every entry was skipped", name);
+            }
+        }
+
+        report
+    }
+
     async fn get_events(&self, last_n: u32) -> Vec<(String, String, String, String)> {
         let state = self.state.read().await;
         state

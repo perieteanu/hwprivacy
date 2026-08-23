@@ -1,3 +1,4 @@
 usr/bin/hwprivacy-daemon
 usr/lib/systemd/user/hwprivacy-daemon.service
 usr/share/dbus-1/services/org.hwprivacy.Daemon.service
+usr/share/hwprivacy/presets/*.toml
