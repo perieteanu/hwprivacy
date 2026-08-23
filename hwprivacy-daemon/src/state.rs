@@ -56,11 +56,12 @@ impl DaemonState {
         app_name: &str,
         pid: u32,
         category: hwprivacy_common::DeviceCategory,
+        instance: Option<&str>,
         node_name: &str,
     ) {
         use hwprivacy_common::stream::AccessAction;
         self.tracker
-            .log_event(app_name, pid, category, node_name, AccessAction::Denied);
+            .log_event(app_name, pid, category, instance, node_name, AccessAction::Denied);
         let now = chrono::Local::now()
             .format("%Y-%m-%d %H:%M:%S")
             .to_string();

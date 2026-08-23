@@ -47,11 +47,15 @@ pub trait HwPrivacy {
     /// Restore to saved rules
     fn unblock_all(&self) -> zbus::Result<bool>;
 
-    /// One-shot allow a pending stream by object serial
-    fn allow_stream(&self, object_serial: u32) -> zbus::Result<bool>;
+    /// One-shot allow a pending stream.
+    ///
+    /// Both arguments are required: a PipeWire node id is reused once its node
+    /// is gone, so the app name is what stops a grant migrating to an unrelated
+    /// stream. `GetActiveStreams` returns both.
+    fn allow_stream(&self, node_id: u32, app_name: &str) -> zbus::Result<bool>;
 
-    /// One-shot deny a pending stream by object serial
-    fn deny_stream(&self, object_serial: u32) -> zbus::Result<bool>;
+    /// One-shot deny a pending stream by node id
+    fn deny_stream(&self, node_id: u32) -> zbus::Result<bool>;
 
     // -- Signals --
 

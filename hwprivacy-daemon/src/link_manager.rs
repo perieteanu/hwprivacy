@@ -29,6 +29,21 @@ pub async fn destroy_link(link_id: u32) -> Result<()> {
     Ok(())
 }
 
+/// Destroy every link in a coalesced group.
+///
+/// Exists because b3's monitor fix coalesces the *prompt* for a sink's
+/// `monitor_FL`/`monitor_FR` pair. Coalescing the prompt must never coalesce
+/// the enforcement: if only the representative link were destroyed, one channel
+/// would keep flowing while the popup said BLOCKED — a worse bug than the
+/// double prompt it replaces.
+pub async fn destroy_links(link_ids: &[u32]) {
+    for id in link_ids {
+        if let Err(e) = destroy_link(*id).await {
+            warn!("Failed to destroy link {}: {}", id, e);
+        }
+    }
+}
+
 /// Destroy all links connected to a specific node (by node ID).
 pub async fn destroy_all_links_to_node(node_id: u32, graph: &super::pipewire_monitor::GraphSnapshot) -> Result<u32> {
     let mut destroyed = 0;

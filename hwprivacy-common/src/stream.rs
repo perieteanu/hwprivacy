@@ -4,8 +4,16 @@ use serde::{Deserialize, Serialize};
 /// Extracted from PipeWire node properties via pw-dump.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamInfo {
-    /// PipeWire object serial (unique ID)
-    pub object_serial: u32,
+    /// The PipeWire **node id** of this stream.
+    ///
+    /// Named `object_serial` until 2026-08-21, which was a lie with
+    /// consequences: PipeWire's `object.serial` is monotonic and never reused,
+    /// while a node id is reused freely once the node is gone. One-shot
+    /// `ask_each` grants are keyed on this value, so under the old name the
+    /// leak in blocker b2 read as a tuning problem instead of a grant landing
+    /// on an unrelated later stream. `pw-dump`'s `object.serial` is not parsed
+    /// here at all — see `pipewire_monitor::NodeInfo`.
+    pub node_id: u32,
     /// Application name from PipeWire (e.g., "Firefox", "telegram-desktop")
     pub app_name: String,
     /// Process ID of the application
@@ -39,8 +47,25 @@ pub struct AccessEvent {
     pub app_name: String,
     pub pid: u32,
     pub device_category: super::DeviceCategory,
+    /// Which instance of the device, when the node presents more than one —
+    /// `mic1`, `mic2`. `None` for the ordinary single-device case.
+    ///
+    /// Its own field rather than being folded into `node_name`: that one is the
+    /// *stream's* node name and answers a different question.
+    #[serde(default)]
+    pub device_instance: Option<String>,
     pub node_name: String,
     pub action: AccessAction,
+}
+
+impl AccessEvent {
+    /// The device as the user should read it: `microphone (mic2)`.
+    pub fn device_display(&self) -> String {
+        match &self.device_instance {
+            Some(i) => format!("{} ({})", self.device_category, i),
+            None => self.device_category.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

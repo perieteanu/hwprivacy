@@ -58,7 +58,19 @@ impl HwPrivacyService {
         };
 
         let mut state = self.state.write().await;
-        state.config.set_rule(app_name, &category, perm);
+
+        // Refuse names that could never match anything rather than writing a
+        // rule that silently does nothing. Three such rules were sitting in the
+        // live config — pasted notification labels ending in "(pid:2332)", and
+        // one empty string (blocker b4).
+        if !state.config.set_rule(app_name, &category, perm) {
+            tracing::warn!(
+                "Rejected rule for {:?}: not a usable rule key. Use the bare app name, \
+                 e.g. 'firefox' — not a pasted notification label.",
+                app_name
+            );
+            return false;
+        }
 
         if let Err(e) = state.config.save() {
             tracing::error!("Failed to save config: {}", e);
@@ -174,7 +186,10 @@ impl HwPrivacyService {
                 (
                     e.timestamp.clone(),
                     e.app_name.clone(),
-                    e.device_category.to_string(),
+                    // device_display(), not device_category: two rows for two
+                    // different microphones were indistinguishable here, which
+                    // is half of what made b3 read as duplicate prompts.
+                    e.device_display(),
                     e.action.to_string(),
                 )
             })
@@ -195,14 +210,20 @@ impl HwPrivacyService {
         true
     }
 
-    async fn allow_stream(&self, object_serial: u32) -> bool {
+    /// Grant a one-shot `ask_each` allow.
+    ///
+    /// Takes the app name as well as the node id, because a node id alone is
+    /// not an identity: PipeWire reuses ids, so a grant keyed on the id only
+    /// can land on an unrelated later stream (blocker b2). The caller already
+    /// has the name — `GetActiveStreams` returns it beside the id.
+    async fn allow_stream(&self, node_id: u32, app_name: &str) -> bool {
         let mut state = self.state.write().await;
-        state.tracker.grant_one_shot(object_serial);
-        info!("One-shot allow granted for stream serial={}", object_serial);
+        state.tracker.grant_one_shot(node_id, app_name);
+        info!("One-shot allow granted: {} on node {}", app_name, node_id);
         true
     }
 
-    async fn deny_stream(&self, _object_serial: u32) -> bool {
+    async fn deny_stream(&self, _node_id: u32) -> bool {
         // Stream is already denied (link was destroyed); this is a no-op confirmation
         true
     }

@@ -125,6 +125,17 @@ decisions:
       - "PipeWire recycles node ids, so an unrelated later stream inherits the grant."
       - "Live evidence: an `ask_each` Firefox mic stream logged ALLOWED with no prompt."
     verdict: "This is a correctness AND security bug, not a tuning issue. Grants must expire when the node disappears."
+    fixed_2026_08_21:
+      what: "Grants are now a HashMap<node_id, normalised app name>, pruned every poll against the live node set."
+      why_the_app_name_is_part_of_the_key: >
+        Pruning alone leaves a race: an id can be freed and reused between two
+        polls. Requiring the app name to match closes the cross-application
+        case, which is the half that matters for security.
+      the_name_that_hid_it: >
+        StreamInfo's field was called object_serial while policy_engine assigned
+        node.id to it. object.serial is monotonic and never reused; a node id is
+        reused freely. Renamed to node_id — this title is now literally correct
+        rather than accidentally so.
 
   - id: d-clients-are-viewers
     date: "2026-03-27"
@@ -171,7 +182,7 @@ decisions:
       Every prompt the user ignored silently became a permanent deny rule. This
       is the primary reason the app 'did not work properly' in daily use — the
       config drifted into decisions the user never made.
-    decision_needed: "Choose the intended dismiss semantics — see ROADMAP.yaml > open_questions q-dismiss-semantics."
+    decision_needed: "RESOLVED 2026-08-21 — see d-dismiss-saves-nothing."
 
   - id: d-posture-unsettled
     date: "2026-08-04"
@@ -188,7 +199,7 @@ decisions:
       ask_by_default:
         pro: "discoverable; the prompt teaches you what is asking"
         con: "prompt fatigue; every unanswered prompt is a decision deferred"
-    status: "MUST BE SETTLED before further work. Costin's 2026-08-04 direction was 'steer the app in the initial full privacy direction', which points at deny-by-default."
+    status: "SETTLED 2026-08-21 — see d-deny-by-default."
 
   - id: d-event-driven-substrate
     date: "2026-08-04"
@@ -338,3 +349,171 @@ decisions:
       and, critically, the stability constraint: the ordinal must come from a
       key that survives a reboot (port NAME, not port id) or a rule silently
       migrates to a different microphone.
+
+  - id: d-deny-by-default
+    date: "2026-08-21"
+    title: "SETTLED: deny by default"
+    supersedes: d-posture-unsettled
+    context: >
+      README claimed "Default policy: deny all" while the shipped config said
+      default_action = "ask", and the code honoured the config. Combined with
+      d-dismiss-defect the effective behaviour was "prompt, then permanently
+      deny whatever you ignored" — the worst of both. Unresolved since
+      2026-08-04.
+    decision: "policy.default_action defaults to `deny`. An app with no rule is denied."
+    consequences:
+      - "The `ask` path still exists and is unchanged. It is now opt-in per rule rather than the fallback for everything unknown."
+      - "A new app breaks with an instant BLOCKED notification that carries NO action buttons; granting means hwprivacy-ctl, the TUI or the GUI."
+      - "Discovery moves to that notification plus the persistent history table. Deny-by-default without a visible denial would be indistinguishable from broken hardware."
+      - "b1's blast radius shrinks: with no `ask` fallback, the rule-writing prompt only fires for rules explicitly set to ask/ask_each."
+      - "Existing configs that name default_action are unaffected. A config that OMITS it flips from ask to deny on upgrade — deliberate, and the direction that fails closed."
+    note_on_what_did_not_change: >
+      `ask` already destroyed the link BEFORE prompting ("security first",
+      main.rs). So `ask` and `deny` were always both fail-closed; the only
+      difference is whether a prompt follows. This decision changes the default,
+      not the enforcement mechanism.
+
+  - id: d-dismiss-saves-nothing
+    date: "2026-08-21"
+    title: "A dismissed prompt writes nothing, cools down, and asks again"
+    supersedes: d-dismiss-defect
+    decision: >
+      Option (a) of q-dismiss-semantics: block this attempt, save no rule, stay
+      quiet for policy.dismiss_cooldown_secs, ask again after it.
+    implementation: >
+      ask_user_permission() returns PromptOutcome — Chosen / Dismissed / Failed
+      — instead of Option<Permission>. notification::decide() maps an outcome to
+      a PromptAction, and SavePermanentRule is reachable ONLY from Chosen.
+    why_a_pure_function_and_not_an_inline_match: >
+      The invariant ("nothing but a button press may be saved") previously lived
+      inside a tokio::spawn where no test could reach it, and it was wrong for
+      months while reading correctly. Same reason denied_opens() was extracted
+      from handle_event() after the C5 accounting bug. If a rule can only be
+      written through one pure function, that function can be tested
+      exhaustively — and it is.
+    third_state_was_not_optional: >
+      The error paths returned Some(Deny) as well, so on a headless session or
+      with no notification daemon EVERY prompt became a permanent deny rule.
+      That is why the enum has three variants and not two: "we could not ask" is
+      a different fact from "the user closed it", even though both must write
+      nothing.
+    regression_guard: >
+      tools/doc-check now carries SENTINELS — source patterns that must not
+      reappear. `perm.or(Some(Permission::Deny))` is the first entry. A fix that
+      outlives the person who remembers why needs a check, not a comment.
+
+  - id: d-policy-fingerprint
+    date: "2026-08-21"
+    title: "The daemon re-pushes kernel policy when the world moves under it"
+    context: >
+      Found by reading the live journals, not the code. On 2026-08-20 dpkg
+      upgraded firefox-esr two minutes after the daemon pushed policy. The path
+      was unchanged, the inode was not, and the kernel map kept the old key —
+      so an allowlisted Firefox was denied the camera for sixteen hours while
+      config.toml said `allow` and hwprivacy-ctl status said "Allowed
+      binaries: 2". It repaired itself at the next reboot, which is exactly why
+      nobody had ever seen it.
+      Reading the code for that surfaced a second, worse one: SetPolicy was sent
+      only at connect time, so a camera rule changed from the CLI, the TUI or
+      the GUI never reached the kernel at all until a restart.
+    decision: >
+      The lsm_client session loop selects over incoming replies and a recheck
+      tick. Each tick fingerprints the INTENDED allowlist — (exe_path, dev, ino)
+      per entry, sorted, plus the enforcement flag — and re-pushes SetPolicy
+      when it differs, naming what moved.
+    why_one_mechanism: "All three staleness modes — binary replaced, rule changed, binary deleted — are changes to the same fingerprint."
+    knob: "policy.exe_recheck_secs, default 30, 0 disables."
+    rejected_alternative_1:
+      what: "inotify on the parent directories"
+      why_rejected: >
+        Near-instant instead of up-to-30s, but needs a new dependency in a
+        security tool, against Debian 13's rustc 1.85. Thirty seconds versus
+        sixteen hours is a 2000x improvement; the remaining gap does not justify
+        the supply chain.
+    rejected_alternative_2:
+      what: "store (dev, ino) in the policy cache instead of paths"
+      why_rejected: "already rejected in Phase 4 for the same reason — an inode cache stops matching Firefox after an update, which is the hardest failure to notice."
+    trap_avoided: >
+      The daemon's (dev, ino) are glibc-encoded and compared ONLY for change
+      detection. Authoritative conversion stays in the helper's
+      PolicyKey::from_path, the single caller of glibc_to_kernel_dev(). The two
+      encodings differ and mixing them yields major 0, matching nothing, while
+      unit tests pass. That has already happened twice here.
+
+  - id: d-executable-is-the-principal
+    date: "2026-08-21"
+    title: "hwprivacy's identity is the executable. It cannot see inside one."
+    context: >
+      Measured 2026-08-21: firefox-esr opened the camera twice in one morning
+      with no video call. Cause: a website held a standing per-origin camera
+      grant and reacquired on tab reload. hwprivacy allowed it correctly — at
+      both layers the question asked was "is this firefox-esr?", and it was.
+      Costin asked whether website-level permission should become a third layer,
+      then ruled it out: the software stays application-agnostic.
+    decision: >
+      State the limit; do not try to close it. Anything that runs many
+      principals inside one executable — a browser's tabs, an interpreter's
+      scripts, a shell's children — is ONE principal to hwprivacy.
+    evidence_that_it_is_not_a_browser_problem: >
+      /usr/bin/python3.13 appears in the live history table with 18 camera
+      denials. The interpreter is the principal; the script is invisible. Same
+      shape, no browser involved.
+    why_not_a_third_layer: >
+      Origin identity exists only inside the browser. A "website layer" could
+      not enforce alongside the other two — it would be a DELEGATION layer,
+      writing policy files that ask the browser to constrain itself, where the
+      enforcer and the constrained party are the same program. That is strictly
+      weaker than both existing layers, and shipping it as "layer 3" would be
+      the kind of overclaim this project has spent days removing from its docs.
+    also_rejected: >
+      Reading browser permission stores (Firefox permissions.sqlite, Chrome
+      Preferences) even read-only. It is per-application coupling to a schema
+      nobody owes us stability on — exactly what d-pipewire-graph-level rejected
+      in the first place.
+    what_is_done_instead: "notify on ALLOWED opens, so a silent grant is at least visible. See ROADMAP > next_up > notify-on-allow."
+
+  - id: d-coalesce-by-category
+    date: "2026-08-21"
+    title: "Two links are duplicates or not depending on the CATEGORY"
+    refines: d-per-microphone-identity
+    context: >
+      d-per-microphone-identity (2026-08-19) ruled that b3's two prompts are two
+      physical microphones and must NOT be coalesced. That is right, and it was
+      applied as if it were a statement about links in general. Reading the live
+      graph on 2026-08-21 showed it is a statement about MICROPHONES:
+        node=46 Audio/Source  capture_FL(64) capture_FR(65)
+        node=36 Audio/Sink    monitor_FL(61) monitor_FR(63)
+      Both look identical in the link diff. They are not the same thing.
+    decision:
+      microphone: >
+        One prompt per port. Two physical microphones, separately gateable —
+        measured 2026-08-19, cutting one channel took its rms to 0.0 while the
+        other kept recording. Labelled mic1..micN.
+      monitor: >
+        Coalesce by (device, app). A sink's monitor_FL/monitor_FR are two
+        CHANNELS of one playback device; recording what the speakers play is one
+        act against one device. Seen live 2026-08-21: two identical
+        "OBS -> Monitor -> ALLOWED" rows in the same second.
+      camera: "unchanged — one link."
+    the_asymmetry_is_the_point: >
+      The test for "are these duplicates" is not "do the links look alike", it
+      is "can the user meaningfully answer differently for each". For two
+      microphones, yes. For two channels of one speaker pair, no.
+    invariant: >
+      Coalescing the PROMPT must never coalesce the ENFORCEMENT. LinkGroup
+      carries every link id and destroy_links() tears down all of them. Had it
+      destroyed only the representative, one channel would keep flowing while
+      the popup said BLOCKED — worse than the defect it replaces. There is a
+      test proven to fail against exactly that mistake.
+    ordinal_stability: >
+      Ordinals come from the port NAME, sorted. Port ids are allocated per
+      session; names persist. Sorting by id would silently move "mic2" to the
+      other microphone after a reboot.
+    a_test_that_proved_nothing: >
+      The first version of the direction-filter test used this laptop's sink,
+      where the in-ports are playback_* and the out-ports are monitor_*. Since
+      "monitor" sorts before "playback", mixing the two populations produced the
+      right ordinals anyway and the test passed with the filter REMOVED. Caught
+      by running it against the reintroduced defect, which is the entire reason
+      that discipline exists. Rewritten with an in-port that sorts first.
+    scope: "Labelling only. Rules remain per CATEGORY; per-device rules stay deferred."

@@ -12,7 +12,7 @@ mod stream_tracker;
 use clap::{Parser, Subcommand};
 use dbus_service::{HwPrivacyService, SharedState};
 use hwprivacy_common::stream::AccessAction;
-use hwprivacy_common::{Config, Permission};
+use hwprivacy_common::{Config, DeviceCategory, Permission};
 use policy_engine::PolicyDecision;
 use state::DaemonState;
 use std::collections::HashSet;
@@ -168,6 +168,160 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// One decision's worth of links.
+///
+/// Usually one link. For a playback monitor it is the sink's whole channel set
+/// — see [`group_links`].
+struct LinkGroup {
+    link_ids: Vec<u32>,
+    m: policy_engine::LinkMatch,
+}
+
+/// Collapse the links that represent ONE act of access, per category.
+///
+/// This is blocker b3, and the two categories need opposite treatment:
+///
+/// * **Microphone** — a stereo capture device is two PHYSICAL microphones,
+///   exposed as `capture_FL` and `capture_FR`. Two prompts are correct, and
+///   coalescing would destroy the only handle on which one is being asked for.
+///   Measured 2026-08-19: cutting one channel mid-capture took its rms to 0.0
+///   while the other kept recording. They are separately gateable, so they are
+///   separately askable. Left alone here; `LinkMatch::instance` labels them.
+///
+/// * **Monitor** — a sink's `monitor_FL` and `monitor_FR` are two CHANNELS of
+///   one playback device. Recording what the speakers are playing is one act
+///   against one device, so two prompts are genuinely duplicates. Seen live on
+///   2026-08-21: two identical `OBS → Monitor → ALLOWED` rows in the same
+///   second. Grouped by (device, app).
+///
+/// * **Camera** — one link. Untouched.
+///
+/// The group carries EVERY link id, not just the representative. Callers must
+/// enforce on all of them; collapsing the prompt must never collapse the
+/// teardown, or one channel keeps flowing while the popup says BLOCKED.
+fn group_links(matches: Vec<(u32, policy_engine::LinkMatch)>) -> Vec<LinkGroup> {
+    let mut groups: Vec<LinkGroup> = Vec::new();
+
+    for (link_id, m) in matches {
+        let coalesce = m.device.category == DeviceCategory::Monitor;
+        let existing = coalesce.then(|| {
+            groups.iter_mut().find(|g| {
+                g.m.device.category == DeviceCategory::Monitor
+                    && g.m.device.node_name == m.device.node_name
+                    && g.m.stream.node_id == m.stream.node_id
+            })
+        });
+
+        match existing.flatten() {
+            Some(g) => g.link_ids.push(link_id),
+            None => groups.push(LinkGroup {
+                link_ids: vec![link_id],
+                m,
+            }),
+        }
+    }
+
+    groups
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+    use hwprivacy_common::device::ProtectedDevice;
+    use hwprivacy_common::stream::StreamInfo;
+
+    fn m(category: DeviceCategory, device_node: &str, app_node_id: u32, instance: Option<&str>)
+        -> policy_engine::LinkMatch
+    {
+        policy_engine::LinkMatch {
+            stream: StreamInfo {
+                node_id: app_node_id,
+                app_name: "OBS".into(),
+                pid: 2201,
+                node_name: "app".into(),
+                media_name: String::new(),
+                media_class: "Stream/Input/Audio".into(),
+            },
+            device: ProtectedDevice {
+                category,
+                node_name: device_node.into(),
+                description: String::new(),
+                object_serial: 0,
+                guarded: true,
+            },
+            instance: instance.map(str::to_string),
+        }
+    }
+
+    /// Seen live 2026-08-21, twice in the same second:
+    ///   09:00:27  OBS [pipewire-pulse] → Monitor → ALLOWED
+    ///   09:00:27  OBS [pipewire-pulse] → Monitor → ALLOWED
+    /// One sink, one app, one act of recording — one prompt.
+    #[test]
+    fn a_sinks_two_monitor_channels_become_one_decision() {
+        let groups = group_links(vec![
+            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
+            (101, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
+        ]);
+        assert_eq!(groups.len(), 1, "one prompt, not two");
+    }
+
+    /// **The trap.** Coalescing the prompt must not coalesce the teardown. If
+    /// the group forgot a link id, that channel would keep flowing while the
+    /// popup said BLOCKED — worse than the double prompt it replaces.
+    #[test]
+    fn a_coalesced_group_still_carries_every_link_to_destroy() {
+        let groups = group_links(vec![
+            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
+            (101, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
+        ]);
+        assert_eq!(groups[0].link_ids, vec![100, 101]);
+    }
+
+    /// b3 proper: two microphones are two decisions. Coalescing here would
+    /// destroy the only handle on which mic is being requested.
+    #[test]
+    fn two_microphones_stay_two_decisions() {
+        let groups = group_links(vec![
+            (100, m(DeviceCategory::Microphone, "alsa_input.analog", 99, Some("mic1"))),
+            (101, m(DeviceCategory::Microphone, "alsa_input.analog", 99, Some("mic2"))),
+        ]);
+        assert_eq!(groups.len(), 2, "one prompt per microphone");
+        assert_eq!(groups[0].m.instance.as_deref(), Some("mic1"));
+        assert_eq!(groups[1].m.instance.as_deref(), Some("mic2"));
+    }
+
+    /// Two different apps tapping the same sink are two separate decisions —
+    /// grouping is per (device, app), never per device alone.
+    #[test]
+    fn two_apps_tapping_one_sink_are_not_merged() {
+        let groups = group_links(vec![
+            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
+            (101, m(DeviceCategory::Monitor, "alsa_output.analog", 77, None)),
+        ]);
+        assert_eq!(groups.len(), 2);
+    }
+
+    /// One app tapping two different sinks (analog and HDMI) is two decisions.
+    #[test]
+    fn one_app_tapping_two_sinks_is_not_merged() {
+        let groups = group_links(vec![
+            (100, m(DeviceCategory::Monitor, "alsa_output.analog", 99, None)),
+            (101, m(DeviceCategory::Monitor, "alsa_output.hdmi", 99, None)),
+        ]);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn a_camera_link_is_its_own_group() {
+        let groups = group_links(vec![
+            (100, m(DeviceCategory::Camera, "v4l2_input.cam", 99, None)),
+        ]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].link_ids, vec![100]);
+    }
+}
+
 /// Main monitoring loop: poll PipeWire graph, detect new links, enforce policy.
 async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
     let interval = tokio::time::Duration::from_millis(poll_interval_ms);
@@ -242,22 +396,36 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
             s.known_link_ids = snapshot.links.iter().map(|l| l.link_id).collect();
         }
 
-        // Process each new link
-        for link in &new_links {
+        // Classify every new link, then group them (see group_links). One
+        // group = one decision, one prompt, but ALL of its links get enforced.
+        let matches: Vec<(u32, policy_engine::LinkMatch)> = {
             let s = state.read().await;
+            new_links
+                .iter()
+                .filter_map(|link| {
+                    policy_engine::classify_link(
+                        link.output_node,
+                        link.output_port,
+                        link.input_node,
+                        link.input_port,
+                        &snapshot.nodes,
+                        &snapshot.ports,
+                        &s.devices,
+                    )
+                    .map(|m| (link.link_id, m))
+                })
+                .collect()
+        };
 
-            // Check if this link involves a protected device
-            let classification = policy_engine::classify_link(
-                link.output_node,
-                link.input_node,
-                &snapshot.nodes,
-                &s.devices,
-            );
-
-            let (stream, device) = match classification {
-                Some((s, d)) => (s, d),
-                None => continue, // Not a protected device link
-            };
+        for group in group_links(matches) {
+            let s = state.read().await;
+            let LinkGroup {
+                ref link_ids,
+                ref m,
+            } = group;
+            let stream = &m.stream;
+            let device = &m.device;
+            let instance = m.instance.as_deref();
 
             // Skip if device category is not guarded
             if !s.config.devices.is_guarded(&device.category) {
@@ -267,22 +435,23 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
             // Check block-all mode
             if s.block_all {
                 drop(s);
-                if let Err(e) = link_manager::destroy_link(link.link_id).await {
-                    warn!("Failed to destroy link in block-all mode: {}", e);
-                }
+                link_manager::destroy_links(link_ids).await;
                 let mut s = state.write().await;
                 s.log_denied(
                     &stream.app_name,
                     stream.pid,
                     device.category,
+                    instance,
                     &stream.node_name,
                 );
                 continue;
             }
 
             // Evaluate policy
-            let is_one_shot = s.tracker.is_one_shot_allowed(stream.object_serial);
-            let decision = policy_engine::evaluate(&s.config, &stream, &device, is_one_shot);
+            let is_one_shot = s
+                .tracker
+                .is_one_shot_allowed(stream.node_id, &stream.app_name);
+            let decision = policy_engine::evaluate(&s.config, stream, device, is_one_shot);
 
             // Act on decision
             match decision {
@@ -290,21 +459,26 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     drop(s);
                     let mut s = state.write().await;
                     let perm = s.config.get_permission(&stream.app_name, &device.category);
-                    s.tracker.add_connection(
-                        link.link_id,
-                        stream.clone(),
-                        &device.node_name,
-                        device.category,
-                        perm,
-                    );
+                    // Every link in the group is tracked — the group exists to
+                    // collapse the PROMPT, not the bookkeeping.
+                    for lid in link_ids {
+                        s.tracker.add_connection(
+                            *lid,
+                            stream.clone(),
+                            &device.node_name,
+                            device.category,
+                            perm,
+                        );
+                    }
                     if perm == Permission::WhileInUse {
                         s.tracker
-                            .track_while_in_use(&stream.app_name, stream.object_serial);
+                            .track_while_in_use(&stream.app_name, stream.node_id);
                     }
                     s.tracker.log_event(
                         &stream.app_name,
                         stream.pid,
                         device.category,
+                        instance,
                         &stream.node_name,
                         AccessAction::Allowed,
                     );
@@ -315,17 +489,16 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     let pid = stream.pid;
                     let cat = device.category;
                     let node = stream.node_name.clone();
+                    let inst = m.instance.clone();
 
                     drop(s);
-                    if let Err(e) = link_manager::destroy_link(link.link_id).await {
-                        warn!("Failed to destroy denied link: {}", e);
-                    }
+                    link_manager::destroy_links(link_ids).await;
                     let mut s = state.write().await;
-                    s.log_denied(&app, pid, cat, &node);
+                    s.log_denied(&app, pid, cat, inst.as_deref(), &node);
                     drop(s);
 
                     // Instant notification — rule already says deny
-                    notification::notify_blocked(&app, pid, cat, &node).await;
+                    notification::notify_blocked(&app, pid, cat, inst.as_deref(), &node).await;
                 }
 
                 PolicyDecision::AskUser | PolicyDecision::AskEachStream => {
@@ -334,20 +507,21 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     let pid = stream.pid;
                     let cat = device.category;
                     let node = stream.node_name.clone();
-                    let serial = stream.object_serial;
-                    let lid = link.link_id;
+                    let node_id = stream.node_id;
+                    let inst = m.instance.clone();
 
-                    // 1. Destroy link immediately (security first)
+                    // 1. Destroy the links immediately (security first).
+                    //    ALL of them: coalescing the prompt must not leave a
+                    //    channel flowing while the popup says BLOCKED.
                     drop(s);
-                    if let Err(e) = link_manager::destroy_link(lid).await {
-                        warn!("Failed to destroy link while asking: {}", e);
-                    }
+                    link_manager::destroy_links(link_ids).await;
 
                     // 2. Check cooldown — if user recently dismissed the same
                     //    prompt, silently block without notification spam
                     let in_cooldown = {
                         let s = state.read().await;
-                        s.tracker.is_in_cooldown(&app, cat)
+                        let secs = s.config.policy.dismiss_cooldown_secs;
+                        s.tracker.is_in_cooldown(&app, cat, secs)
                     };
 
                     {
@@ -357,9 +531,12 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                             // blocked_count itself for a Denied action
                             // (stream_tracker.rs). An extra += 1 here counted
                             // every cooldown-suppressed block twice.
-                            s.log_denied(&app, pid, cat, &node);
+                            s.log_denied(&app, pid, cat, inst.as_deref(), &node);
                         } else {
-                            s.tracker.log_event(&app, pid, cat, &node, AccessAction::AskedUser);
+                            s.tracker.log_event(
+                                &app, pid, cat, inst.as_deref(), &node,
+                                AccessAction::AskedUser,
+                            );
                         }
                     }
 
@@ -369,48 +546,61 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     }
 
                     // 3. Stage 1: instant BLOCKED notification (fire-and-forget)
-                    notification::notify_blocked(&app, pid, cat, &node).await;
+                    notification::notify_blocked(&app, pid, cat, inst.as_deref(), &node).await;
 
                     // 4. Stage 2: action notification for rule setting (async)
                     let notify_state = state.clone();
                     tokio::spawn(async move {
                         let response = notification::ask_user_permission(
-                            &app, pid, cat, &node, is_per_stream,
+                            &app, pid, cat, inst.as_deref(), &node, is_per_stream,
                         )
                         .await;
 
+                        if let notification::PromptOutcome::Failed(e) = &response {
+                            warn!(
+                                "Could not prompt for {} → {:?} ({}). Access stayed blocked \
+                                 and NO rule was saved.",
+                                app, cat, e
+                            );
+                        }
+
                         let mut s = notify_state.write().await;
-                        match response {
-                            Some(perm) => {
-                                // User made a choice — save rule
-                                if is_per_stream {
-                                    if perm == Permission::Allow {
-                                        s.tracker.grant_one_shot(serial);
-                                        s.tracker.log_event(
-                                            &app, pid, cat, &node,
-                                            AccessAction::StreamAllowed,
-                                        );
-                                    } else {
-                                        s.tracker.log_event(
-                                            &app, pid, cat, &node,
-                                            AccessAction::StreamDenied,
-                                        );
-                                    }
-                                } else {
-                                    s.config.set_rule(&app, &cat, perm);
+                        match notification::decide(&response, is_per_stream) {
+                            notification::PromptAction::GrantThisStream => {
+                                s.tracker.grant_one_shot(node_id, &app);
+                                s.tracker.log_event(
+                                    &app, pid, cat, inst.as_deref(), &node,
+                                    AccessAction::StreamAllowed,
+                                );
+                            }
+                            notification::PromptAction::DenyThisStream => {
+                                s.tracker.log_event(
+                                    &app, pid, cat, inst.as_deref(), &node,
+                                    AccessAction::StreamDenied,
+                                );
+                            }
+                            notification::PromptAction::SavePermanentRule(perm) => {
+                                if s.config.set_rule(&app, &cat, perm) {
                                     if let Err(e) = s.config.save() {
                                         error!("Failed to save config after user decision: {}", e);
                                     }
                                     info!("User set rule: {} → {:?} = {}", app, cat, perm);
+                                } else {
+                                    // set_rule refuses names that could never
+                                    // match. Saying so beats writing a rule
+                                    // that silently does nothing — blocker b4.
+                                    warn!(
+                                        "Refused to save a rule for {:?} → {:?}: the name \
+                                         cannot become a usable rule key",
+                                        app, cat
+                                    );
                                 }
                             }
-                            None => {
-                                // User dismissed — no rule saved, start cooldown
-                                // to prevent notification spam for 60s.
-                                // Access stays blocked, will ask again after cooldown.
+                            notification::PromptAction::SaveNothingAndCooldown => {
+                                let secs = s.config.policy.dismiss_cooldown_secs;
                                 info!(
-                                    "Notification dismissed for {} → {:?}, cooldown 60s",
-                                    app, cat
+                                    "No answer for {} → {:?}; nothing saved, quiet for {}s",
+                                    app, cat, secs
                                 );
                                 s.tracker.record_dismiss(&app, cat);
                             }
@@ -420,10 +610,14 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
             }
         }
 
-        // Clean up: remove connections for links that no longer exist
+        // Clean up: drop connections for links that no longer exist, and
+        // one-shot grants whose stream node is gone. The grants MUST expire
+        // here — PipeWire reuses node ids, so a grant that outlives its node
+        // eventually authorises somebody else (blocker b2).
         {
             let current_link_ids: HashSet<u32> =
                 snapshot.links.iter().map(|l| l.link_id).collect();
+            let current_node_ids: HashSet<u32> = snapshot.nodes.keys().copied().collect();
             let mut s = state.write().await;
             let stale: Vec<u32> = s
                 .tracker
@@ -435,6 +629,7 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
             for lid in stale {
                 s.tracker.remove_connection(lid);
             }
+            s.tracker.prune_one_shot(&current_node_ids);
         }
     }
 }

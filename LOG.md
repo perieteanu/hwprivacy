@@ -125,3 +125,21 @@
 19-08-2026 22:36 | Wed | hw | [note] mic was MUTED for every microphone test tonight until 22:32; link-level results unaffected
 19-08-2026 22:40 | Wed | hw | [decide] naming for indistinguishable devices: mic1..micN, cam1..camN — never left/right — unless the device publishes a name
 19-08-2026 22:41 | Wed | hw | [note] ordinals must derive from a REBOOT-STABLE key (port name, not port id) or a rule silently moves to another device
+23-08-2026 11:00 | Sun | hw | [note] READ THE LOGS: firefox-esr denied the camera 16h on 08-20 — dpkg upgraded it 2min after the policy push, kernel map kept the old inode
+23-08-2026 11:05 | Sun | hw | [note] every status surface said healthy throughout: config said allow, ctl said "Allowed binaries: 2". Self-healed at reboot, which is why it was never seen
+23-08-2026 11:20 | Sun | hw | [note] found while fixing it: SetPolicy only ever sent at connect — camera rule changes from ctl/tui/gui never reached the kernel at all
+23-08-2026 11:25 | Sun | hw | [note] StreamInfo.object_serial actually held node.id — serials are never reused, node ids are. The name is why b2 read as a tuning issue
+23-08-2026 12:10 | Sun | hw | [fix] PolicyFingerprint: daemon re-stats the allowlist every exe_recheck_secs and re-pushes on change. One mechanism, all three staleness modes
+23-08-2026 12:40 | Sun | hw | [fix] b1 — PromptOutcome Chosen/Dismissed/Failed; only a button press can reach SavePermanentRule. Decision extracted to a pure, testable fn
+23-08-2026 12:45 | Sun | hw | [note] b1 had a second half nobody had recorded: a FAILED notification also wrote a permanent deny. Headless = every prompt becomes deny
+23-08-2026 13:00 | Sun | hw | [fix] b2 — one-shot grants keyed on (node_id, app) and pruned each poll; b4 — sanitize_rule_name() refuses names that can never match
+23-08-2026 13:10 | Sun | hw | [decide] posture SETTLED: deny-by-default. Dismiss = block, save nothing, cooldown, ask again
+23-08-2026 13:20 | Sun | hw | [add] doc-check SENTINELS — source patterns that must never reappear. First two: the b1 expression and the b2 Vec<u32>
+23-08-2026 13:25 | Sun | hw | [note] found a test that had never run: #[test] was stacked twice on the fn above it, leaving the next one dead. Compiled, read as covered
+23-08-2026 15:40 | Sun | hw | [decide] b3 splits by CATEGORY — mics get one labelled prompt each (mic1/mic2), a sink's channel links get coalesced into one
+23-08-2026 15:45 | Sun | hw | [note] the test is not "do the links look alike" but "can the user meaningfully answer differently for each". Two mics yes, two channels of one sink no
+23-08-2026 16:00 | Sun | hw | [add] classify_link() has tests for the first time since 2026-03-27 — 14, incl. that ordinary playback is NOT a monitor tap
+23-08-2026 16:05 | Sun | hw | [note] one of those tests proved nothing at first: on this laptop monitor_* sorts before playback_*, so it passed with the direction filter REMOVED
+23-08-2026 16:10 | Sun | hw | [note] LIVE: parecord mic -> two rows "microphone (mic1)" / "(mic2)"; monitor tap -> ONE row. b3 verified end to end
+23-08-2026 16:20 | Sun | hw | [note] NEW b6 found while verifying b1: Hint::Resident(true) beats timeout(60000) — the prompt never expires, so the cooldown never starts
+23-08-2026 16:22 | Sun | hw | [note] b1's fix holds (config byte-identical, no rule written) but "ask again later" does not happen — the first ask never ends. Not fixed, needs a decision

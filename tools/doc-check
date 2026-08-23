@@ -193,7 +193,7 @@ ok(f"project-shape LOC claims within tolerance of {N_LOC}")
 # same file gets flagged and the gate becomes noise.
 ANCHORS = {
     "hwprivacy-daemon/src/notification.rs":
-        ("perm.or(Some(Permission::Deny))", "perm.or("),
+        ("pub fn decide", "decide("),
     "hwprivacy-daemon/src/stream_tracker.rs":
         ("pub fn grant_one_shot", "grant_one_shot"),
 }
@@ -242,6 +242,37 @@ for rel in DOCS:
                  f"cites {src}:{num} but the file has only "
                  f"{len(body.splitlines())} lines")
 ok("cited source lines match their anchors and are in range")
+
+# ══════════════════════════════════════════════════════════════════
+# 5b. Regression sentinels.  Source patterns that MUST NOT come back.
+#     Every entry here is a defect that shipped, was diagnosed, and cost real
+#     time — the point is that the fix outlives whoever remembers why.
+#     Add one only after a bug has actually occurred, never speculatively.
+# ══════════════════════════════════════════════════════════════════
+SENTINELS = [
+    ("perm.or(Some(Permission::Deny))",
+     "b1: this collapsed 'dismissed' into a permanent deny rule. Dismissal must "
+     "stay distinguishable — see notification::PromptOutcome."),
+    ("one_shot_allowed: Vec<u32>",
+     "b2: grants keyed on a bare node id leak onto later streams, because "
+     "PipeWire reuses node ids. Key on (node_id, app) and prune."),
+]
+_sentinel_hits = 0
+for dirpath, dirnames, filenames in os.walk(ROOT):
+    dirnames[:] = [d for d in dirnames if d not in ("target", ".git")]
+    for f in filenames:
+        if not f.endswith(".rs"):
+            continue
+        rel = os.path.relpath(os.path.join(dirpath, f), ROOT)
+        body = read(rel)
+        if body is None:
+            continue
+        for token, why in SENTINELS:
+            if token in body:
+                _sentinel_hits += 1
+                fail("regression", rel, f"{token!r} is back. {why}")
+if _sentinel_hits == 0:
+    ok(f"no fixed defect has reappeared ({len(SENTINELS)} sentinels)")
 
 # ══════════════════════════════════════════════════════════════════
 # 6. Both layers described.  OCCURRED: ARCHITECTURE.yaml and README described

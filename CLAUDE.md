@@ -5,11 +5,11 @@ Android-style hardware permission manager for the Linux desktop. Gates native
 **playback monitor** across **two enforcement layers**: the PipeWire graph, and
 an eBPF LSM in the kernel.
 
-Rust workspace, **7 crates, 7817 LOC** (7562 Rust + 255 lines of BPF C;
-generated `vmlinux.h` excluded). Debian 13 / PipeWire / KDE + GNOME.
+Rust workspace, **7 crates, 8814 LOC** (BPF C included; generated `vmlinux.h`
+excluded). Debian 13 / PipeWire / KDE + GNOME.
 Registered in project-tracker as `hwprivacy`, short name `hw`.
 
-Verified against the filesystem and the live daemon on **2026-08-19**.
+Verified against the filesystem and the live daemon on **2026-08-21**.
 Run `make doc-check` before trusting any number in this file.
 
 ---
@@ -64,18 +64,17 @@ not merely legacy. Detail: `DECISIONS.yaml > d-kernel-lsm-layer` and
 
 **Layer 1 is feature-complete and has been running continuously.** Costin
 reopened the project on 2026-08-04 not remembering that, and reported it
-"didn't work properly". Both are true: all five planned phases exist and build
-clean, but four behavioural defects made daily use unpredictable — `ROADMAP.yaml >
-blockers` (b1–b4), **all still unfixed**. The headline one: **dismissing a
-notification writes a permanent `deny` rule** — [`notification.rs:196`](hwprivacy-daemon/src/notification.rs#L196),
-`perm.or(Some(Permission::Deny))`, which makes the `None` arm at
-[`main.rs:404`](hwprivacy-daemon/src/main.rs#L404) dead code. Months of ignored
-popups became policy the user never chose.
+"didn't work properly". Both are true: all five planned phases existed and built
+clean, but four behavioural defects made daily use unpredictable —
+`ROADMAP.yaml > blockers` (b1–b4). **all four were fixed on
+2026-08-21.**
 
-**Nothing is enforced at the kernel layer at rest.** `hwprivacy-lsm` has no
-systemd unit (Phase 4, not started), the BPF program is never pinned, and
-killing the helper detaches it and restores normal access. It only runs when a
-test starts it, by hand, as root.
+**The kernel layer runs at boot.** `hwprivacy-lsm.service` is installed,
+enabled, and starts before the user daemon, enforcing from
+`/var/lib/hwprivacy/policy`. The BPF program is still **never pinned**, so
+stopping the service detaches it and restores normal access. Docs written before
+2026-08-20 say the helper is started by hand — they are wrong, and `doc-check`
+cannot catch that because it only reads files.
 
 ---
 
@@ -94,20 +93,23 @@ still lands on it.
 
 ## Docs vs code — where README lies
 
-README is the best single overview *of layer 1* but predates both the defects
-and the pivot. It is **wrong** about:
+README was realigned on 2026-08-19 and now leads with both layers, so the older
+warning here ("zero mentions of the kernel") is itself retired. What it is
+**still** wrong or silent about:
 
-- **The whole kernel layer.** Zero mentions. It describes ~half the codebase.
-- "Dismiss = no rule saved + 60s cooldown" → dismiss writes a permanent deny.
 - D-Bus signals `AccessAttempt` / `StreamEvent` documented as API → declared but
   **never emitted**. (`RuleChanged` *is* emitted.) Frontends poll (TUI 1s, GUI 2s).
-- "Default policy: **deny all**" (line 5) → the live config ships
-  `default_action = "ask"`, and README's own example at line 382 says `"ask"`.
-  It contradicts itself. Unresolved; see `d-posture-unsettled`.
-- Known Limitations omits three real holes: links existing at daemon start are
-  never evaluated, `BlockAll` does not stop anything already recording, and
+- Posture: README carries a note saying the default is `ask`. Since 2026-08-21
+  the code default is **deny** (`d-deny-by-default`). The note and the example
+  config both need updating.
+- Known Limitations omits four real holes: links existing at daemon start are
+  never evaluated, `BlockAll` does not stop anything already recording,
   **kernel enforcement cannot revoke an already-open fd** — the hook is on
-  `open()`, not on read. Costin saw live camera video with enforcement on.
+  `open()`, not on read — and **the executable is the principal**, so allowing
+  `firefox` allows every website that ever obtained a per-origin grant
+  (`d-executable-is-the-principal`, measured live 2026-08-21).
+- It describes `hwprivacy-lsm` as run by hand. It has been a boot-time systemd
+  service since 2026-08-20.
 
 Per the global rule: **once a project has code, verify a doc claim against the
 filesystem or the running host, never against another document.** This project
@@ -127,7 +129,7 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 - Daemon runs from **`~/.local/bin/hwprivacy-daemon`** (since 2026-08-04; it
   used to run out of `target/release/`, where a rebuild swapped the binary
   underneath the live service). **Four of the five binaries are installed
-  there** — `hwprivacy-lsm` is not, it runs by hand as root.
+  there**; `hwprivacy-lsm` lives in **`/usr/bin`** and is started by systemd.
   **After rebuilding you must re-install for it to take effect:**
   `install -m 0755 target/release/hwprivacy-{daemon,ctl,tui,gui} ~/.local/bin/`
   then `systemctl --user restart hwprivacy`.
@@ -136,9 +138,11 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 - Config: `~/.config/hwprivacy/config.toml`. The daemon **rewrites the whole
   file** on any rule change — comments and hand-formatting are destroyed.
   Stop the daemon before hand-editing.
-- Measured idle cost of layer 1: `pw-dump` (272 KB JSON) twice a second →
-  **~1.2–1.5% of a core** (15 CPU ticks over 10s, sampled 2026-08-19),
-  **15.5 MB RSS**. Costin has explicitly rejected this price.
+- Measured idle cost of layer 1: `pw-dump` (272 KB JSON) twice a second.
+  **1.24% of a core on 2026-08-04; 2.93% on 2026-08-21** (same method —
+  cgroup CPU ÷ uptime; 3.03% over the full 16h session of 08-20). Costin
+  rejected 1.2% as "very generous"; the regression is undiagnosed.
+  The kernel helper over the same window: **0.04%**.
 - Measured cost of layer 2: **+13.75 ns per `open()`**, 95% CI `[+7.3, +20.2]`
   — 1.88% of a 733 ns `open()`, and **0% at idle**.
 
@@ -148,9 +152,9 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 
 ```bash
 cargo build --release --workspace       # or: make build
-cargo check --workspace                 # 8 warnings, 0 errors
+cargo check --workspace                 # 5 warnings, 0 errors
 cargo clippy                            # NOT AVAILABLE — no such command on this toolchain
-cargo test --workspace                  # 78 tests, all pass
+cargo test --workspace                  # 120 tests, all pass
 ```
 
 Binaries (5): `hwprivacy-daemon` (layer 1 enforcer + policy owner),
@@ -160,13 +164,18 @@ are pure D-Bus viewers with no authority.
 
 Test coverage is **not** evenly spread:
 
-| crate | LOC | tests |
-|---|---|---|
-| hwprivacy-lsm | 2872 | 48 |
-| hwprivacy-daemon | 2603 | 15 |
-| hwprivacy-common | 705 | 9 |
-| hwprivacy-proto | 271 | 6 |
-| hwprivacy-ctl / -tui / -gui | 1366 | 0 |
+| crate | tests |
+|---|---|
+| hwprivacy-lsm | 49 |
+| hwprivacy-daemon | 50 |
+| hwprivacy-common | 15 |
+| hwprivacy-proto | 6 |
+| hwprivacy-ctl / -tui / -gui | 0 |
+
+`classify_link()` was covered on 2026-08-21 — 14 tests, including the one that
+had never existed: that ordinary playback into a sink is **not** classified as a
+monitor tap. `parse_node()`/`parse_link()` against real pw-dump JSON, and the
+three frontends, remain uncovered.
 
 **`cargo test` does not refresh `target/debug/hwprivacy-lsm`** — it builds a
 separate `cfg(test)` harness. 30 passing tests once said nothing about the
@@ -176,11 +185,11 @@ binary being executed. Test scripts must `cargo build` themselves.
 
 ## Current direction (`d-kernel-lsm-layer`)
 
-**The kernel layer is the direction.** Phases 1–3 have landed; Phase 3 scored
-11/13. Open: **C5** (burst counting — the test as written cannot verify it) and
-**D1** (unresolved, two untested hypotheses). Both are spelled out in
-`HANDOFF.md`. Then **Phase 4** (systemd unit for the helper) and **Phase 5**
-(audio backstop) — neither started.
+**The kernel layer is the direction.** Phases 1–4 have landed. Phase 3 closed
+13/13 (C5 and D1 both resolved 2026-08-19). Phase 4's systemd unit is installed
+and boot-verified. **Phase 5** (audio backstop) has not started — note its
+shape: you cannot simply deny major 116, because that denies `/usr/bin/pipewire`,
+which is every application's microphone path.
 
 `d-event-driven-substrate` (replace `pw-dump` polling with `pipewire-rs`) is
 **deferred and applies to layer 1 only**. It is not the current direction; it
@@ -191,8 +200,9 @@ Do **not** "fix" layer 1's CPU by raising `poll_interval_ms`. It is already a
 config knob and needs no code, but it buys CPU by widening the race window —
 the wrong trade for a security tool.
 
-Ordering for layer 1, when it is picked back up: settle the deny-vs-ask posture
-→ fix blockers b1–b4 → cover `classify_link()` → only then touch the substrate.
+Layer-1 ordering, updated 2026-08-21: posture is **settled (deny)**, b1–b4 are
+**all fixed**, and `classify_link()` is covered. What remains: notify-on-allow →
+presets → README/MISSION for publication → only then touch the substrate.
 
 ---
 
@@ -206,13 +216,24 @@ Ordering for layer 1, when it is picked back up: settle the deny-vs-ask posture
 - **MSRV is whatever Debian 13 ships (rustc 1.85.0).** `notify-rust` is pinned
   to `=4.11.3` for this reason. Do not bump pinned crates or adopt newer
   language features without checking Debian.
-- **`classify_link()` holds the entire layer-1 security decision and has zero
-  tests.** It is a pure function in `policy_engine.rs`, untouched since
-  2026-03-27. Any layer-1 test work starts there. (`normalize_app_name()` *is*
-  covered — 4 assertions in `config.rs`.)
-- **Write rules as the bare lowercase app name** (`firefox`, `obs`). Never with
-  `(pid:N)` — normalization does not strip it and the rule is dead on arrival.
-  **Three such dead rules exist in the live config right now.**
+- **Two prompts are not always a bug — it depends on the category.** Two mic
+  links are two physical microphones and get one prompt each, labelled
+  `mic1`/`mic2`. Two monitor links are two channels of one sink and get a
+  single coalesced prompt. Applying either rule to the other category is what
+  made b3 look unfixable. See `d-per-microphone-identity` + ROADMAP b3.
+- **When you coalesce a prompt, never coalesce the teardown.** `LinkGroup`
+  carries every link id for exactly this reason.
+- **Prove a new test fails against the bug it catches**, before keeping it. Every
+  test added on 2026-08-21 was run against the deliberately reintroduced defect
+  and observed to fail. A test that passes both ways is worthless.
+- **`tools/doc-check` carries regression SENTINELS** — source patterns that must
+  never reappear. Add one only after a defect has actually shipped.
+- **Write rules as the bare lowercase app name** (`firefox`, `obs`). Since
+  2026-08-21 `set_rule()` sanitises this for you — a pasted `(pid:N)` label is
+  cleaned, and a name that cannot become a key is REFUSED rather than stored.
+  The **matcher** (`normalize_app_name`) is deliberately unchanged; only writes
+  are sanitised. **Three dead rules still sit in the live config** — cleaning
+  them is a manual step with the daemon stopped.
 - **Two `dev_t` encodings.** glibc's `stat()` and the kernel's are different
   layouts. Decoding one with the other's rules yields major 0 and silently
   matches *nothing* — while unit tests pass. This bit twice. All conversion

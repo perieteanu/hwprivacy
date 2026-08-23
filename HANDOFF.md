@@ -1,31 +1,92 @@
-# HANDOFF — 2026-08-19 (evening session)
+# HANDOFF — 2026-08-21 (two tranches)
 
 Read this first, then `CLAUDE.md`, then `docs-yaml/ROADMAP.yaml`.
 
 **Before trusting any doc in this repo, run `make doc-check`.** It is green as
-of this commit. If it is red, the docs are lying to you and it will say exactly
-where.
+of this commit, and it caught four real drifts during this session — including
+the b1 anchor disappearing, which is what a *fixed* defect looks like to a gate
+that only knows coordinates.
 
 ---
 
-## Where things stand
+## What this session did
 
-| | Phase | State |
-|---|---|---|
-| 1 | observe-only eBPF LSM | **validated live** |
-| 2 | camera enforcement | **PROVEN** — acceptance 5/5, denied live against Firefox/WhatsApp |
-| 3 | daemon integration | **13/13 — COMPLETE** (2026-08-19) |
-| 4 | continuous operation + audit trail | **code complete**, stage 1 verified live; unit not yet installed |
-| 5 | audio backstop | agreed in principle, not started |
+It started as "read the logs". Reading two days of live journals found a bug
+nobody had seen, and reading the code for *that* found two more of the same
+family. Two tranches followed: staleness + b1/b2/b4 + posture, then b3 and the
+first tests `classify_link()` has ever had.
 
-`git`: 32 commits, clean tree. **78 tests**, all passing. 7 crates, 7817 LOC.
-Run `make doc-check` before trusting any number in any doc here — it is green
-as of this commit and it has already caught two real drifts.
+`git`: **uncommitted**. **120 tests**, all passing (was 78). 7 crates, 8814 LOC.
 
-2026-08-19 was two sessions. The morning wrote no code — it realigned the docs
-with the tree and built `tools/doc-check` to keep them that way. The evening
-closed Phase 3 (C5 + D1), fixed three accounting defects, and built all of
-Phase 4. Behaviour changed; see below.
+### The find: enforcement silently stopped for sixteen hours
+
+```
+08-20 08:03:35  daemon pushes policy  → "2 executable(s) allowed"
+08-20 08:05:16  dpkg: firefox-esr 140.13.0esr → 140.14.0esr   ← inode changes
+08-20 09:45:14  DENIED /usr/lib/firefox-esr/firefox-esr  ino=30282365
+08-20 18:10:14  DENIED   (same, 8.5 hours later)
+08-21 08:42     reboot → helper reloads its cache → ALLOWED again
+```
+
+Throughout, `config.toml` said `camera = "allow"` and `hwprivacy-ctl status`
+said `Allowed binaries: 2`. Both surfaces reported health while the feature was
+dead. It repairs itself at the next boot, which is why it had never been seen.
+
+Two more, found while fixing it — both worse, because neither needs an upgrade:
+
+- **`SetPolicy` was sent only at connect time.** `set_rule`/`remove_rule` never
+  poked the kernel layer, so changing a camera rule from `hwprivacy-ctl`, the
+  TUI or the GUI did nothing until a restart. For layer 2, all three frontends
+  were decorative.
+- **`StreamInfo.object_serial` held `node.id`.** PipeWire's `object.serial` is
+  never reused; a node id is reused freely. The name is why b2 read as a tuning
+  issue rather than a grant landing on someone else's stream.
+
+All three are one mechanism now: `PolicyFingerprint` in `lsm_client.rs`.
+
+### Fixed
+
+| | |
+|---|---|
+| **b1** dismiss wrote a permanent deny | `PromptOutcome` (Chosen/Dismissed/Failed) + the pure `notification::decide()` |
+| **b1b** *(new)* a FAILED notification also wrote a deny | headless or no notify daemon → every prompt became a permanent deny |
+| **b2** one-shot grants leaked | keyed on `(node_id, app)`, pruned every poll |
+| **b4** dead rules | `sanitize_rule_name()` on write; `set_rule` returns false rather than storing junk |
+| **posture** | `default_action` defaults to **deny** |
+| **staleness** | s1/s2/s3 above |
+| **b3** two identical prompts | split by category — see below |
+| *incidental* | a test that had never run — `#[test]` was stacked twice on the function above it |
+
+### b3: the reframe was half right
+
+`d-per-microphone-identity` said "two links are two microphones, label them,
+never coalesce". True for the microphone. **False for the playback monitor**,
+and the live graph says so plainly:
+
+```
+node=46 Audio/Source   capture_FL(64), capture_FR(65)   ← two microphones
+node=36 Audio/Sink     monitor_FL(61), monitor_FR(63)   ← two CHANNELS, one sink
+```
+
+So: **microphones get one prompt each, labelled `mic1`/`mic2`; a sink's channel
+links get coalesced into one prompt.** The test is not "do the links look
+alike" — they do, in both cases — it is "can the user meaningfully answer
+differently for each".
+
+Ordinals come from the sorted port **name**. Port ids are per-session; sorting
+by id would silently move `mic2` to the other microphone after a reboot.
+
+`classify_link()` finally has tests — 14 of them, including the one that never
+existed: **ordinary playback into a sink must not be classified as a monitor
+tap.** `d-monitor-tap-by-link-direction` rests entirely on that and nothing had
+ever checked it.
+
+Every new test was run against the deliberately reintroduced defect and observed
+to **fail** before being kept. A test that passes both ways is worthless — and
+this session produced one: the first direction-filter test passed with the
+filter *removed*, because on this laptop `monitor_*` happens to sort before
+`playback_*` and the coincidence hid the bug. Rewritten with a port that sorts
+first. That is the entire argument for the discipline.
 
 ---
 
@@ -33,15 +94,21 @@ Phase 4. Behaviour changed; see below.
 
 | | |
 |---|---|
-| `hwprivacy.service` (user) | **active**, `NRestarts=0`, from `~/.local/bin/hwprivacy-daemon` |
-| `hwprivacy-ctl/-tui/-gui` | in `~/.local/bin`, on `PATH` — call them by name |
-| `hwprivacy-lsm` | **not running, no systemd unit.** Started by hand as root, per test. |
+| `hwprivacy.service` (user) | active, `NRestarts=0`, from `~/.local/bin/hwprivacy-daemon` |
+| `hwprivacy-lsm.service` (system) | **active since 2026-08-20**, enabled, starts *before* the user daemon, enforcing from `/var/lib/hwprivacy/policy` |
+| `hwprivacy-ctl/-tui/-gui` | in `~/.local/bin`, on `PATH` |
 
-**Nothing is being enforced at the kernel layer right now.** The helper only
-runs when a test starts it, and the eBPF program is never pinned — killing the
-process detaches it and restores normal access.
+**Both tranches ARE deployed** — installed to `~/.local/bin` and the service
+restarted on 2026-08-23. `hwprivacy-lsm` is unchanged and still the 08-20 build.
 
-After rebuilding, re-install or the service keeps the old binary:
+The previous binaries are backed up; to roll back:
+
+```bash
+install -m 0755 <scratchpad>/bin-backup/hwprivacy-{daemon,ctl,tui,gui} ~/.local/bin/
+systemctl --user restart hwprivacy
+```
+
+To redeploy after a rebuild:
 
 ```bash
 cargo build --release --workspace
@@ -49,55 +116,70 @@ install -m 0755 target/release/hwprivacy-{daemon,ctl,tui,gui} ~/.local/bin/
 systemctl --user restart hwprivacy
 ```
 
+The BPF program is still **never pinned** — stopping the service detaches it and
+restores normal access.
+
 ---
 
 ## Pick up here — in this order
 
-### 1. Install the kernel unit and prove it survives a boot
+### 1. Run the staleness acceptance script
 
-Everything about Phase 4 is written and committed, and stages 1, 3 and 4 are
-verified live. **Stage 2 is not**: the systemd unit has never been installed or
-booted. Until it is, the kernel layer still protects nothing unless a human
-starts it by hand — which was the entire point of Phase 4.
+`~/projects/claude-run/hwprivacy-staleness-test-20260821.sh` proves the
+staleness fix end to end against the live kernel. Needs `sudo`; it carries the
+three-part banner. **The staleness fix is the one thing still unverified against
+a running kernel** — b1 and b3 were verified live on 2026-08-23:
 
-```bash
-~/projects/claude-run/hwprivacy-install-lsm-20260819.sh   # asks you to type INSTALL
+```
+16:02:33  parecord -> microphone (mic1)  DENIED
+16:02:33  parecord -> microphone (mic2)  DENIED     ← b3: distinguishable
+16:02:59  parecord -> monitor            ASKED      ← one row, not two
+config.toml byte-identical after an unanswered prompt  ← b1
 ```
 
-Then reboot and confirm the helper is active and enforcing from
-`/var/lib/hwprivacy/policy` before anyone logs in.
+### 2. Clean three dead rules out of the live config
 
-**Expect `hwprivacy-ctl` to say `Connected: no` right after installing.** The
-desktop session predates the `hwprivacy` group, so the daemon cannot open the
-socket until the next login. Not a fault. The helper enforces from the cache
-meanwhile, which is exactly the boot scenario.
+`sanitize_rule_name()` stops *new* ones. The three already in
+`~/.config/hwprivacy/config.toml` are still there and still dead:
+`""`, `"Firefox [pipewire-pulse] (pid:2332)"`, `"pipewire [pipewire-pulse]"`.
+**Stop the daemon first** — it rewrites the whole file on any rule change.
 
-### 2. b3 — duplicate prompts. Now corrupts the audit trail too
+### 3. Decide whether the live config adopts deny-by-default
 
-One stereo capture creates two PipeWire links, evaluated independently, so it
-produces two BLOCKED popups, two rule prompts, **and two rows in the persistent
-offenders table**. Seen four times live on 2026-08-19. It was cosmetic; now
-that Phase 4 persists counters, it inflates history for as long as it stays
-unfixed. Fix shape: coalesce new links by (app node, device category) within a
-poll before deciding or notifying.
+The code default changed; his config sets `default_action = "ask"` explicitly,
+so nothing changed underneath him. Flipping it is a deliberate edit.
 
-### 3. Phase 4 background — why the unit matters
+### 4. Decide what to do about b6 (found live, not fixed)
 
-Until this exists, layer 2 protects nothing unless a human is running it. This
-is the single largest gap between "proven in a test" and "actually protecting
-the machine". Reshaped on 2026-08-05 to cover continuous operation **and** a
-persistent audit trail — see `ROADMAP.yaml`, the fail2ban-shaped proposal.
+`Hint::Resident(true)` beats `timeout(60000)`, so an unanswered prompt never
+expires: the cooldown never starts, the same app re-prompts on every new stream,
+and popups stack. b1's fix holds — nothing is written — but the "ask again
+later" half of the contract does not happen. Three options in
+`ROADMAP > b6_resident_prompt_never_times_out`; all three are decisions.
 
-### 4. Phase 5 — audio backstop
+### 5. Then: notify-on-allow → presets → README/MISSION for publication
 
-Note the shape: you cannot simply deny major 116, because that denies
-`/usr/bin/pipewire`, which is every application's microphone path. The rule has
-to be "only the audio server may open capture devices".
+See `ROADMAP.yaml > next_up`. Shape warning worth carrying:
 
-**What is already proven:** connection, reconnect without restarting the
-daemon, policy push, gap reporting, unresolved-entry reporting, enforcement,
-kernel events reaching `hwprivacy-ctl`/TUI/GUI, notifications with the right
-wording, restore on detach, and no interference with the PipeWire layer.
+- **notify-on-allow has no "stopped" event.** The LSM hook is on `open()`;
+  nothing fires on close. A tray dot would light and never go out.
+
+---
+
+## Two findings that are not bugs
+
+**The PipeWire camera route is dead system-wide.** `/usr/bin/pipewire` is denied
+`/dev/video0` at every boot, so no camera node is created and the camera is
+absent from `hwprivacy-ctl devices` entirely. Decided 2026-08-21: the shipped
+default will allowlist `pipewire` **and** `wireplumber`, because that hands the
+PipeWire camera route back to layer 1, which can attribute it per application —
+something layer 2 structurally cannot do. Not implemented yet; see
+`ROADMAP > next_up > presets`.
+
+**Layer 1's idle CPU has roughly doubled.** 1.24 % of a core (2026-08-04) →
+2.93 % (2026-08-21), same method; 3.03 % over the full 16 h session of 08-20.
+The kernel helper over the same window: 0.04 %. Costin rejected 1.2 % as "very
+generous". Undiagnosed — measure before proposing anything.
 
 ---
 
@@ -108,108 +190,58 @@ ffmpeg -f v4l2 -i /dev/video0   → 90 frames captured, 0 events logged
 ffmpeg -f alsa -i hw:0,0        → 3s of mic audio,    0 events logged
 ```
 
-Both layers watching the same 7 seconds:
-
-```
-KERNEL   firefox-esr → /dev/video0 ×10, /dev/video1 ×3
-         pipewire    → pcmC0D0c    ×1      ← cannot tell WHO wants the mic
-PIPEWIRE Firefox     → microphone  ASKED   ← knows the app, blind to the camera
-```
-
 Hook cost: **+13.75 ns/open**, 95 % CI `[+7.3, +20.2]`, 1.88 % of a 733 ns
-`open()`, **0 % at idle**. The PipeWire poll burns ~1.2–1.5 % constantly.
-
----
-
-## Two decisions Costin has NOT made
-
-1. **deny-by-default vs ask-by-default** for the PipeWire layer. The live config
-   says `ask`. See `DECISIONS.yaml > d-posture-unsettled`. Deliberately
-   untouched — one variable at a time.
-2. Whether the PipeWire layer's four defects (b1–b4) get fixed before or after
-   the kernel layer is finished.
+`open()`, **0 % at idle**.
 
 ---
 
 ## Traps that already bit
 
-- **Two `dev_t` encodings.** `stat()`'s (glibc) and the kernel's are different
-  layouts. Decoding one with the other's rules yields major 0 and silently
-  matches *nothing* — while unit tests pass. This bit twice: once for `i_rdev`,
-  then again for `s_dev` in the allowlist, where it looked exactly like
-  "enforcement works, allowlist doesn't". All conversion now lives in
-  `device_index::glibc_to_kernel_dev()`.
+- **Inodes in documentation rot.** Four docs recorded firefox-esr as
+  `ino=30287776`; it is `30282365` now. A hardcoded inode has a half-life of one
+  `apt upgrade`.
+- **Two `dev_t` encodings.** glibc's and the kernel's differ. Decoding one with
+  the other's rules yields major 0 and silently matches *nothing* while unit
+  tests pass. Bit twice. All conversion lives in
+  `device_index::glibc_to_kernel_dev()`. The daemon's new fingerprint uses raw
+  glibc values for *change detection only* and deliberately does not convert.
+- **A field name can hide a bug.** `object_serial` holding a node id made b2
+  unreadable for months.
+- **An attribute can be silently absent.** `#[test]` stacked twice on one
+  function left the next one dead. It compiled and read as covered.
 - **`cargo test` does not refresh `target/debug/hwprivacy-lsm`.** It builds a
-  separate `cfg(test)` harness. 30 passing tests once said nothing about the
-  binary being executed. Test scripts now run `cargo build` themselves.
-- **D-Bus activation vs systemd.** Pointing the activation file at a real
-  binary let `hwprivacy-ctl` fork a *second* daemon that grabbed the bus name;
-  the unit crash-looped 32 times with `name already taken on the bus`. Now
-  delegates via `SystemdService=`. Check `MainPID`, not `is-active` — the
-  latter says "active" mid-restart.
-- **`/usr/bin/firefox` is a shell script.** Real binaries:
+  separate `cfg(test)` harness. Test scripts must `cargo build` themselves.
+- **D-Bus activation vs systemd.** Check `MainPID`, not `is-active`.
+- **`/usr/bin/firefox` is a shell script.** The real binaries are
   `/usr/lib/firefox-esr/firefox-esr` and `~/firefox-developer/firefox-bin` —
-  different inodes, so different policy keys. That is the feature.
+  different inodes, different policy keys. That is the feature.
 - **A camera session is 13 `open()` calls.** Coalescing collapses them to one
-  event; the count is flushed separately or 12 denials vanish from the log.
+  event; the count is flushed separately.
 - **`bpftool` lives in `/usr/sbin`**, off a non-root `PATH`.
-- **`libelf.h: No such file`** means the Phase 0 toolchain script has not run.
-- **Docs drifted silently for 15 days** while reading perfectly. `make
-  doc-check` now fails on the specific ways that happened. If you find a new
-  way, add a check — but only after it has actually gone wrong once.
+- **`doc-check` only reads files.** It passed green all morning while four docs
+  said the kernel helper is started by hand — it has been a boot-time service
+  since 2026-08-20. Everything it cannot verify is a claim about the host.
 
 ---
 
-## What the 2026-08-19 session changed
-
-Two sessions in one day. The morning was documentation; the evening was code
-and measurement.
-
-**Documentation** — the 2026-08-04 kernel pivot had no ADR for fifteen days;
-`DECISIONS.yaml` recorded why the old basis was wrong and never what replaced
-it. Added `d-kernel-lsm-layer`, demoted `d-event-driven-substrate` to
-layer-1-only (it was titled "DIRECTION SET" and read as the current direction),
-renamed `d-two-layer-model` → `d-per-stream-gating` to kill a phrase collision,
-and realigned CLAUDE.md, ARCHITECTURE.yaml and README with the tree. Added
-`tools/doc-check` (`make doc-check`) — seven checks, each one a contradiction
-that actually occurred here.
-
-**Phase 3 closed, 13/13.** C5 was measured, found to over-count by exactly one,
-fixed, and re-verified. D1 was proven in both directions with Firefox-ESR.
-
-**Phase 4 built**, stages 1/3/4 verified live: `--policy-cache`, dated
-timestamps, and `hwprivacy-ctl offenders`.
-
-**A pattern, not just fixes.** Four instruments failed while the product
-behaved correctly — a grep for a line `--json` suppresses, two `pkill -f`
-patterns matching the checking shell itself, and a test that killed the helper
-mid-push then deleted the log proving it. Recorded in `ROADMAP.yaml >
-test_harness_race_2026_08_19`. Assert on STATE, never on log text or process
-names, and never let a test delete its own raw evidence.
-
 ## Deliberately NOT done
 
-- **C5 and D1** — see "Pick up here". Everything else in Phase 3 is proven.
-- **Phases 4 and 5** — no code.
-- **PipeWire-layer defects b1–b4** — untouched. Dismissing a prompt on the
-  plain `ask` path still writes a permanent `deny` rule
-  (`notification.rs:196`). This is why kernel denials use an *informational*
-  notification with no action buttons: routing them through the action path
-  would inherit b1 on day one.
-- **`classify_link()` still has zero tests.** It is a pure function holding the
-  entire layer-1 security decision, untouched since 2026-03-27. All 63 tests
-  are on the kernel layer and config. Coverage is lopsided by era, not by risk.
-- **`MISSION.yaml` not rewritten.** It still files the kernel layer under
-  `what_would_fix_it`, in the conditional. `CLAUDE.md`'s reading order flags
-  this inline so it cannot mislead silently, but the file itself is unfixed.
-- **Per-event cost unmeasured** — what one camera/mic event costs the observer
-  (`/proc` resolution, printing). Only the hot path was measured.
-- **Enforcement cannot revoke an ALREADY-OPEN fd.** The LSM hook fires on
-  `open()`, not on reads. Costin saw live camera video while enforcement was
-  on, because Firefox had opened the device earlier and kept the descriptor.
-  This is the same class as the PipeWire layer's g1/g2 and is a real
-  limitation, not a bug — but "I enabled blocking and still saw video" is
-  exactly how someone concludes the tool does not work, so it must be stated
-  plainly wherever the camera feature is described. Closing it would mean
-  hooking `security_file_permission` (intercepting every read, not every open)
-  or revoking on policy change. That is a design step, not a patch.
+- **b6 is not fixed** — found while verifying b1; the fix is a decision, not a
+  patch. See `ROADMAP > b6_resident_prompt_never_times_out`.
+- **The staleness fix is still unverified against a live kernel.** b1 and b3
+  were verified live on 2026-08-23; the acceptance script for staleness is
+  written and shellcheck-clean but needs sudo and has not been run.
+- **Three dead rules are still in the live config** — the code refuses new ones,
+  the existing three need a manual clean with the daemon stopped.
+- **The live config still says `default_action = "ask"`.** The code default is
+  now deny; his file sets it explicitly, so nothing changed underneath him.
+- **notify-on-allow, presets** — next tranche, by agreement.
+- **Per-device rules.** b3 labels the microphones; it does not let you write
+  `mic2 = deny`. Rules are still per category.
+- **The CPU regression** — measured, not diagnosed.
+- **`doc-check --host`** — agreed as worth building, not built.
+- **README** — not rewritten. It still describes the helper as hand-started and
+  carries a note saying the default posture is `ask`. Both are now wrong. This
+  matters more than usual: publishing to a public repo is the stated goal.
+- **MISSION.yaml** — still files the kernel layer under `what_would_fix_it`, in
+  the conditional, and says nothing about the executable being the principal.

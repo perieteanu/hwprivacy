@@ -12,7 +12,7 @@ current_state:
     unpredictable.
 
   verified_working:
-    - "Cargo workspace, 7 crates, 7817 LOC, 78 tests, builds clean (8 trivial warnings, 0 errors) — verified 2026-08-19"
+    - "Cargo workspace, 7 crates, 8814 LOC, 120 tests, builds clean (5 trivial warnings, 0 errors) — verified 2026-08-21"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"
@@ -36,47 +36,200 @@ current_state:
     running_from: "target/release/ — the dev tree, NOT /usr/bin"
 
 blockers:
-  label: "Why it 'did not work properly'. Fix these before anything else."
+  label: "Why it 'did not work properly'. ALL FOUR FIXED 2026-08-21."
   b1_dismiss_writes_deny:
     severity: critical
-    what: "Dismissing a notification writes a permanent `deny` rule instead of doing nothing."
-    where: "hwprivacy-daemon/src/notification.rs:196 — `perm.or(Some(Permission::Deny))`  (was :146 until notify_kernel_denial() was inserted above it; tools/doc-check now guards this coordinate)"
-    effect: "The unreachable `None` arm in main.rs:382 means record_dismiss()/is_in_cooldown() are dead code. Config silently accumulated denials the user never chose."
+    status: "FIXED 2026-08-21. Every new test verified to FAIL against the reintroduced defect before being kept."
+    what: "Dismissing a notification wrote a permanent `deny` rule instead of doing nothing."
+    was_where: "notification.rs — `perm.or(Some(Permission::Deny))` at the end of ask_user_permission()"
+    effect: "The unreachable `None` arm in main.rs meant record_dismiss()/is_in_cooldown() were dead code. Config silently accumulated denials the user never chose."
     evidence: "journalctl 18:47:04 — 'dismissed — no rule saved' immediately followed by 'User set rule: ... = deny'"
-    mode: execute
-    est_minutes: 20
+    fix: >
+      ask_user_permission() now returns PromptOutcome — Chosen / Dismissed /
+      Failed — so a dismissal, a decision, and a broken notification daemon stop
+      being the same value. The decision itself moved out of the tokio::spawn
+      into the pure function notification::decide(), because the invariant that
+      had to hold ("nothing but a button press reaches SavePermanentRule") was
+      previously in a place no test could reach.
+    second_defect_found_while_fixing: >
+      The error paths returned Some(Deny) too. On a headless session, or with no
+      notification daemon running, EVERY prompt became a permanent deny rule.
+      Failed is now treated exactly like Dismissed: blocked, nothing written.
+    regression_guard: "tools/doc-check SENTINELS refuses the old expression anywhere in the tree."
 
   b2_stale_oneshot_grants:
     severity: critical
-    what: "`ask_each` streams get silently ALLOWED with no prompt."
-    where: "hwprivacy-daemon/src/stream_tracker.rs:133 grant_one_shot()"
-    effect: "one_shot_allowed: Vec<u32> is never pruned and is keyed on the PipeWire node id, which PipeWire recycles. An old grant leaks onto an unrelated later stream."
+    status: "FIXED 2026-08-21."
+    what: "`ask_each` streams got silently ALLOWED with no prompt."
+    where: "hwprivacy-daemon/src/stream_tracker.rs grant_one_shot()"
+    effect: "one_shot_allowed: Vec<u32> was never pruned and was keyed on the PipeWire node id, which PipeWire recycles. An old grant leaked onto an unrelated later stream."
     evidence: "live event log — 'Firefox [pipewire-pulse] microphone ALLOWED' while config says microphone = ask_each"
-    mode: execute
-    est_minutes: 45
+    the_camouflage: >
+      StreamInfo's field was NAMED object_serial but policy_engine.rs assigned
+      node.id to it. PipeWire's object.serial is monotonic and never reused; a
+      node id is reused freely. Under the wrong name the bug read as a tuning
+      issue rather than a grant landing on somebody else's stream. The field is
+      now called node_id, and pw-dump's real object.serial is still not parsed.
+    fix: >
+      Grants are keyed on (node_id, normalised app name) and pruned every poll
+      against the live node set. Pruning alone still leaves a race — an id can
+      be freed and reused between two polls — so the app name is what actually
+      closes the cross-application case.
+    regression_guard: "doc-check SENTINELS refuses `one_shot_allowed: Vec<u32>`."
 
   b3_duplicate_prompts:
     severity: high
-    what: "A stereo capture produces two identical BLOCKED popups and two rule prompts."
-    where: "hwprivacy-daemon/src/main.rs — `for link in &new_links`, no grouping"
-    effect: "Each channel is its own PipeWire link and is evaluated independently. Reads as broken."
+    status: "FIXED 2026-08-21. Every new test verified to FAIL against the reintroduced defect."
+    what: "A stereo capture produced two identical BLOCKED popups and two rule prompts."
     evidence: "event log shows exact pairs: 18:45:17 monitor DENIED x2, 18:45:19 x2, 18:45:22 x2"
-    fix_shape: "SUPERSEDED — do NOT coalesce. See DECISIONS d-per-microphone-identity: the two links are two PHYSICAL MICROPHONES (capture_FL / capture_FR), not duplicates. Label each prompt with which microphone it is."
     reframed_2026_08_19: "b3 is a LABELLING bug, not a duplication bug. Coalescing would destroy the only handle on which mic is being requested — and per-channel gating was measured to work: right mic cut mid-capture went to rms 0.0 while the left kept recording and the app never noticed."
-    mode: execute
-    est_minutes: 60
+    split_by_category_2026_08_21: >
+      The 2026-08-19 reframe is right for the MICROPHONE and wrong for the
+      MONITOR, and applying one treatment to both is what made either look
+      broken. Read out of the live graph:
+        node=46 Audio/Source  capture_FL(64) capture_FR(65)  -> two microphones
+        node=36 Audio/Sink    monitor_FL(61) monitor_FR(63)  -> two CHANNELS, one sink
+      A sink monitor has no independent-gating story. Recording what the
+      speakers play is one act against one device, so its two links ARE
+      duplicates — seen live 2026-08-21, two identical
+      "OBS -> Monitor -> ALLOWED" rows in the same second.
+    fix:
+      microphone: "one prompt per port, labelled mic1..micN — ordinals assigned by sorted port NAME, never port id, never discovery order."
+      monitor: "the sink's channel links are coalesced by (device, app) into ONE decision and one prompt."
+      camera: "untouched — one link."
+      surfaces: "the label reaches the notification, the event log, and hwprivacy-ctl log (AccessEvent gained device_instance; get_events emits device_display())."
+    the_trap_it_would_have_been: >
+      Coalescing the PROMPT must never coalesce the ENFORCEMENT. A LinkGroup
+      carries every link id and destroy_links() tears down all of them; had it
+      destroyed only the representative, one channel would keep flowing while
+      the popup said BLOCKED — worse than the double prompt it replaces.
+      Covered by a test proven to fail against exactly that mistake.
+    what_this_is_NOT: >
+      Labelling only. Rules are still per CATEGORY. Per-device rules
+      ("mic2 = deny") remain deferred — CONVENTIONS lists config.toml among the
+      places ordinals apply, but that is the destination, not this step.
 
   b4_dead_rules_in_config:
     severity: medium
-    what: "Three of the 8 live rules can never match anything."
+    status: "CODE FIXED 2026-08-21. The live config still holds the three dead rules — cleaning them is a manual step with the daemon stopped."
+    what: "Three of the 9 live rules can never match anything."
     detail:
       - "app_name = '' — no stream is ever named empty (parse_node falls back to 'unknown')"
       - "app_name = 'Firefox [pipewire-pulse] (pid:2332)' — ends with ')', so normalize_app_name strips nothing"
       - "app_name = 'pipewire [pipewire-pulse]' — a self-reference artefact of the dismiss defect"
     root_cause: "notification bodies render '{app} (pid:{n})' and users paste that string into the rule form"
-    fix_shape: "clean the config AND stop the trap — validate/normalize app_name on SetRule, and stop offering a pasteable pid-bearing label"
-    mode: execute
-    est_minutes: 30
+    fix: >
+      config::sanitize_rule_name() runs on WRITE — it strips a trailing
+      "(pid:N)", applies normalize_app_name, and refuses anything that cannot
+      become a key (empty, or a bare "[annotation]"). set_rule() returns false
+      instead of storing junk, and SetRule over D-Bus reports the refusal.
+      Notification bodies now print an explicit "Rule name: firefox" line, so
+      the string a user copies is the one that works.
+    why_the_matcher_was_left_alone: >
+      normalize_app_name runs on every lookup and decides access. Widening it
+      would make all future matching fuzzier to repair a write-time mistake.
+      Sanitising happens once, on input, where a bad result is visible in
+      config.toml immediately instead of being silently wrong forever.
+
+b6_resident_prompt_never_times_out:
+  severity: medium
+  status: "FOUND LIVE 2026-08-21 while verifying b1. NOT FIXED — the fix is a design choice, not a patch."
+  found_how: >
+    Verifying that an unanswered prompt writes nothing. It writes nothing, which
+    is the b1 fix working. But the "ask again later" half of the documented
+    contract never happens.
+  what: >
+    notification.rs sets BOTH Hint::Resident(true) and timeout(60000). Resident
+    tells the notification daemon to keep the popup until the user acts, and it
+    wins — the 60s timeout never fires, wait_for_action() never returns, and the
+    spawned task sits there forever.
+  evidence_2026_08_21: |
+    16:02:59  parecord -> monitor  ASKED     (prompt appears, left unanswered)
+    16:04:48  parecord -> monitor  ASKED     (109s later — a SECOND prompt)
+    config.toml: byte-identical throughout, sha256 0f28b14112d532d5, 9 rules
+    journal: no "nothing saved" / "quiet for" line, ever
+    daemon threads: 22 with nothing pending, 23 with prompts pending
+  what_it_means:
+    - "record_dismiss() is still never called on a TIMEOUT, so the cooldown never starts and the same app re-prompts on every new stream."
+    - "The dismiss contract in CONVENTIONS is only half true: 'save nothing' works, 'ask again after the cooldown' does not — because the first ask never ends."
+    - "Each pending prompt holds a blocking thread (spawn_blocking + wait_for_action). Tokio's blocking pool is bounded, so enough unanswered prompts would eventually starve it. Magnitude not measured — the observed delta was +1 thread for 2 pending prompts, so they are not strictly 1:1."
+    - "Popups accumulate on screen rather than one being re-asked."
+  not_introduced_by_b1: >
+    Resident + timeout has been there since the beginning. Before b1 was fixed
+    this was invisible, because closing the popup wrote a deny and nobody
+    examined the timeout path. Fixing b1 is what made the gap legible.
+  fix_options_not_yet_chosen:
+    - "Drop Hint::Resident(true) and let the 60s timeout close it — simplest, but the popup can then vanish while the user is reading it."
+    - "Keep Resident and wrap wait_for_action in a timeout on our side, so the daemon stops waiting even if the popup stays."
+    - "Keep Resident and accept that a prompt persists until answered — then DELETE the cooldown machinery and the contract that describes it, rather than documenting behaviour that does not occur."
+  do_not: "Do not 'fix' this by shortening the timeout. The timeout is already ignored."
+
+policy_staleness_2026_08_21:
+  label: >
+    Three ways the kernel map drifted away from config.toml while every status
+    surface reported healthy. Found by reading two days of live journals, not by
+    reading code. All FIXED 2026-08-21 by one mechanism.
+  s1_binary_replaced_by_a_package_upgrade:
+    severity: "critical — enforcement silently stopped for an allowlisted app"
+    measured_live: |
+      08-20 08:03:35  daemon pushes policy  -> "2 executable(s) allowed"
+      08-20 08:05:16  dpkg: firefox-esr 140.13.0esr -> 140.14.0esr
+      08-20 09:45:14  DENIED /usr/lib/firefox-esr/firefox-esr ino=30282365
+      08-20 18:10:14  DENIED   (same, 8.5 hours later, same pid)
+      08-21 08:42     reboot -> helper reloads its cache -> ALLOWED again
+    what: >
+      The kernel matches on the executable's inode. A package upgrade gives the
+      same path a new inode; the map kept the old one. For sixteen hours
+      config.toml said camera = "allow" and hwprivacy-ctl status said
+      "Allowed binaries: 2", while Firefox was being denied.
+    why_it_was_never_noticed: >
+      It repairs itself at the next boot, when the helper re-resolves paths from
+      /var/lib/hwprivacy/policy. The docs had PREDICTED this exact failure —
+      phase_4_stage_1 > stores_paths_not_inodes calls it "the hardest possible
+      failure to notice" — but the mitigation only covers helper start, not a
+      package upgrade during a running session.
+    also_note: >
+      The inode recorded for firefox-esr in four documents (30287776) is now
+      wrong; it is 30282365. A hardcoded inode has a half-life of one upgrade.
+    fail_open_direction: >
+      The reverse is worse and is why this was not left as a documented
+      limitation: ext4 reuses inode numbers, so a stale allowlist entry can
+      eventually match a DIFFERENT file. Low probability, wrong direction.
+
+  s2_rule_changes_never_reached_the_kernel:
+    severity: "critical — the CLI, TUI and GUI were decorative for layer 2"
+    what: >
+      SetPolicy was sent once per connection, from session(), and never again.
+      set_rule/remove_rule in dbus_service.rs did not poke the kernel layer at
+      all. Changing a camera rule with hwprivacy-ctl, the TUI or the GUI did
+      nothing until the daemon or the helper restarted.
+    why_it_matters_more_than_s1: "It needs no package upgrade. It fired every time anybody edited a camera rule."
+    probably_explains: "part of the 2026-08-19 D1 confusion, where a config change 'could not be pushed at all'."
+
+  s3_deleted_binary_left_a_key_behind:
+    severity: medium
+    what: "An allowlisted binary that is removed leaves its key in the map and is never re-reported."
+
+  the_one_fix:
+    where: "hwprivacy-daemon/src/lsm_client.rs — PolicyFingerprint"
+    what: >
+      The session loop is now a tokio::select! over incoming replies and a
+      recheck tick. Each tick fingerprints the INTENDED allowlist —
+      (exe_path, dev, ino) per entry, sorted, plus the enforcement flag — and
+      re-pushes SetPolicy when it differs, logging what moved
+      ("<path> ino 30287776 -> 30282365 (binary replaced)").
+    covers: "s1, s2 and s3 with one mechanism, because all three change that fingerprint."
+    knob: "policy.exe_recheck_secs, default 30. Set 0 to disable."
+    cost: "a handful of stat() calls on paths already named in the config — microseconds. This is not the pw-dump situation."
+    deliberately_not_inotify: >
+      No notify/inotify crate exists in the workspace and MSRV is Debian 13's
+      rustc 1.85. A new dependency in a security tool needs a better reason than
+      shaving 30 seconds off a window that was previously sixteen hours.
+    dev_encoding_note: >
+      The daemon's (dev, ino) are glibc-encoded and used ONLY to detect change.
+      Authoritative resolution stays in the helper's PolicyKey::from_path, the
+      one caller of glibc_to_kernel_dev(). Duplicating that conversion is the
+      trap that has already bitten this project twice.
 
 security_gaps:
   label: "Real holes not listed in README > Known Limitations."
@@ -706,26 +859,47 @@ kernel_layer:
       why_lower_priority: "Events are rare (a handful per day) vs opens (millions). Matters for Phase 2 notification behaviour, not for system-wide overhead."
 
 next_up:
-  label: "Ordered. Do not start item 2 before item 1 is settled."
+  label: "Ordered. Tranche 1 landed 2026-08-21; what remains is below."
+  done_2026_08_21:
+    - "settle-posture — DECIDED: deny-by-default. Code default flipped; docs realigned."
+    - "policy staleness s1/s2/s3 — one fingerprint mechanism, see policy_staleness_2026_08_21"
+    - "b1, b2, b3, b4 — ALL FOUR fixed, each new test verified to fail against the reintroduced defect"
+    - "classify_link() covered — 14 tests, including that ordinary playback is not a monitor tap. It held the whole layer-1 security decision with zero tests since 2026-03-27."
   steps:
-  - id: settle-posture
-    what: "Decide deny-by-default vs ask-by-default, then make README, config default, and code agree."
-    why: "README and the live config currently contradict each other. Every other fix depends on which one is true."
-    ref: "DECISIONS.yaml d-posture-unsettled"
-    mode: decide
-    est_minutes: 20
-
-  - id: fix-blockers
-    what: "b1, b2, b3, b4 in that order."
-    why: "These are the entire reason daily use failed. Cheap, local, no architecture change."
+  - id: notify-on-allow
+    what: "Notify when an ALLOWED open happens, and carry allowed rows in the history table."
+    why: >
+      Measured 2026-08-21: firefox-esr opened the camera twice in one morning
+      with no video call, because a website held a standing per-origin grant.
+      hwprivacy allowed it correctly and said nothing — the deny path is loud
+      and the allow path is silent.
+    decided: "notification only. There is no 'camera released' event (the LSM hook is on open(), not close), so a tray dot would light and never go out."
+    also: "rename `hwprivacy-ctl offenders` -> `history` before publication; once it carries allowed rows the old name is wrong."
     mode: execute
-    est_minutes: 155
 
-  - id: pure-function-tests
-    what: "First tests in the workspace: normalize_app_name, Permission/DeviceCategory round-trip, classify_link against captured pw-dump fixtures."
-    why: "classify_link and normalize_app_name hold the whole security decision and have zero coverage. Fixtures also make b2/b3 regressions catchable."
+  - id: presets
+    what: "Importable rule sets under /usr/share/hwprivacy/presets/ and ~/.config/hwprivacy/presets/."
+    why: "Costin 2026-08-21, after ruling out anything browser-specific: the MECHANISM is generic, the CONTENT is data the user opts into."
+    design:
+      - "candidate path LISTS per entry, not one path — /usr/lib/firefox-esr/... is Debian-specific"
+      - "import must NEVER widen an existing rule; skip and report"
+      - "--dry-run first; no auto-import. A preset granting camera=allow is a grant."
+      - "baseline (pipewire, wireplumber, xdg-desktop-portal) ships in the generated default config; applications are opt-in presets"
     mode: execute
-    est_minutes: 90
+
+  - id: cpu-regression
+    what: "Diagnose layer 1's idle cost: 1.24% of a core (2026-08-04) -> 2.93% (2026-08-21), same method."
+    why: "Costin rejected 1.2% as 'very generous'. Measure before deciding whether layer 1 ships enabled by default."
+    mode: execute
+
+  - id: doc-check-host-tier
+    what: "`make doc-check --host` — query systemd, cgroup CPU, and re-stat recorded inodes."
+    why: >
+      doc-check passed GREEN on 2026-08-21 while four documents said the kernel
+      helper has no systemd unit and is started by hand. It has been a
+      boot-time service since 2026-08-20. Everything the gate cannot verify is
+      a claim about the running host.
+    mode: execute
 
   - id: event-driven-substrate
     what: "Replace pw-dump polling with pipewire-rs registry callbacks."
@@ -780,7 +954,7 @@ deferred:
 
 debt:
   hardcoded_values_that_should_be_config:
-    - "DISMISS_COOLDOWN_SECS = 60 (stream_tracker.rs:8)"
+    - "DONE 2026-08-21: DISMISS_COOLDOWN_SECS -> policy.dismiss_cooldown_secs"
     - "event ring buffer size 500 (stream_tracker.rs:79)"
     - "notification timeouts 5000 / 60000 ms (notification.rs:49, :101)"
     - "device rescan window: every 5s for the first 120s (main.rs:153-154)"
@@ -791,30 +965,41 @@ debt:
     - "link_manager.rs destroy_all_links_to_node() — defined, never called (see g2)"
     - "config.rs rules_map() — defined, never called"
     - "stream_tracker.rs while_in_use_streams — written, never read"
-    - "stream_tracker.rs record_dismiss()/is_in_cooldown() — unreachable via b1"
+    - "DONE 2026-08-21: record_dismiss()/is_in_cooldown() are reachable now that b1 is fixed, and covered by tests"
     - "PwLink.output_port / input_port — parsed, never read (compiler warns)"
     - "AccessAction::RevokedOnDisconnect — variant never constructed"
-  compiler_warnings: 5
+  compiler_warnings: 6
   clippy: "not installed for this toolchain — `cargo clippy` returns 'no such command'"
+
+answered_2026_08_21:
+  q-posture:
+    question: "deny-by-default or ask-by-default?"
+    answer: "DENY-BY-DEFAULT."
+    consequence_accepted: >
+      An app with no rule is denied and gets the instant BLOCKED notification,
+      which has no action buttons — granting means hwprivacy-ctl, the TUI or the
+      GUI. `ask` still works and is now opt-in per rule. Discovery moves to the
+      notification plus the persistent history table.
+  q-dismiss-semantics:
+    question: "When the user dismisses a rule prompt without choosing, what should happen?"
+    answer: "(a) block this attempt, save nothing, cooldown, ask again later."
+    note: "The cooldown machinery already existed and was simply unreachable. It now runs, and policy.dismiss_cooldown_secs replaces the const."
+  q-kernel-baseline-allowlist:
+    question: "Does the shipped default allowlist pipewire and wireplumber for the camera?"
+    answer: "YES, both — plus a preset mechanism for everything above that baseline."
+    why_it_is_not_a_concession: >
+      With pipewire denied, the PipeWire camera route does not exist at all —
+      the camera vanishes from hwprivacy-ctl devices and layer 1's camera
+      feature is dead. Allowing the servers hands that route back to layer 1,
+      which can attribute it PER APPLICATION, something layer 2 structurally
+      cannot do. The two layers then cover one route each:
+        app -> PipeWire -> camera : layer 1, by application name, weaker
+        app -> V4L2 -> /dev/video0: layer 2, by executable inode, stronger
+      Firefox and Chrome are on the second row.
+    not_yet_implemented: "See next_up > presets."
 
 open_questions:
   label: "Need Costin's answer. Blocking the fixes they belong to."
-  q-posture:
-    question: "deny-by-default or ask-by-default?"
-    blocks: "everything — see next_up > settle-posture"
-    context: "README says deny-all, live config says ask. Costin's 2026-08-04 steer ('full privacy direction') points at deny."
-    ref: "DECISIONS.yaml d-posture-unsettled"
-
-  q-dismiss-semantics:
-    question: "When the user dismisses a rule prompt without choosing, what should happen?"
-    blocks: "b1_dismiss_writes_deny — the fix is trivial once this is answered"
-    options:
-      a: "block this attempt, save nothing, 60s cooldown, ask again later (what README documents)"
-      b: "block this attempt, save nothing, never ask again this session (quieter, still no permanent rule)"
-      c: "treat dismiss as deny and save it permanently (current behaviour, almost certainly unintended)"
-    note: "the cooldown machinery for option (a) already exists and is simply unreachable"
-    ref: "DECISIONS.yaml d-dismiss-defect"
-
   q-blockall-semantics:
     question: "Should Block All tear down links already flowing, or only gate new ones?"
     blocks: "g2_blockall_does_not_block"

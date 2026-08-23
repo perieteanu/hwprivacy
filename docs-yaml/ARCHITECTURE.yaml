@@ -10,15 +10,16 @@
 ---
 shape:
   language: "Rust 2021 + one BPF C file"
-  layout: "Cargo workspace, 7 crates, 7878 LOC of first-party code (7623 Rust + 255 BPF C; generated vmlinux.h excluded)"
+  layout: "Cargo workspace, 7 crates, 8814 LOC of first-party code (BPF C included; generated vmlinux.h excluded)"
   build: "cargo build --release --workspace  (or: make build)"
   binaries: 5
-  tests: 78         # 48 lsm + 15 daemon + 9 common + 6 proto. Zero in ctl/tui/gui.
+  tests: 120        # 49 lsm + 50 daemon + 15 common + 6 proto. Zero in ctl/tui/gui.
   test_distribution_warning: >
-    Coverage is lopsided by era, not by risk. The kernel layer (2026-08) has 44
-    tests; the PipeWire layer (2026-03) has 4, none of which touch
-    classify_link() — the pure function that makes the entire layer-1 security
-    decision. See ROADMAP.yaml > next_up.
+    The 2026-08-21 tranches closed the worst of it: the dismiss path, one-shot
+    grants, rule-name sanitising, policy staleness, and finally the layer-1
+    security decision itself — classify_link() had none at all from 2026-03-27
+    until 2026-08-21. What remains uncovered: parse_node()/parse_link() against
+    real pw-dump JSON, and the three frontends.
 
 two_layers:
   summary: >
@@ -31,7 +32,7 @@ two_layers:
     mechanism: "poll pw-dump, diff link ids, destroy offending links"
     nature: "DESTRUCTIVE and RETROACTIVE — the link exists and carries data before it is torn down"
   layer_2_kernel:
-    binary: "hwprivacy-lsm (root, started by hand — no systemd unit yet)"
+    binary: "hwprivacy-lsm (root, systemd system service since 2026-08-20)"
     sees: "every open() of a video4linux (major 81) or ALSA (major 116) device node, keyed by executable inode"
     blind_to: "which app wants the mic — /dev/snd is held by /usr/bin/pipewire on behalf of everyone"
     mechanism: "eBPF LSM on security_file_open, returning -EPERM"
@@ -58,14 +59,15 @@ crates:
     files:
       main.rs:            "CLI (run/install/uninstall/service-status), the monitoring loop, systemd+D-Bus unit installation"
       device_discovery.rs: "pw-dump JSON -> Vec<ProtectedDevice>. Classifies by media.class."
-      pipewire_monitor.rs: "capture_graph() -> GraphSnapshot; diff_links(); app identity resolution"
-      policy_engine.rs:   "classify_link() (which side is the device), evaluate() (rule -> PolicyDecision)"
+      pipewire_monitor.rs: "capture_graph() -> GraphSnapshot (nodes, ports, links); diff_links(); app identity resolution"
+      policy_engine.rs:   "classify_link() (which side is the device, and WHICH instance of it), device_instance() (mic1..micN by sorted port name), evaluate() (rule -> PolicyDecision)"
       link_manager.rs:    "destroy_link() via pw-link --disconnect, fallback pw-cli destroy"
       stream_tracker.rs:  "active connections, 500-event ring buffer, one-shot grants, dismiss cooldowns"
       notification.rs:    "2-stage freedesktop notifications via notify-rust"
       dbus_service.rs:    "#[zbus::interface] server impl — 11 methods, 3 declared signals"
       state.rs:           "DaemonState = config + devices + tracker + known_link_ids + block_all"
-      lsm_client.rs:      "layer 2 client — connects to the root helper's unix socket, reconnects every 10s, pushes the allowlist, receives kernel AccessEvents and folds them into the same tracker/notification path (362 LOC)"
+      lsm_client.rs:      "layer 2 client — connects to the root helper's unix socket, reconnects every 10s, pushes the allowlist, RE-pushes it whenever PolicyFingerprint changes, receives kernel AccessEvents and folds them into the same tracker/notification path"
+      offenders.rs:       "the persistent per-(identity, device, source) denial table behind `hwprivacy-ctl offenders`. Survives restarts; $XDG_STATE_HOME/hwprivacy/offenders.json, atomic writes. Undocumented here until 2026-08-21."
 
   hwprivacy-ctl:
     loc: 230
@@ -103,7 +105,11 @@ crates:
     loc: 2434
     tests: 44
     purpose: "The root helper. Owns the BPF maps and is the only writer to them."
-    runs_as: "root, by hand. NO systemd unit exists (Phase 4 not started)."
+    runs_as: >
+      root, as hwprivacy-lsm.service (/usr/lib/systemd/system/), enabled and
+      started at boot BEFORE the user daemon. Installed 2026-08-20; verified
+      across two boots on 2026-08-21, NRestarts=0. Docs written before that date
+      say it is started by hand — they are wrong.
     files:
       main.rs:         "CLI, BPF load/attach, the event loop, /proc enrichment, coalescing. BPF maps never leave the main thread."
       device_index.rs: "maps (major,minor) -> a human device name; owns glibc_to_kernel_dev()"
@@ -167,6 +173,7 @@ enforcement_pipeline_layer_2_kernel:
   steps:
     - "1. helper starts as root, loads the BPF object, attaches, binds /run/hwprivacy/lsm.sock (0660, group = desktop user)"
     - "2. daemon's lsm_client connects; on failure it retries every 10s, forever"
+    - "2b. every policy.exe_recheck_secs the daemon fingerprints the intended allowlist — (exe_path, dev, ino) per entry plus the enforce flag — and re-pushes if it moved. Without this the kernel map went stale on a package upgrade (16h of silent non-enforcement, measured 2026-08-20) and rule changes from ctl/tui/gui never arrived at all. See DECISIONS d-policy-fingerprint."
     - "3. daemon derives the allowlist from config: only `allow` + a resolvable exe_path becomes a PolicyEntry (dev, ino)"
     - "4. rules that want the camera but whose exe_path does not resolve are returned as UnresolvedEntry and surfaced to the user"
     - "5. kernel: on open() of major 81/116, look up the calling executable's (dev, ino) in the allowlist"
@@ -180,11 +187,12 @@ enforcement_pipeline_layer_2_kernel:
     /usr/lib/firefox-esr/firefox-esr and ~/firefox-developer/firefox-bin are
     different inodes and therefore different policy keys. That is the feature.
   notification_path: >
-    Kernel denials use an INFORMATIONAL notification with no action buttons,
-    deliberately. The action path carries blocker b1 (dismiss writes a
-    permanent deny); routing a new event source through it would inherit that
-    bug on day one. Kernel camera policy is edited in config.toml until b1 is
-    fixed.
+    Kernel denials use an INFORMATIONAL notification with no action buttons.
+    Originally because the action path carried b1 (dismiss wrote a permanent
+    deny). b1 was fixed on 2026-08-21, so that reason has expired — but the
+    buttons have NOT been added back, and adding them is a decision, not a
+    cleanup: a kernel allow means writing an exe_path, which the prompt has no
+    way to resolve from an event.
   critical_limitation: >
     Cannot revoke an ALREADY-OPEN fd. The hook fires on open(), not on read.
     Costin observed live camera video while enforcement was on, because Firefox
@@ -241,15 +249,15 @@ dbus_api:
   method_list:
     - "GetDevices() -> a(sssb)              (category, node, description, guarded)"
     - "GetRules() -> a(sss)                 (app, device, permission)"
-    - "SetRule(app, device, perm) -> b"
+    - "SetRule(app, device, perm) -> b        (false if the name cannot become a rule key)"
     - "RemoveRule(app) -> b"
     - "GetActiveStreams() -> a(susssssb)    (app, pid, device, node, media, perm, active)"
     - "GetStatus() -> (buuuu)               (running, devices, rules, blocked, streams)"
     - "GetEvents(last_n) -> a(ssss)         (timestamp, app, device, action)"
     - "BlockAll() -> b"
     - "UnblockAll() -> b"
-    - "AllowStream(serial) -> b"
-    - "DenyStream(serial) -> b"
+    - "AllowStream(node_id, app_name) -> b   (both: a node id alone is not an identity)"
+    - "DenyStream(node_id) -> b"
   signals_declared: ["AccessAttempt", "RuleChanged", "StreamEvent"]
   signals_actually_emitted: ["RuleChanged"]
   consequence: >
@@ -286,7 +294,13 @@ deployment:
     `make install` (which targets /usr/bin, needs sudo) has never been run and
     no .deb has ever been built.
   after_rebuild: "install -m 0755 target/release/hwprivacy-{daemon,ctl,tui,gui} ~/.local/bin/ && systemctl --user restart hwprivacy"
-  kernel_helper_unit: "NONE. Phase 4. Until it exists, layer 2 enforces only while a human is running the helper."
+  kernel_helper_unit: >
+      hwprivacy-lsm.service, enabled, at /usr/lib/systemd/system/. Binary in
+      /usr/bin, not ~/.local/bin. Runs:
+        hwprivacy-lsm --socket /run/hwprivacy/lsm.sock --socket-group hwprivacy
+                      --policy-cache /var/lib/hwprivacy/policy --enforce --json
+      Enforces from the cache before any user session exists. Still never
+      pinned: stopping the service detaches the program and restores access.
   debian_dir: "complete (control, rules, changelog, copyright, compat, .service, .desktop, 4x .install) but never exercised"
 
 external_dependencies:

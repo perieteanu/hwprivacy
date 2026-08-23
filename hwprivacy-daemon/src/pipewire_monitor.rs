@@ -19,6 +19,10 @@ pub struct PwLink {
 pub struct GraphSnapshot {
     /// All nodes: id → properties
     pub nodes: HashMap<u32, NodeInfo>,
+    /// All ports: id → properties. Needed to tell one microphone from another
+    /// — a stereo capture device exposes `capture_FL` and `capture_FR`, and the
+    /// port is the only thing distinguishing the two links.
+    pub ports: HashMap<u32, PortInfo>,
     /// All active links
     pub links: Vec<PwLink>,
 }
@@ -31,6 +35,20 @@ pub struct NodeInfo {
     pub app_name: String,
     pub pid: u32,
     pub media_name: String,
+}
+
+/// One port on a node.
+///
+/// `name` is the stable identity — `capture_FL`, `monitor_FR`. Port **ids** are
+/// allocated per session and must never be used to order or identify a port
+/// that a rule or a label will refer to.
+#[derive(Debug, Clone)]
+pub struct PortInfo {
+    pub id: u32,
+    pub node_id: u32,
+    pub name: String,
+    /// "in" or "out", as PipeWire reports it.
+    pub direction: String,
 }
 
 /// Capture the current PipeWire graph state via pw-dump.
@@ -75,6 +93,11 @@ pub async fn capture_graph() -> Result<GraphSnapshot> {
                     snapshot.nodes.insert(id, info);
                 }
             }
+            "PipeWire:Interface:Port" => {
+                if let Some(port) = parse_port(id, obj) {
+                    snapshot.ports.insert(id, port);
+                }
+            }
             "PipeWire:Interface:Link" => {
                 if let Some(link) = parse_link(id, obj) {
                     snapshot.links.push(link);
@@ -85,8 +108,9 @@ pub async fn capture_graph() -> Result<GraphSnapshot> {
     }
 
     trace!(
-        "Graph snapshot: {} nodes, {} links",
+        "Graph snapshot: {} nodes, {} ports, {} links",
         snapshot.nodes.len(),
+        snapshot.ports.len(),
         snapshot.links.len()
     );
 
@@ -227,6 +251,31 @@ fn proc_cgroup_unit(pid: u32) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
+}
+
+/// Parse a `PipeWire:Interface:Port`.
+///
+/// A port with no `port.name` is dropped rather than given a placeholder: the
+/// name is what makes an ordinal stable across reboots, and an ordinal derived
+/// from anything else is a claim that will quietly stop being true.
+fn parse_port(id: u32, obj: &Value) -> Option<PortInfo> {
+    let props = obj.get("info")?.get("props")?;
+    let node_id = props.get("node.id").and_then(prop_as_u32)?;
+    let name = props.get("port.name").and_then(|v| v.as_str())?.to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let direction = props
+        .get("port.direction")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(PortInfo {
+        id,
+        node_id,
+        name,
+        direction,
+    })
 }
 
 fn parse_link(id: u32, obj: &Value) -> Option<PwLink> {

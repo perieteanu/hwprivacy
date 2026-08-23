@@ -38,8 +38,20 @@ config_file:
   path: "~/.config/hwprivacy/config.toml"
   owner: "the daemon"
   format: "TOML — [policy], [devices], and a [[rules]] array"
-  rule_shape: "{app_name, microphone, camera, monitor} — every rule carries all three categories"
+  rule_shape: "{app_name, microphone, camera, monitor, exe_path?} — every rule carries all three categories"
   default_for_unset_category: "deny  (serde default = default_deny)"
+  policy_knobs:
+    default_action: "deny since 2026-08-21 (d-deny-by-default). A config that OMITS the field now deserialises to deny, not ask."
+    poll_interval_ms: "500. Raising it buys CPU by widening the race window — the wrong trade for a security tool."
+    dismiss_cooldown_secs: "60. How long one (app, device) stays quiet after its prompt was dismissed."
+    exe_recheck_secs: "30, 0 disables. How often the daemon re-stats the kernel allowlist's executables to notice a package upgrade changed an inode. See DECISIONS d-policy-fingerprint."
+  rule_names_are_sanitised_on_write: >
+    set_rule() runs config::sanitize_rule_name(), which strips a trailing
+    "(pid:N)", normalises, and REFUSES anything that cannot become a key —
+    empty, or a bare "[annotation]". It returns false rather than storing junk.
+    The MATCHER (normalize_app_name) is deliberately untouched: it runs on every
+    lookup and decides access, so widening it to repair a write-time mistake
+    would make all future matching fuzzier.
   hand_editing:
     allowed: "yes, but stop the daemon first"
     warning: >
@@ -56,15 +68,25 @@ notifications:
   action_ids_permanent: ["allow", "ask_each", "while_in_use", "deny"]
   action_ids_per_stream: ["allow_stream", "deny_stream"]
   body_markup: "freedesktop HTML subset — <b>, <i>, <u> only"
+  rule_key_line: >
+    Every body that names an app also prints "Rule name: <key>" — the string
+    that will actually match. The pid stays visible because it distinguishes two
+    instances, but it is no longer the only thing there is to copy.
   dismiss_contract:
-    documented: "no rule saved + 60s cooldown before re-prompting"
-    actual: "a permanent `deny` rule is written — see DECISIONS.yaml d-dismiss-defect"
+    contract: "block this attempt, save NO rule, stay quiet for policy.dismiss_cooldown_secs, ask again after it"
+    since: "2026-08-21 — see DECISIONS.yaml d-dismiss-saves-nothing"
+    history: >
+      Until then a dismissal wrote a permanent `deny` rule and the cooldown code
+      was unreachable. The same expression also turned a FAILED notification —
+      headless session, no notification daemon — into a permanent deny.
+    three_outcomes: "notification::PromptOutcome is Chosen | Dismissed | Failed. Only Chosen may be persisted, and only notification::decide() decides that."
 
 logging:
   framework: "tracing + tracing_subscriber::fmt, level from RUST_LOG (unit sets RUST_LOG=info)"
   read_with: "journalctl --user -u hwprivacy -f"
-  event_ring_buffer: "500 entries, in memory, lost on restart. There is no persistent audit log."
-  event_timestamp: "chrono::Local, '%H:%M:%S' — time only, no date. Useless past midnight."
+  event_ring_buffer: "500 entries, in memory, lost on restart. The PERSISTENT record is the offenders table (offenders.rs) plus the journal."
+  event_timestamp: "chrono::Local, '%Y-%m-%d %H:%M:%S'. ISO order rather than the project's usual EU order because these lines get sorted and grepped as text. It was time-only until 2026-08-19 (gap g4)."
+  event_device_column: "device_display() — 'microphone (mic2)' when the node presents several. Was the bare category, which made two different microphones indistinguishable in the log (half of b3)."
 
 code_style:
   edition: "2021"
@@ -76,18 +98,36 @@ code_style:
   lint: "cargo check is clean. clippy is NOT installed for this toolchain (`cargo clippy` -> no such command)."
 
 testing:
-  current: "none — zero #[test] in the workspace"
-  when_added_start_with:
-    - "normalize_app_name() — table-driven, including the '(pid:N)' trap case"
-    - "Permission / DeviceCategory FromStr <-> Display round-trip"
-    - "classify_link() against captured pw-dump JSON fixtures (mic capture, monitor tap, plain playback)"
-    - "Config TOML round-trip with a missing category field (must default to deny)"
-  rationale: "classify_link and normalize_app_name are pure functions holding the entire security decision. They are the cheapest possible tests and do not exist."
+  current: "120 tests — 15 common, 50 daemon, 49 lsm, 6 proto. Zero in ctl/tui/gui."
+  still_uncovered:
+    - "parse_node() / parse_link() / parse_port() against real pw-dump JSON. classify_link() is covered as of 2026-08-21, but from hand-built structs — the JSON parsing in front of it is not."
+    - "the three frontends (ctl, tui, gui)."
+  classify_link_covered_2026_08_21: >
+    14 tests, built from node and port ids read out of this laptop's live graph.
+    The one that matters most: ordinary playback INTO a sink must not be
+    classified as a monitor tap. d-monitor-tap-by-link-direction rests entirely
+    on that and nothing had ever checked it — a regression there would start
+    tearing down music playback.
+  house_rule_assert_on_state: >
+    Never assert on log text or on process names. Four instruments failed on
+    2026-08-19 while the product behaved correctly — a grep for a line --json
+    suppresses, two pkill -f patterns matching the checking shell itself, and a
+    test that killed the helper mid-push then deleted the log proving it. Assert
+    on state: does the map hold the key, is the rule in the config, is the open
+    denied.
+  house_rule_prove_the_test_fails: >
+    A test that passes against the bug it exists to catch is worthless. Every
+    test added on 2026-08-21 was run against the deliberately reintroduced
+    defect and observed to FAIL before being kept — the same discipline used for
+    the b5 regression test.
+  regression_sentinels: >
+    tools/doc-check carries SENTINELS: source patterns that must never reappear,
+    each one a defect that actually shipped. Add an entry only after a bug has
+    occurred, never speculatively.
 
 repo_hygiene:
-  version_control: "NONE — this is not a git repository as of 2026-08-04"
+  version_control: "git, since 2026-08-04. target/ is ignored. Docs predating that date claim otherwise and are wrong."
   size: "3.2 GB, almost entirely target/"
-  when_git_is_added: "gitignore target/ first, before the initial commit"
   log_md: "append-only, global format: DD-MM-YYYY HH:MM | DDD | hw | [TYPE] desc"
   short_name: "hw  (as registered in project-tracker projects.yaml)"
 
@@ -140,10 +180,33 @@ multiple_devices_of_one_kind:
     are the fallback for indistinguishable devices on one physical adapter,
     not the default for everything.
   applies_to:
-    - "notification text — the user must be able to tell two prompts apart"
-    - "rules in config.toml"
-    - "the offenders table, or two mics collapse into one row"
-    - "hwprivacy-ctl devices"
+    - "notification text — the user must be able to tell two prompts apart  [DONE 2026-08-21]"
+    - "the event log and hwprivacy-ctl log  [DONE 2026-08-21]"
+    - "rules in config.toml  [NOT DONE — rules are still per CATEGORY; per-device rules stay deferred]"
+    - "the offenders table, or two mics collapse into one row  [NOT DONE]"
+    - "hwprivacy-ctl devices  [NOT DONE]"
+  does_NOT_apply_to_the_monitor_category:
+    rule: "A playback sink is never given an ordinal."
+    why: >
+      monitor_FL and monitor_FR are two CHANNELS of one playback device, not two
+      devices. Labelling them would invent a second speaker pair. Their links
+      are coalesced into a single prompt instead — the opposite treatment from
+      the microphone, and deliberately so. See DECISIONS d-coalesce-by-category.
+    the_test: >
+      Not "do the two links look alike" — they do, in both cases. It is "can the
+      user meaningfully answer differently for each". Two microphones: yes. Two
+      channels of one speaker pair: no.
+  implementation_2026_08_21:
+    where: "policy_engine::device_instance()"
+    sorted_by: "port NAME, ascending. Never port id, never discovery order."
+    returns_none_when: "the node has fewer than two ports facing that direction, or the port cannot be resolved. A missing ordinal is honest; a wrong one is not."
+    direction_matters: >
+      Only ports facing the same way as the one used are counted. A sink has
+      playback_* facing in and monitor_* facing out and they are not one
+      population. NOTE: on this laptop "monitor" happens to sort before
+      "playback", so a test built on this hardware passes even with the
+      direction filter removed — the first version of that test did exactly
+      that and proved nothing.
   worked_example_2026_08_19: >
     This laptop: one ALSA stereo capture device, two physical microphones,
     exposed by PipeWire as ports capture_FL and capture_FR. Sorted by name that

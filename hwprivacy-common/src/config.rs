@@ -102,27 +102,58 @@ impl AppRule {
 /// Global policy settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyConfig {
-    /// Default action when no rule matches: "ask" (recommended) or "deny"
-    #[serde(default = "default_ask")]
+    /// Action when no rule matches. `deny` by default — settled 2026-08-21,
+    /// resolving `DECISIONS.yaml > d-posture-unsettled`, which had README
+    /// claiming deny-all while the shipped config said `ask`.
+    ///
+    /// An app with no rule is denied and gets the instant BLOCKED
+    /// notification. `ask` still works and is still honoured; it is now opt-in
+    /// per rule rather than the fallback for everything unknown.
+    #[serde(default = "default_deny_action")]
     pub default_action: Permission,
     /// Poll interval in milliseconds
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
+    /// How long to stay quiet about one (app, device) after the user dismissed
+    /// its prompt, in seconds. Was a `const` in stream_tracker.rs.
+    #[serde(default = "default_dismiss_cooldown")]
+    pub dismiss_cooldown_secs: u64,
+    /// How often the daemon re-checks that the executables in the kernel
+    /// allowlist are still the same files, in seconds.
+    ///
+    /// This is not a poll of the world — it is a handful of `stat()` calls on
+    /// the paths already named in the config, and it exists because a package
+    /// upgrade changes a binary's inode while the kernel map keeps the old one.
+    /// Measured 2026-08-20: firefox-esr was upgraded two minutes after the
+    /// policy push and lost the camera for sixteen hours while every status
+    /// surface reported healthy.
+    #[serde(default = "default_exe_recheck")]
+    pub exe_recheck_secs: u64,
 }
 
-fn default_ask() -> Permission {
-    Permission::Ask
+fn default_deny_action() -> Permission {
+    Permission::Deny
 }
 
 fn default_poll_interval() -> u64 {
     500
 }
 
+fn default_dismiss_cooldown() -> u64 {
+    60
+}
+
+fn default_exe_recheck() -> u64 {
+    30
+}
+
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            default_action: Permission::Ask,
-            poll_interval_ms: 500,
+            default_action: default_deny_action(),
+            poll_interval_ms: default_poll_interval(),
+            dismiss_cooldown_secs: default_dismiss_cooldown(),
+            exe_recheck_secs: default_exe_recheck(),
         }
     }
 }
@@ -259,13 +290,32 @@ impl Config {
         }
     }
 
-    /// Set a rule. Creates a new entry if app not found.
-    pub fn set_rule(&mut self, app_name: &str, category: &super::DeviceCategory, perm: Permission) {
-        if let Some(rule) = self.find_rule_mut(app_name) {
+    /// Set a rule. Creates a new entry if the app is not found.
+    ///
+    /// Returns `false` and writes nothing if the name cannot become a usable
+    /// rule key. That is blocker b4: `set_rule` used to store whatever string
+    /// it was handed, so a label copied out of a notification body —
+    /// `Firefox [pipewire-pulse] (pid:2332)` — became a rule that can never
+    /// match anything, because [`normalize_app_name`] only strips a trailing
+    /// `[...]` and that string ends with `)`. Three such rules were sitting in
+    /// the live config on 2026-08-21, one of them the empty string.
+    ///
+    /// Names are sanitised on WRITE, not on lookup — see [`sanitize_rule_name`]
+    /// for why the matcher itself is deliberately left alone.
+    pub fn set_rule(
+        &mut self,
+        app_name: &str,
+        category: &super::DeviceCategory,
+        perm: Permission,
+    ) -> bool {
+        let Some(key) = sanitize_rule_name(app_name) else {
+            return false;
+        };
+        if let Some(rule) = self.find_rule_mut(&key) {
             rule.set_permission(category, perm);
         } else {
             let mut rule = AppRule {
-                app_name: app_name.to_string(),
+                app_name: key,
                 microphone: Permission::Deny,
                 camera: Permission::Deny,
                 monitor: Permission::Deny,
@@ -279,6 +329,7 @@ impl Config {
             rule.set_permission(category, perm);
             self.rules.push(rule);
         }
+        true
     }
 
     /// Remove all rules for an app.
@@ -367,6 +418,59 @@ pub fn normalize_app_name(app_name: &str) -> String {
         _ => app_name,
     };
     trimmed.trim().to_lowercase()
+}
+
+/// Turn a human-supplied string into a storable rule key, or `None` if it
+/// cannot become one.
+///
+/// # Why this is separate from [`normalize_app_name`]
+///
+/// They run at different times and must stay different. `normalize_app_name` is
+/// the MATCHER: it runs on every lookup, against names PipeWire reports, and it
+/// is deliberately narrow — it exists to make `OBS`, `obs` and
+/// `OBS [pipewire-pulse]` share one rule, and nothing more. Widening it would
+/// make every future lookup fuzzier, which is the wrong direction for the
+/// function that decides access.
+///
+/// This one runs once, on WRITE, on a string a human typed or pasted. It can
+/// afford to be forgiving because a bad result is visible immediately in
+/// `config.toml` rather than silently wrong forever.
+///
+/// What it repairs is the pid trap: notification bodies render
+/// `{app} (pid:{n})`, users paste the whole thing, and the result ends with `)`
+/// so the matcher strips nothing and the rule is dead on arrival.
+pub fn sanitize_rule_name(app_name: &str) -> Option<String> {
+    let mut s = app_name.trim();
+
+    // Strip a trailing "(pid:N)". Only the pid form, and only at the end —
+    // an app legitimately named "Foo (Beta)" must survive untouched.
+    if s.ends_with(')') {
+        if let Some(open) = s.rfind('(') {
+            let inner = &s[open + 1..s.len() - 1];
+            if let Some(digits) = inner.strip_prefix("pid:") {
+                if !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                    s = s[..open].trim_end();
+                }
+            }
+        }
+    }
+
+    let key = normalize_app_name(s);
+    if key.is_empty() {
+        return None;
+    }
+
+    // A key that is nothing but a bracketed annotation — "[pipewire-pulse]" —
+    // can never match either. `normalize_app_name` strips a trailing " [...]"
+    // only when something precedes it, so no real application name ever
+    // normalises to this shape. It is the residue of a label that lost its app
+    // name, and one of the three dead rules found in the live config was
+    // exactly this family.
+    if key.starts_with('[') && key.ends_with(']') {
+        return None;
+    }
+
+    Some(key)
 }
 
 #[cfg(test)]
@@ -484,5 +588,85 @@ monitor = "deny"
             c.get_permission("never-seen", &DeviceCategory::Camera),
             c.policy.default_action
         );
+    }
+
+    /// Settled 2026-08-21. README claimed deny-all for months while the shipped
+    /// config said `ask`; the code honoured the config, so the effective
+    /// behaviour was "prompt, then keep whatever you ignored".
+    #[test]
+    fn an_app_with_no_rule_is_denied_by_default() {
+        let c = Config::default();
+        assert_eq!(c.policy.default_action, Permission::Deny);
+        assert_eq!(
+            c.get_permission("never-seen", &DeviceCategory::Camera),
+            Permission::Deny
+        );
+    }
+
+    /// An existing config that predates the knob must not silently keep `ask`.
+    #[test]
+    fn a_config_without_default_action_deserialises_to_deny() {
+        let c: Config = toml::from_str("[policy]\npoll_interval_ms = 500\n").unwrap();
+        assert_eq!(c.policy.default_action, Permission::Deny);
+        assert_eq!(c.policy.dismiss_cooldown_secs, 60);
+        assert_eq!(c.policy.exe_recheck_secs, 30);
+    }
+
+    /// b4, the exact string found dead in the live config on 2026-08-21.
+    /// A label pasted out of a notification body must become a rule that WORKS.
+    #[test]
+    fn a_pasted_notification_label_becomes_a_usable_rule() {
+        let mut c = Config::default();
+        assert!(c.set_rule(
+            "Firefox [pipewire-pulse] (pid:2332)",
+            &DeviceCategory::Camera,
+            Permission::Allow
+        ));
+        assert_eq!(c.rules.len(), 1);
+        assert_eq!(c.rules[0].app_name, "firefox", "stored key must be clean");
+        assert!(
+            c.find_rule("Firefox").is_some(),
+            "and it must actually match the app it was written for"
+        );
+        assert_eq!(
+            c.get_permission("Firefox [pipewire-pulse]", &DeviceCategory::Camera),
+            Permission::Allow
+        );
+    }
+
+    /// The empty-string rule was also live. It can never match — `parse_node`
+    /// falls back to the literal "unknown", never to "".
+    #[test]
+    fn a_name_that_cannot_become_a_key_is_refused_and_writes_nothing() {
+        let mut c = Config::default();
+        for junk in ["", "   ", "(pid:99)", " [pipewire-pulse] "] {
+            assert!(!c.set_rule(junk, &DeviceCategory::Camera, Permission::Allow),
+                "{junk:?} must be refused");
+        }
+        assert!(c.rules.is_empty(), "nothing may be written: {:?}", c.rules);
+    }
+
+    /// Only the `(pid:N)` form is stripped, and only at the end. An app really
+    /// called "Foo (Beta)" must keep its name — over-stripping would silently
+    /// merge two different applications into one rule.
+    #[test]
+    fn sanitize_only_strips_a_trailing_pid_and_leaves_other_parentheses_alone() {
+        assert_eq!(sanitize_rule_name("Firefox (pid:2332)").as_deref(), Some("firefox"));
+        assert_eq!(sanitize_rule_name("Foo (Beta)").as_deref(), Some("foo (beta)"));
+        assert_eq!(sanitize_rule_name("Foo (pid:)").as_deref(), Some("foo (pid:)"));
+        assert_eq!(sanitize_rule_name("Foo (pid:abc)").as_deref(), Some("foo (pid:abc)"));
+        assert_eq!(sanitize_rule_name("obs").as_deref(), Some("obs"));
+    }
+
+    /// Setting a second category on a pasted label must find the rule the first
+    /// call created, not add a duplicate under a different spelling.
+    #[test]
+    fn two_writes_from_different_spellings_land_on_one_rule() {
+        let mut c = Config::default();
+        assert!(c.set_rule("Firefox [pipewire-pulse] (pid:1)", &DeviceCategory::Camera, Permission::Allow));
+        assert!(c.set_rule("firefox", &DeviceCategory::Microphone, Permission::Deny));
+        assert_eq!(c.rules.len(), 1, "{:?}", c.rules);
+        assert_eq!(c.rules[0].camera, Permission::Allow);
+        assert_eq!(c.rules[0].microphone, Permission::Deny);
     }
 }

@@ -87,7 +87,117 @@ pub async fn run(state: SharedState, socket_path: Option<String>) {
     }
 }
 
-/// One connection: handshake, push policy, then stream events until it drops.
+/// What the daemon believes it has pushed: the intended allowlist, plus the
+/// identity of each file *as it is on disk right now*, plus the enforcement
+/// flag.
+///
+/// # Why the on-disk identity is part of it
+///
+/// The kernel matches on the executable's inode. A package upgrade replaces the
+/// binary, giving the same path a new inode, and the map keeps the old one — so
+/// the application is silently denied while `config.toml` still says `allow`
+/// and `hwprivacy-ctl status` still reports it allowed. Measured on the live
+/// system on 2026-08-20: `firefox-esr` was upgraded two minutes after the
+/// policy push and lost the camera for sixteen hours. It "fixed itself" at the
+/// next reboot, when the helper reloaded its cache, which is exactly why it had
+/// never been noticed.
+///
+/// Comparing this each tick also catches the *other* way the map goes stale:
+/// `SetPolicy` used to be sent once per connection and never again, so a rule
+/// changed with `hwprivacy-ctl`, the TUI or the GUI did not reach the kernel
+/// until something restarted.
+///
+/// The `(dev, ino)` here are glibc-encoded and used ONLY to detect change.
+/// Authoritative resolution into kernel dev encoding stays in the helper's
+/// `PolicyKey::from_path` — the two encodings differ, and duplicating that
+/// conversion is the trap that has already bitten this project twice.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct PolicyFingerprint {
+    /// `(exe_path, dev, ino)`, sorted. `None` for a path that does not resolve
+    /// — a file that is missing is itself a state worth re-pushing on.
+    files: Vec<(String, Option<(u64, u64)>)>,
+    enforce_camera: bool,
+}
+
+impl PolicyFingerprint {
+    /// Sorted, so a reordering of `config.toml` is not mistaken for a change.
+    fn take(entries: &[PolicyEntry], enforce_camera: bool) -> Self {
+        let mut files: Vec<(String, Option<(u64, u64)>)> = entries
+            .iter()
+            .map(|e| (e.exe_path.clone(), stat_identity(&e.exe_path)))
+            .collect();
+        files.sort();
+        files.dedup();
+        PolicyFingerprint {
+            files,
+            enforce_camera,
+        }
+    }
+
+    /// Human-readable description of what moved, for the journal. An INFO line
+    /// naming `old ino → new ino` is what would have made the 2026-08-20
+    /// failure a five-minute diagnosis instead of an invisible one.
+    fn describe_change(&self, prev: &PolicyFingerprint) -> String {
+        let mut notes = Vec::new();
+        if self.enforce_camera != prev.enforce_camera {
+            notes.push(format!(
+                "camera enforcement {} → {}",
+                prev.enforce_camera, self.enforce_camera
+            ));
+        }
+        for (path, now) in &self.files {
+            match prev.files.iter().find(|(p, _)| p == path) {
+                None => notes.push(format!("added {path}")),
+                Some((_, before)) if before != now => notes.push(match (before, now) {
+                    (Some((_, old)), Some((_, new))) => {
+                        format!("{path} ino {old} → {new} (binary replaced)")
+                    }
+                    (Some(_), None) => format!("{path} disappeared"),
+                    (None, Some(_)) => format!("{path} appeared"),
+                    (None, None) => unreachable!("equal values are filtered above"),
+                }),
+                Some(_) => {}
+            }
+        }
+        for (path, _) in &prev.files {
+            if !self.files.iter().any(|(p, _)| p == path) {
+                notes.push(format!("removed {path}"));
+            }
+        }
+        if notes.is_empty() {
+            "no visible difference".to_string()
+        } else {
+            notes.join("; ")
+        }
+    }
+}
+
+/// glibc `(dev, ino)` of a path, or `None` if it cannot be stat'ed.
+fn stat_identity(path: &str) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|md| (md.dev(), md.ino()))
+}
+
+/// The allowlist the config currently intends, plus the enforcement flag and
+/// any rules that cannot reach the kernel layer.
+async fn intended_policy(state: &SharedState) -> (Vec<PolicyEntry>, bool, Vec<(String, &'static str)>) {
+    let s = state.read().await;
+    let entries: Vec<PolicyEntry> = s
+        .config
+        .kernel_camera_allowlist()
+        .into_iter()
+        .map(|(exe_path, _)| PolicyEntry {
+            exe_path,
+            perms: PERM_CAMERA,
+        })
+        .collect();
+    // The kernel layer enforces only when the guard for cameras is on.
+    let enforce = s.config.devices.is_guarded(&DeviceCategory::Camera);
+    (entries, enforce, s.config.kernel_camera_gaps())
+}
+
+/// One connection: handshake, push policy, then stream events until it drops —
+/// re-pushing whenever the intended policy or the files behind it change.
 async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> {
     let (rx, mut tx) = stream.into_split();
     let mut lines = BufReader::new(rx).lines();
@@ -102,26 +212,13 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
 
     // Push the allowlist immediately. Until this lands the helper is enforcing
     // whatever it was started with, which may be nothing.
-    let (entries, enforce, gaps) = {
-        let s = state.read().await;
-        let entries: Vec<PolicyEntry> = s
-            .config
-            .kernel_camera_allowlist()
-            .into_iter()
-            .map(|(exe_path, _)| PolicyEntry {
-                exe_path,
-                perms: PERM_CAMERA,
-            })
-            .collect();
-        // The kernel layer enforces only when the guard for cameras is on.
-        let enforce = s.config.devices.is_guarded(&DeviceCategory::Camera);
-        (entries, enforce, s.config.kernel_camera_gaps())
-    };
+    let (entries, mut enforce, gaps) = intended_policy(state).await;
 
     for (app, why) in &gaps {
         warn!("Kernel layer gap: rule '{}' — {}", app, why);
     }
 
+    let mut fingerprint = PolicyFingerprint::take(&entries, enforce);
     tx.write_all(
         encode_line(&Request::SetPolicy {
             entries: entries.clone(),
@@ -131,7 +228,45 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
     )
     .await?;
 
-    while let Some(line) = lines.next_line().await? {
+    let recheck = {
+        let s = state.read().await;
+        // 0 disables the check. Guard the interval anyway: tokio panics on a
+        // zero period, and a config typo must not take the daemon down.
+        s.config.policy.exe_recheck_secs
+    };
+    let mut recheck_tick = tokio::time::interval(Duration::from_secs(recheck.max(1)));
+    recheck_tick.tick().await; // the first tick completes immediately
+
+    loop {
+        let line = tokio::select! {
+            line = lines.next_line() => match line? {
+                Some(l) => l,
+                None => break,
+            },
+            _ = recheck_tick.tick(), if recheck > 0 => {
+                let (entries, want_enforce, _) = intended_policy(state).await;
+                let next = PolicyFingerprint::take(&entries, want_enforce);
+                if next != fingerprint {
+                    info!(
+                        "Kernel layer: policy changed under us ({}); re-pushing {} entr(ies)",
+                        next.describe_change(&fingerprint),
+                        entries.len()
+                    );
+                    tx.write_all(
+                        encode_line(&Request::SetPolicy {
+                            entries,
+                            enforce_camera: want_enforce,
+                        })?
+                        .as_bytes(),
+                    )
+                    .await?;
+                    fingerprint = next;
+                    enforce = want_enforce;
+                }
+                continue;
+            }
+        };
+
         if line.trim().is_empty() {
             continue;
         }
@@ -249,7 +384,9 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     {
         let mut s = state.write().await;
         s.tracker
-            .log_event(&app, ev.pid, category, &ev.exe_path, action);
+            // No instance: the kernel layer sees a device NODE (/dev/video0),
+            // not a PipeWire port, so it has nothing to disambiguate with.
+            .log_event(&app, ev.pid, category, None, &ev.exe_path, action);
 
         // denied_opens() is the single statement of how much this event is
         // worth. log_event() has ALREADY added one for a Denied action, so add
@@ -364,6 +501,118 @@ pub fn kernel_permission_for(allowed: bool) -> Permission {
 mod tests {
     use super::*;
 
+    fn entry(path: &str) -> PolicyEntry {
+        PolicyEntry {
+            exe_path: path.to_string(),
+            perms: PERM_CAMERA,
+        }
+    }
+
+    /// A scratch file we can replace in place, so "same path, different inode"
+    /// is a real filesystem event and not a mocked one.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("hwp-fp-{}-{tag}", std::process::id()));
+        std::fs::write(&p, tag).unwrap();
+        p
+    }
+
+    /// The 2026-08-20 failure, reproduced: `firefox-esr` was upgraded two
+    /// minutes after the policy push. The path never changed, the inode did,
+    /// and the kernel kept matching on the old one — so an allowlisted app was
+    /// denied the camera for sixteen hours while `config.toml` said `allow` and
+    /// `hwprivacy-ctl status` said it was allowed.
+    ///
+    /// Detecting this is the entire point of the fingerprint.
+    #[test]
+    fn replacing_a_binary_in_place_changes_the_fingerprint() {
+        let path = scratch("upgrade");
+        let name = path.to_string_lossy().to_string();
+        let entries = vec![entry(&name)];
+
+        let before = PolicyFingerprint::take(&entries, true);
+
+        // What dpkg does: a new file, moved over the old path. Same name,
+        // new inode. `write()` alone would reuse the inode and prove nothing.
+        let tmp = path.with_extension("new");
+        std::fs::write(&tmp, "upgraded").unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+
+        let after = PolicyFingerprint::take(&entries, true);
+        assert_ne!(before, after, "an in-place replacement must be visible");
+        let why = after.describe_change(&before);
+        assert!(why.contains("binary replaced"), "{why}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Re-pushing on every tick would be pointless churn, and worse, would hide
+    /// the INFO line that says something really moved.
+    #[test]
+    fn an_unchanged_world_produces_an_unchanged_fingerprint() {
+        let path = scratch("stable");
+        let entries = vec![entry(&path.to_string_lossy())];
+        assert_eq!(
+            PolicyFingerprint::take(&entries, true),
+            PolicyFingerprint::take(&entries, true)
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The daemon rewrites the whole config file on any rule change, so entry
+    /// order is not stable. Order must not read as a change.
+    #[test]
+    fn reordering_the_config_is_not_a_change() {
+        let a = scratch("order-a");
+        let b = scratch("order-b");
+        let (a, b) = (a.to_string_lossy().to_string(), b.to_string_lossy().to_string());
+        assert_eq!(
+            PolicyFingerprint::take(&[entry(&a), entry(&b)], true),
+            PolicyFingerprint::take(&[entry(&b), entry(&a)], true)
+        );
+        let _ = std::fs::remove_file(&a);
+        let _ = std::fs::remove_file(&b);
+    }
+
+    /// The second bug the fingerprint closes: `SetPolicy` used to be sent once
+    /// per connection and never again, so adding or removing a camera rule from
+    /// `hwprivacy-ctl`, the TUI or the GUI did not reach the kernel until
+    /// something restarted.
+    #[test]
+    fn adding_or_removing_a_rule_is_a_change() {
+        let path = scratch("rules");
+        let name = path.to_string_lossy().to_string();
+        let none = PolicyFingerprint::take(&[], true);
+        let one = PolicyFingerprint::take(&[entry(&name)], true);
+        assert_ne!(none, one);
+        assert!(one.describe_change(&none).contains("added"));
+        assert!(none.describe_change(&one).contains("removed"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Turning the camera guard off is a policy change with no file behind it.
+    #[test]
+    fn toggling_enforcement_is_a_change() {
+        let on = PolicyFingerprint::take(&[], true);
+        let off = PolicyFingerprint::take(&[], false);
+        assert_ne!(on, off);
+        assert!(off.describe_change(&on).contains("enforcement"));
+    }
+
+    /// An allowlisted binary that is deleted must be noticed. Under
+    /// default-deny that app is now being denied, and the map still holds a key
+    /// for a file that no longer exists.
+    #[test]
+    fn a_vanished_binary_is_a_change() {
+        let path = scratch("vanish");
+        let name = path.to_string_lossy().to_string();
+        let entries = vec![entry(&name)];
+        let present = PolicyFingerprint::take(&entries, true);
+        std::fs::remove_file(&path).unwrap();
+        let gone = PolicyFingerprint::take(&entries, true);
+        assert_ne!(present, gone);
+        assert!(gone.describe_change(&present).contains("disappeared"));
+    }
+
     #[test]
     fn short_name_takes_the_binary_not_the_path() {
         assert_eq!(short_name("/usr/lib/firefox-esr/firefox-esr"), "firefox-esr");
@@ -379,10 +628,6 @@ mod tests {
         assert_eq!(short_name("/trailing/"), "/trailing/");
     }
 
-    /// A burst summary must be counted but must NOT notify — otherwise one
-    /// camera session produces two popups, which is the defect coalescing
-    /// exists to prevent.
-    #[test]
     /// The exact case measured on 2026-08-19 against the live kernel: one
     /// process opened /dev/video0 thirteen times inside the coalescing window
     /// and every open was denied. The helper reported one event plus a burst
@@ -426,9 +671,9 @@ mod tests {
         use hwprivacy_common::DeviceCategory;
         let mut t = crate::stream_tracker::StreamTracker::new();
         assert_eq!(t.blocked_count, 0);
-        t.log_event("x", 1, DeviceCategory::Camera, "/dev/video0", AccessAction::Denied);
+        t.log_event("x", 1, DeviceCategory::Camera, None, "/dev/video0", AccessAction::Denied);
         assert_eq!(t.blocked_count, 1, "log_event counts exactly one denial");
-        t.log_event("x", 1, DeviceCategory::Camera, "/dev/video0", AccessAction::Allowed);
+        t.log_event("x", 1, DeviceCategory::Camera, None, "/dev/video0", AccessAction::Allowed);
         assert_eq!(t.blocked_count, 1, "an allowed event must not count");
     }
 
@@ -468,6 +713,14 @@ mod tests {
         assert_eq!(denied_opens(&allowed_summary), 0);
     }
 
+    /// A burst summary must be counted but must NOT notify — otherwise one
+    /// camera session produces two popups, which is the defect coalescing
+    /// exists to prevent.
+    ///
+    /// This test had NO `#[test]` attribute from the day it was written until
+    /// 2026-08-21 — the attribute had been stacked twice on the function above
+    /// it instead. It compiled, it read as covered, and it never ran once.
+    #[test]
     fn a_burst_summary_is_identified_by_pid_zero() {
         let summary = AccessEvent {
             ts_unix: 0,
