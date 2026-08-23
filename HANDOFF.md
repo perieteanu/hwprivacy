@@ -247,6 +247,37 @@ Removing `ask_each` took away the only grant machinery that could have made it
 real. Options are in `ROADMAP > blockers > while_in_use_is_not_implemented`.
 Costin asked to keep it pending a decision; it is still on every prompt.
 
+### `while_in_use` now means something (layer 1)
+
+Costin asked whether it was implemented. It was not — `while_in_use_streams`
+written and read nowhere, `RevokedOnDisconnect` emitted nowhere, `evaluate`
+mapping it to `Allow`. And `evaluate()` had **no tests at all**, which is how
+that survived.
+
+**The claim that unblocked it was false.** Every doc and the notification body
+said "hwprivacy cannot tell when access ends". Layer 1 has always seen it — a
+vanishing link IS the release, and `main.rs` already pruned on it. And
+`bpf_lsm_file_release` is present in Debian 13's BTF, so layer 2 could see it
+too. The limitation was an unattached hook, not the platform. Nobody had checked.
+
+Now: no session → **ask**; answering opens the session; the session ends when
+the device is released; the next open asks again. Keyed on **(app, device)**,
+never a node id. `AccessAction::SessionEnded` is the first end-of-access event
+this project has ever had.
+
+`policy.while_in_use_settle_secs` (default 10) bridges the gap between the
+user's answer and the app's reconnect — enforcement destroys the link *before*
+the prompt, so there are legitimately zero links in that window. Without it the
+session dies in the gap and prompts forever, which is exactly how `ask_each`
+failed.
+
+**The camera refuses it** at write time, with the reason printed, and the prompt
+does not offer the button. Next step is a second BPF program on
+`lsm/file_release`.
+
+Live evidence: with `parecord mic = while_in_use`, opening the mic logged
+`ASKED`. The same rule before this change logged a silent `ALLOWED`.
+
 ### Also fixed, outside the plan
 
 `~/.config/autostart/hwprivacy-gui.desktop` pointed at

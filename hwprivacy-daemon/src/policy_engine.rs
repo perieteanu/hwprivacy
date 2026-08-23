@@ -4,7 +4,7 @@ use hwprivacy_common::{Config, DeviceCategory, Permission};
 use tracing::debug;
 
 /// The decision made by the policy engine for a link attempt.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyDecision {
     /// Allow the link — it stays
     Allow,
@@ -20,6 +20,9 @@ pub fn evaluate(
     config: &Config,
     stream: &StreamInfo,
     device: &ProtectedDevice,
+    // Whether a while_in_use session for this (app, device) is currently
+    // live. Ignored for every other permission.
+    session_live: bool,
 ) -> PolicyDecision {
     // Check if device category is guarded
     if !config.devices.is_guarded(&device.category) {
@@ -41,11 +44,20 @@ pub fn evaluate(
     match permission {
         Permission::Allow => PolicyDecision::Allow,
         Permission::Deny => PolicyDecision::Deny,
-        // NOT IMPLEMENTED, and the comment that used to sit here said it
-        // was. `while_in_use_streams` is written and never read; nothing ever
-        // emits AccessAction::RevokedOnDisconnect. Today this is a synonym for
-        // Allow. See ROADMAP > while_in_use_is_not_implemented.
-        Permission::WhileInUse => PolicyDecision::Allow,
+        // Allowed only while a session is live. The caller supplies that —
+        // it is state, not policy, and keeping evaluate() a pure function of
+        // its arguments is what makes every branch here testable.
+        //
+        // A session runs from the user's answer until the device is released.
+        // With no session, this is a question, not a refusal: the prompt is
+        // how a session begins. See d-while-in-use-is-a-session.
+        Permission::WhileInUse => {
+            if session_live {
+                PolicyDecision::Allow
+            } else {
+                PolicyDecision::AskUser
+            }
+        }
         Permission::Ask => PolicyDecision::AskUser,
     }
 }
@@ -339,4 +351,103 @@ mod tests {
         assert!(classify_link(46, 64, 4242, 0, &nodes, &ports, &devices).is_none());
     }
 
+
+    // ---------------------------------------------------------------------
+    // evaluate() — the core policy function, which had NO tests until
+    // 2026-08-23. That absence is why `while_in_use` could map straight to
+    // Allow for months without anyone noticing.
+    // ---------------------------------------------------------------------
+
+    use hwprivacy_common::Config;
+
+    fn cfg(app: &str, cat: DeviceCategory, perm: Permission) -> Config {
+        let mut c = Config::default();
+        assert!(c.set_rule(app, &cat, perm), "fixture rule must be accepted");
+        c
+    }
+
+    fn stream_of(app: &str) -> StreamInfo {
+        StreamInfo {
+            node_id: 99,
+            app_name: app.into(),
+            pid: 1234,
+            node_name: "app-capture".into(),
+            media_name: String::new(),
+            media_class: "Stream/Input/Audio".into(),
+        }
+    }
+
+    #[test]
+    fn allow_and_deny_are_unconditional() {
+        let mic = dev(DeviceCategory::Microphone, "alsa_input.analog-stereo", 46);
+        for (perm, want) in [
+            (Permission::Allow, PolicyDecision::Allow),
+            (Permission::Deny, PolicyDecision::Deny),
+        ] {
+            let c = cfg("obs", DeviceCategory::Microphone, perm);
+            for session in [true, false] {
+                assert_eq!(
+                    evaluate(&c, &stream_of("obs"), &mic, session),
+                    want,
+                    "{perm:?} must not depend on a session"
+                );
+            }
+        }
+    }
+
+    /// `while_in_use` is a SESSION, and this is the assertion that would have
+    /// caught it being a synonym for `allow`. With no session live it must ASK
+    /// — the prompt is how a session begins — and with one live it must allow
+    /// without asking again.
+    #[test]
+    fn while_in_use_allows_only_inside_a_live_session() {
+        let mic = dev(DeviceCategory::Microphone, "alsa_input.analog-stereo", 46);
+        let c = cfg("obs", DeviceCategory::Microphone, Permission::WhileInUse);
+
+        assert_eq!(
+            evaluate(&c, &stream_of("obs"), &mic, false),
+            PolicyDecision::AskUser,
+            "no session yet: ask, do not silently allow"
+        );
+        assert_eq!(
+            evaluate(&c, &stream_of("obs"), &mic, true),
+            PolicyDecision::Allow,
+            "session live: allow without asking again"
+        );
+    }
+
+    /// The whole point, stated as one assertion: `while_in_use` and `allow`
+    /// must NOT behave the same. They did, silently, until 2026-08-23.
+    #[test]
+    fn while_in_use_is_not_a_synonym_for_allow() {
+        let mic = dev(DeviceCategory::Microphone, "alsa_input.analog-stereo", 46);
+        let wiu = cfg("obs", DeviceCategory::Microphone, Permission::WhileInUse);
+        let allow = cfg("obs", DeviceCategory::Microphone, Permission::Allow);
+        assert_ne!(
+            evaluate(&wiu, &stream_of("obs"), &mic, false),
+            evaluate(&allow, &stream_of("obs"), &mic, false),
+            "with no session live these must differ, or while_in_use means nothing"
+        );
+    }
+
+    /// An unguarded category short-circuits before any rule is consulted.
+    #[test]
+    fn an_unguarded_category_is_allowed_without_consulting_the_rule() {
+        let mic = dev(DeviceCategory::Microphone, "alsa_input.analog-stereo", 46);
+        let mut c = cfg("obs", DeviceCategory::Microphone, Permission::Deny);
+        c.devices.microphone = false;
+        assert_eq!(evaluate(&c, &stream_of("obs"), &mic, false), PolicyDecision::Allow);
+    }
+
+    /// An app with no rule follows default_action — both ways, so the test
+    /// cannot pass by the default happening to match.
+    #[test]
+    fn an_app_with_no_rule_follows_the_default_action() {
+        let mic = dev(DeviceCategory::Microphone, "alsa_input.analog-stereo", 46);
+        let mut c = Config::default();
+        c.policy.default_action = Permission::Deny;
+        assert_eq!(evaluate(&c, &stream_of("nobody"), &mic, false), PolicyDecision::Deny);
+        c.policy.default_action = Permission::Ask;
+        assert_eq!(evaluate(&c, &stream_of("nobody"), &mic, false), PolicyDecision::AskUser);
+    }
 }

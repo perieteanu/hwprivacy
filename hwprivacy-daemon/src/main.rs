@@ -476,7 +476,12 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
             }
 
             // Evaluate policy
-            let decision = policy_engine::evaluate(&s.config, stream, device);
+            let session_live = s.tracker.session_live(
+                &stream.app_name,
+                device.category,
+                std::time::Duration::from_secs(s.config.policy.while_in_use_settle_secs),
+            );
+            let decision = policy_engine::evaluate(&s.config, stream, device, session_live);
 
             // Act on decision
             match decision {
@@ -496,8 +501,10 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                         );
                     }
                     if perm == Permission::WhileInUse {
-                        s.tracker
-                            .track_while_in_use(&stream.app_name, stream.node_id);
+                        // Refresh the session: the app is demonstrably using
+                        // the device right now, so the settle window restarts
+                        // from here rather than from the original grant.
+                        s.tracker.begin_session(&stream.app_name, device.category);
                     }
                     s.log_allowed(
                         &stream.app_name,
@@ -544,7 +551,7 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                             &app,
                             pid,
                             cat,
-                                    "Allowed by your rules. hwprivacy cannot tell when access ends.",
+                                    "Allowed by your rules.",
                         )
                         .await;
                     }
@@ -649,6 +656,15 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                         let mut s = notify_state.write().await;
                         match notification::decide(&response) {
                             notification::PromptAction::SavePermanentRule(perm) => {
+                                // A while_in_use answer opens the session NOW.
+                                // Without this the app reconnects, finds no
+                                // session, and is asked again — the loop that
+                                // killed the old per-stream grant. The settle
+                                // window then covers the gap until its first
+                                // link arrives.
+                                if perm == Permission::WhileInUse {
+                                    s.tracker.begin_session(&app, cat);
+                                }
                                 if s.config.set_rule(&app, &cat, perm) {
                                     if let Err(e) = s.config.save() {
                                         error!("Failed to save config after user decision: {}", e);
@@ -705,6 +721,22 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                 .collect();
             for lid in stale {
                 s.tracker.remove_connection(lid);
+            }
+
+            // End every while_in_use session whose device has been released.
+            // This is the entire feature: the grant must not outlive the use.
+            // Ordered AFTER the stale-link prune, or a session would still see
+            // the connection it is being judged on.
+            let settle = std::time::Duration::from_secs(
+                s.config.policy.while_in_use_settle_secs,
+            );
+            for (app, cat) in s.tracker.expire_sessions(settle) {
+                // Logged, because it is otherwise completely invisible: no
+                // notification fires, and the next thing the user sees is a
+                // prompt they may not expect.
+                info!("while_in_use session ended: {} released {:?}", app, cat);
+                s.tracker
+                    .log_event(&app, 0, cat, "", AccessAction::SessionEnded);
             }
         }
     }

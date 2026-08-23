@@ -354,10 +354,15 @@ pub async fn ask_user_permission(
         // grant could never be used, so the honest description of that button
         // was "ask me this again shortly". "Allow Stream"/"Deny Stream" are
         // gone with the whole per-stream branch.
-        notif
-            .action("allow", "Always Allow")
-            .action("while_in_use", "While in Use")
-            .action("deny", "Always Deny");
+        notif.action("allow", "Always Allow");
+        // Not offered for the camera: the kernel layer never observes a release,
+        // so the session could not be ended and the grant would quietly behave
+        // as `allow`. A button that does something other than what it says is
+        // the defect this whole permission was rewritten to remove.
+        if device != DeviceCategory::Camera {
+            notif.action("while_in_use", "While in Use");
+        }
+        notif.action("deny", "Always Deny");
 
         match notif.show() {
             Ok(handle) => {

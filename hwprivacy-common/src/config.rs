@@ -174,6 +174,20 @@ pub struct PolicyConfig {
     #[serde(default = "default_exe_recheck")]
     pub exe_recheck_secs: u64,
 
+    /// How long a `while_in_use` session stays live after the device is
+    /// released, in seconds.
+    ///
+    /// NOT a convenience. Enforcement destroys the link before the prompt is
+    /// shown, so between the user answering and the application reconnecting
+    /// there are legitimately zero links. Without this window the session would
+    /// end in that gap and prompt again immediately, forever — which is exactly
+    /// how the removed per-stream grant failed.
+    ///
+    /// Keep it short. It is the only period in which a released device is still
+    /// granted, and it is the difference between `while_in_use` and `allow`.
+    #[serde(default = "default_while_in_use_settle")]
+    pub while_in_use_settle_secs: u64,
+
     /// Notify when access is ALLOWED, not only when it is denied.
     ///
     /// Measured 2026-08-21: firefox-esr opened the camera twice in one morning
@@ -219,6 +233,10 @@ fn default_dismiss_cooldown() -> u64 {
     60
 }
 
+fn default_while_in_use_settle() -> u64 {
+    10
+}
+
 fn default_exe_recheck() -> u64 {
     30
 }
@@ -238,6 +256,7 @@ impl Default for PolicyConfig {
             poll_interval_ms: default_poll_interval(),
             dismiss_cooldown_secs: default_dismiss_cooldown(),
             exe_recheck_secs: default_exe_recheck(),
+            while_in_use_settle_secs: default_while_in_use_settle(),
             notify_on_allow: true,
             notify_allow_grace_secs: default_notify_allow_grace(),
             notify_allow_cooldown_secs: default_notify_allow_cooldown(),
@@ -400,6 +419,18 @@ impl Config {
         let Some(key) = sanitize_rule_name(app_name) else {
             return false;
         };
+        // The camera cannot honour a session yet, and a rule that silently
+        // behaves as `allow` is the exact defect `while_in_use` was found to
+        // be. Refuse it rather than store it — the b4 precedent.
+        //
+        // The obstacle is layer 2, not this function: the camera is taken
+        // through V4L2 directly, and the LSM program is attached only to
+        // `lsm/file_open`, so nothing observes the close. `bpf_lsm_file_release`
+        // IS available on Debian 13's kernel (checked 2026-08-23), so this is a
+        // "not built yet", not a "cannot be built".
+        if *category == super::DeviceCategory::Camera && perm == Permission::WhileInUse {
+            return false;
+        }
         if let Some(rule) = self.find_rule_mut(&key) {
             rule.set_permission(category, perm);
         } else {
@@ -1140,6 +1171,43 @@ microphone = "ask_each"
         let err = "nonsense".parse::<Permission>().unwrap_err();
         assert!(!err.contains("ask_each"), "{err}");
         assert!(err.contains("while_in_use"), "{err}");
+    }
+
+    /// The camera cannot end a session, so it must not be offered one.
+    ///
+    /// The kernel layer enforces the camera and is attached to `lsm/file_open`
+    /// only — it never observes the release. A `while_in_use` camera rule would
+    /// therefore behave exactly as `allow`, which is the defect this permission
+    /// was rewritten to remove. Refused at write time, the b4 way.
+    #[test]
+    fn the_camera_refuses_while_in_use() {
+        let mut c = Config::default();
+        assert!(
+            !c.set_rule("firefox", &DeviceCategory::Camera, Permission::WhileInUse),
+            "a camera session cannot be ended, so it must not be granted"
+        );
+        assert!(c.find_rule("firefox").is_none(), "and nothing is written");
+    }
+
+    /// The refusal is specific to the camera. Microphone and monitor go through
+    /// PipeWire, where a vanishing link IS the release signal.
+    #[test]
+    fn the_microphone_and_monitor_accept_while_in_use() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Microphone, Permission::WhileInUse));
+        assert!(c.set_rule("firefox", &DeviceCategory::Monitor, Permission::WhileInUse));
+        assert_eq!(
+            c.find_rule("firefox").unwrap().microphone,
+            Some(Permission::WhileInUse)
+        );
+    }
+
+    /// And it is specific to the PERMISSION — the camera still takes the others.
+    #[test]
+    fn the_camera_still_accepts_allow_and_deny() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        assert!(c.set_rule("chrome", &DeviceCategory::Camera, Permission::Deny));
     }
 
     /// The suggested rule name for a binary. Only ever a suggestion — the

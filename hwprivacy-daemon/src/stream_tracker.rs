@@ -8,8 +8,20 @@ use tracing::{debug, info};
 pub struct StreamTracker {
     /// Active connections: link_id → ActiveConnection
     pub active: HashMap<u32, ActiveConnection>,
-    /// Streams allowed with "while_in_use": app_name → set of node ids
-    pub while_in_use_streams: HashMap<String, Vec<u32>>,
+    /// Live `while_in_use` sessions: (app, device) → when it was granted.
+    ///
+    /// # Why keyed on (app, device) and not a node id
+    ///
+    /// The previous per-stream grant was keyed on a PipeWire node id and pruned
+    /// the moment that node left the graph. Since the link is destroyed BEFORE
+    /// the user is asked, the node was usually gone by the time an answer
+    /// arrived — so the grant expired before it could ever be used, and the app
+    /// was prompted again forever. Measured live 2026-08-23; it is why
+    /// `ask_each` was removed (`d-no-per-stream-grants`).
+    ///
+    /// (app, device) survives that churn: the app reconnects with a fresh node
+    /// and a fresh link, and the session is still the same session.
+    pub while_in_use: HashMap<(String, DeviceCategory), Instant>,
     /// Recent events log (ring buffer, max 500)
     pub events: Vec<AccessEvent>,
     /// Counter for blocked access attempts
@@ -36,7 +48,7 @@ impl StreamTracker {
     pub fn new() -> Self {
         Self {
             active: HashMap::new(),
-            while_in_use_streams: HashMap::new(),
+            while_in_use: HashMap::new(),
             events: Vec::new(),
             blocked_count: 0,
             dismiss_cooldowns: HashMap::new(),
@@ -174,12 +186,61 @@ impl StreamTracker {
     // Measured live: allow, nothing happens, asked again — forever.
     // See DECISIONS d-no-per-stream-grants.
 
-    /// Track a while_in_use stream.
-    pub fn track_while_in_use(&mut self, app_name: &str, node_id: u32) {
-        self.while_in_use_streams
-            .entry(app_name.to_string())
-            .or_default()
-            .push(node_id);
+    /// Open a `while_in_use` session for (app, device).
+    pub fn begin_session(&mut self, app_name: &str, category: DeviceCategory) {
+        self.while_in_use
+            .insert((normalize_app_name(app_name), category), Instant::now());
+    }
+
+    /// Is there a live `while_in_use` session for (app, device)?
+    ///
+    /// Live means: the app currently holds a link to that device, OR the grant
+    /// is younger than `settle` and the app has simply not reconnected yet.
+    ///
+    /// The settle window is not a convenience. Enforcement destroys the link
+    /// before the prompt is shown, so between the user's answer and the
+    /// application's retry there are legitimately ZERO links — and without a
+    /// window the session would end in that gap and re-prompt immediately, on
+    /// a loop. That is exactly how the old per-stream grant failed.
+    pub fn session_live(
+        &self,
+        app_name: &str,
+        category: DeviceCategory,
+        settle: std::time::Duration,
+    ) -> bool {
+        let key = (normalize_app_name(app_name), category);
+        let Some(granted_at) = self.while_in_use.get(&key) else {
+            return false;
+        };
+        self.has_active_link(&key.0, category) || granted_at.elapsed() < settle
+    }
+
+    /// Does the app hold at least one live link to this device category?
+    pub fn has_active_link(&self, app_name: &str, category: DeviceCategory) -> bool {
+        let key = normalize_app_name(app_name);
+        self.active.values().any(|c| {
+            c.device_category == category && normalize_app_name(&c.stream.app_name) == key
+        })
+    }
+
+    /// End every session whose device has been released and whose settle window
+    /// has passed. Returns the sessions that ended, for logging.
+    ///
+    /// This is the whole point of `while_in_use`: the grant must not outlive the
+    /// use. Called once per poll, after stale connections have been pruned.
+    pub fn expire_sessions(&mut self, settle: std::time::Duration) -> Vec<(String, DeviceCategory)> {
+        let ended: Vec<(String, DeviceCategory)> = self
+            .while_in_use
+            .iter()
+            .filter(|((app, cat), granted_at)| {
+                !self.has_active_link(app, *cat) && granted_at.elapsed() >= settle
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &ended {
+            self.while_in_use.remove(k);
+        }
+        ended
     }
 
     /// Get recent events.
@@ -281,5 +342,114 @@ mod tests {
             !t.is_in_cooldown("firefox", DeviceCategory::Microphone, 0),
             "a zero cooldown means ask again immediately"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // while_in_use sessions. The grant must not outlive the use — that is the
+    // entire difference between this permission and `allow`.
+    // ---------------------------------------------------------------------
+
+    use std::time::Duration;
+
+    fn si(app: &str, node_id: u32) -> StreamInfo {
+        StreamInfo {
+            node_id,
+            app_name: app.into(),
+            pid: 1,
+            node_name: "app".into(),
+            media_name: String::new(),
+            media_class: "Stream/Input/Audio".into(),
+        }
+    }
+
+    const SETTLE: Duration = Duration::from_secs(10);
+
+    #[test]
+    fn no_session_exists_until_one_is_granted() {
+        let t = StreamTracker::new();
+        assert!(!t.session_live("firefox", DeviceCategory::Microphone, SETTLE));
+    }
+
+    /// The settle window, and why it is not optional. Enforcement destroys the
+    /// link BEFORE the prompt, so right after the answer there are legitimately
+    /// zero links. Without this the session would end in that gap and prompt
+    /// again immediately — the loop that killed the old per-stream grant.
+    #[test]
+    fn a_fresh_grant_is_live_before_the_app_reconnects() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Microphone);
+        assert!(
+            t.session_live("firefox", DeviceCategory::Microphone, SETTLE),
+            "no links yet, but the app has not had time to retry"
+        );
+    }
+
+    /// Once the settle window has passed with no link, the session is over.
+    #[test]
+    fn a_grant_the_app_never_used_expires() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Microphone);
+        let ended = t.expire_sessions(Duration::ZERO);
+        assert_eq!(ended, vec![("firefox".to_string(), DeviceCategory::Microphone)]);
+        assert!(!t.session_live("firefox", DeviceCategory::Microphone, SETTLE));
+    }
+
+    /// While the app holds a link the session stays live no matter how long
+    /// ago it was granted — a call lasting an hour must not be interrupted.
+    #[test]
+    fn a_session_with_a_live_link_never_expires() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Microphone);
+        t.add_connection(
+            7,
+            si("Firefox [pipewire-pulse]", 99),
+            "alsa_input.analog",
+            DeviceCategory::Microphone,
+            Permission::WhileInUse,
+        );
+        assert!(t.expire_sessions(Duration::ZERO).is_empty(), "still in use");
+        assert!(t.session_live("firefox", DeviceCategory::Microphone, Duration::ZERO));
+    }
+
+    /// Releasing the device ends the session. This is the feature.
+    #[test]
+    fn releasing_the_device_ends_the_session() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Microphone);
+        t.add_connection(
+            7,
+            si("Firefox [pipewire-pulse]", 99),
+            "alsa_input.analog",
+            DeviceCategory::Microphone,
+            Permission::WhileInUse,
+        );
+        assert!(t.expire_sessions(Duration::ZERO).is_empty());
+
+        t.remove_connection(7); // the app closed the microphone
+        assert_eq!(
+            t.expire_sessions(Duration::ZERO),
+            vec![("firefox".to_string(), DeviceCategory::Microphone)],
+            "grant must not outlive the use"
+        );
+        assert!(!t.session_live("firefox", DeviceCategory::Microphone, SETTLE));
+    }
+
+    /// A session is per DEVICE. Granting the microphone must not hand over the
+    /// monitor, which is a different question about a different device.
+    #[test]
+    fn a_session_does_not_leak_across_devices() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Microphone);
+        assert!(!t.session_live("firefox", DeviceCategory::Monitor, SETTLE));
+    }
+
+    /// And per app — under the normalised name, so `Firefox` and
+    /// `Firefox [pipewire-pulse]` are one session and `obs` is not.
+    #[test]
+    fn a_session_does_not_leak_across_apps() {
+        let mut t = StreamTracker::new();
+        t.begin_session("Firefox [pipewire-pulse]", DeviceCategory::Microphone);
+        assert!(t.session_live("firefox", DeviceCategory::Microphone, SETTLE));
+        assert!(!t.session_live("obs", DeviceCategory::Microphone, SETTLE));
     }
 }

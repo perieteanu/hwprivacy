@@ -552,7 +552,7 @@ async fn notify_allowed_kernel(
         app,
         ev.pid,
         category,
-        "Allowed by your rules. hwprivacy cannot tell when access ends — \
+        "Allowed by your rules. The kernel layer sees the open, not the release, so it cannot tell when this ends — \
          the kernel hook fires on open, not on close.",
     )
     .await;

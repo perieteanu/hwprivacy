@@ -834,3 +834,58 @@ decisions:
       implement rather than easier. See ROADMAP blockers
       while_in_use_is_not_implemented; Costin asked to keep it pending a
       decision.
+
+  - id: d-while-in-use-is-a-session
+    date: "2026-08-23"
+    title: "`while_in_use` is a grant bounded by one device session"
+    context: >
+      Costin asked directly whether `while_in_use` was implemented. It was not,
+      and had never been: `StreamTracker::while_in_use_streams` was written by
+      track_while_in_use() and READ NOWHERE; AccessAction::RevokedOnDisconnect
+      was declared and EMITTED NOWHERE; policy_engine::evaluate mapped
+      WhileInUse straight to Allow under a comment claiming it tracked the
+      client lifecycle. It was a synonym for `allow` presented in the UI as the
+      narrower choice — the lying-surface class removed everywhere else that
+      day. evaluate() had no tests at all, which is why it survived.
+    the_correction_that_unblocked_it: >
+      Every doc, and the notification body text itself, asserted "hwprivacy
+      cannot tell when access ends". That is false, and nobody had checked.
+      Layer 1 has always seen the end — main.rs diffs live link ids against
+      tracked connections every poll and prunes the stale ones; a vanishing link
+      IS the release. And for layer 2, `bpf_lsm_file_release` and
+      `bpf_lsm_file_free_security` are both present in Debian 13's BTF
+      (verified 2026-08-23), so the kernel could tell us too. The limitation was
+      an unattached hook, not the platform.
+    decision: >
+      Costin, 2026-08-23: the grant "stays ONLY [while] that device is started
+      until is closed", and at session end the next open ASKS again. Layer 1
+      first; the camera refuses `while_in_use` at write time rather than
+      accepting a rule it cannot honour.
+    how_it_works:
+      grant: "no session -> AskUser. The prompt IS how a session begins; answering while_in_use opens it immediately."
+      live: "a session is live while the app holds a link to that device, OR while the settle window since the grant has not elapsed."
+      end: "expire_sessions() runs each poll AFTER stale links are pruned, drops every session whose device was released, and logs AccessAction::SessionEnded — the first END-of-access event this project has had."
+      key: "(normalised app, device category). NOT a node id: that is precisely what pruned the old per-stream grants before they could be used."
+    the_settle_window: >
+      `policy.while_in_use_settle_secs`, default 10. Not a convenience and not
+      the "reopen grace" that was considered and rejected. Enforcement destroys
+      the link BEFORE the prompt is shown, so between the user's answer and the
+      application's reconnect there are legitimately zero links; without a
+      window the session would end in that gap and prompt again on a loop. That
+      is exactly how `ask_each` failed (`d-no-per-stream-grants`). It is also
+      the only period in which a released device is still granted, so it is kept
+      short and is a config knob rather than a constant.
+    why_the_camera_is_refused: >
+      The camera is taken through V4L2 directly and is enforced by the LSM
+      program, which is attached to `lsm/file_open` only. It never observes the
+      release, so it could not end the session and the rule would silently
+      behave as `allow` — the defect being fixed. set_rule() returns false, the
+      CLI prints why, and the prompt does not OFFER the button for a camera.
+      This is "not built yet", not "cannot be built": the hook exists.
+    consequences:
+      - "evaluate() takes a `session_live` flag. State stays in the caller so the function remains pure and every branch is testable — it had zero tests before this."
+      - "AccessAction::SessionEnded added; RevokedOnDisconnect is still unused and still emitted nowhere."
+      - "'hwprivacy cannot tell when access ends' was removed from the layer-1 notification and narrowed to the kernel layer everywhere else."
+    next: >
+      Attach a second BPF program to lsm/file_release, match the same device
+      inodes, and the camera can have sessions too. ROADMAP > next_up.

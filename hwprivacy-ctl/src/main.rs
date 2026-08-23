@@ -406,6 +406,15 @@ async fn main() -> anyhow::Result<()> {
                 let ok = proxy.set_rule(&app, &device, &permission).await?;
                 if ok {
                     println!("Rule set: {} → {} = {}", app, device, permission);
+                } else if device.starts_with("cam") && permission == "while_in_use" {
+                    eprintln!(
+                        "Refused: the camera cannot do while_in_use yet.\n\
+                         \n\
+                         The kernel layer is what enforces the camera, and it is attached\n\
+                         to lsm/file_open only — it never sees the camera released, so it\n\
+                         could not end the session. Use 'allow' or 'deny'."
+                    );
+                    std::process::exit(2);
                 } else {
                     eprintln!("Failed to set rule. Check device ({}) and permission ({}) values.", device, permission);
                     std::process::exit(2);
@@ -502,7 +511,8 @@ async fn main() -> anyhow::Result<()> {
                     "ALLOWED means the access SUCCEEDED, under a rule you set. It is not an\n\
                      alarm — it is the answer to 'did anything use my camera on Tuesday',\n\
                      which could not be answered at all before. Counts are opens, not\n\
-                     sessions, and hwprivacy cannot see when access ended."
+                     sessions. 'pipewire' rows end a while_in_use session when the link
+     goes away; 'kernel' rows cannot — that hook is on open() only."
                 );
             }
         }

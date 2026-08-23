@@ -67,6 +67,12 @@ pub enum AccessAction {
     Denied,
     AskedUser,
     // StreamAllowed / StreamDenied removed 2026-08-23 with `ask_each`.
+    /// A `while_in_use` session ended because the device was released.
+    ///
+    /// The first END-of-access event this project has ever had. Every other
+    /// action records something being attempted; this one records something
+    /// stopping, which is what makes `while_in_use` mean anything.
+    SessionEnded,
     RevokedOnDisconnect, // while_in_use client disconnected
 }
 
@@ -77,6 +83,7 @@ impl std::fmt::Display for AccessAction {
             AccessAction::Denied => write!(f, "DENIED"),
             AccessAction::AskedUser => write!(f, "ASKED"),
             AccessAction::RevokedOnDisconnect => write!(f, "REVOKED"),
+            AccessAction::SessionEnded => write!(f, "SESSION_ENDED"),
         }
     }
 }

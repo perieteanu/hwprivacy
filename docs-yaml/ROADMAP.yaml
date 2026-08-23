@@ -145,7 +145,7 @@ blockers:
 
   while_in_use_is_not_implemented:
     severity: high
-    status: "OPEN — found 2026-08-23, undecided."
+    status: "FIXED 2026-08-23 for layer 1 (see d-while-in-use-is-a-session). Camera still refuses it at write time; needs an lsm/file_release hook."
     what: >
       `while_in_use` is offered in the config, on the CLI, in the GUI dropdown
       and as a button on every permission prompt, and it does nothing that

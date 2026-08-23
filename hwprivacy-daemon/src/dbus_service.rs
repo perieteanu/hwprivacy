@@ -88,11 +88,20 @@ impl HwPrivacyService {
         // live config — pasted notification labels ending in "(pid:2332)", and
         // one empty string (blocker b4).
         if !state.config.set_rule(app_name, &category, perm) {
-            tracing::warn!(
-                "Rejected rule for {:?}: not a usable rule key. Use the bare app name, \
-                 e.g. 'firefox' — not a pasted notification label.",
-                app_name
-            );
+            if category == DeviceCategory::Camera && perm == Permission::WhileInUse {
+                tracing::warn!(
+                    "Rejected '{}' camera = while_in_use: the kernel layer is attached \
+                     to lsm/file_open only, so it never observes the camera being \
+                     released and could not end the session. Use allow or deny.",
+                    app_name
+                );
+            } else {
+                tracing::warn!(
+                    "Rejected rule for {:?}: not a usable rule key. Use the bare app name, \
+                     e.g. 'firefox' — not a pasted notification label.",
+                    app_name
+                );
+            }
             return false;
         }
 

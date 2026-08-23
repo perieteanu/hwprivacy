@@ -154,7 +154,7 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 cargo build --release --workspace       # or: make build
 cargo check --workspace                 # 5 warnings, 0 errors
 cargo clippy                            # NOT AVAILABLE — no such command on this toolchain
-cargo test --workspace                  # 169 tests, all pass
+cargo test --workspace                  # 184 tests, all pass
 make gui-test                           # 14 checks against the RUNNING window
 ```
 
@@ -231,9 +231,18 @@ regression → only then touch the substrate.
   parses, to `ask`, so old configs load. Do not reintroduce per-stream grants
   without first giving `link_manager` a way to CREATE a link — the whole reason
   it failed is that the deny path destroys what the allow path cannot restore.
-- **`while_in_use` is NOT implemented.** It is a synonym for `allow`;
-  `while_in_use_streams` is written and never read. Do not describe it as
-  working. ROADMAP > blockers > `while_in_use_is_not_implemented`.
+- **`while_in_use` is a SESSION**, not a synonym for `allow`
+  (`d-while-in-use-is-a-session`). No session → ask; the prompt is how a session
+  begins; the session ends when the device is released and the next open asks
+  again. Keyed on **(app, device)**, never a node id — that is what pruned the
+  old per-stream grants before they could be used.
+- **The camera REFUSES `while_in_use`** at write time. The LSM program is on
+  `lsm/file_open` only, so it never sees the release. `bpf_lsm_file_release`
+  IS available on Debian 13 — this is "not built yet", not "impossible".
+- **"hwprivacy cannot tell when access ends" is FALSE for layer 1** and was
+  repeated in the docs and in notification text for months. A vanishing
+  PipeWire link is the release signal, and `main.rs` has always pruned on it.
+  It remains true for layer 2 until that second hook exists.
 - **When you coalesce a prompt, never coalesce the teardown.** `LinkGroup`
   carries every link id for exactly this reason.
 - **The allow path is as important as the deny path.** `hwprivacy-ctl history`
