@@ -162,3 +162,20 @@
 23-08-2026 18:38 | Sun | hw | [change] imported desktop-baseline: pipewire camera=allow + exe_path. wireplumber correctly SKIPPED — Costin's own rule already existed
 23-08-2026 18:40 | Sun | hw | [note] PROOF of the staleness fix: "policy changed under us (added /usr/bin/pipewire); re-pushing" — kernel went 2 -> 3 allowed with NOTHING restarted
 23-08-2026 18:42 | Sun | hw | [note] camera node still absent: PipeWire enumerates once at session start. Reboot needed. /var/lib/hwprivacy/policy verified to hold all 3 before rebooting
+23-08-2026 19:05 | Sun | hw | [note] read the 18:46 call journal: camera ALLOWED (kernel), mic DENIED. Both correct; the WAY the mic was denied was not
+23-08-2026 19:12 | Sun | hw | [note] mic1/mic2 label two CHANNELS of one mic. device_instance() filters siblings by node_id, so it could only ever label channels
+23-08-2026 19:20 | Sun | hw | [fix] exe_path was unwritable from every frontend; kernel_camera_allowlist() keys on it alone, so no typed app name could grant a camera
+23-08-2026 19:34 | Sun | hw | [fix] gap warning was unreachable — ran only at connect time, and a rule with no exe_path never changes the fingerprint. Now notifies on save
+23-08-2026 19:48 | Sun | hw | [decide] AppRule categories become Option<Permission>; unset falls through to default_action. Existing explicit denies left alone
+23-08-2026 20:02 | Sun | hw | [add] SetRuleExe + AllowCamera (atomic, rolls back on a bad path). rules denied-cameras is the picker — the kernel already logged the path
+23-08-2026 20:30 | Sun | hw | [add] tools/gui-test: 14 AT-SPI checks against the live GTK window, wired to make gui-test. GUI had zero tests before
+23-08-2026 20:44 | Sun | hw | [note] 2 gui-test checks passed with the 'screen' placeholder compiled in — a placeholder is not a label node, it is an object attribute
+23-08-2026 20:58 | Sun | hw | [fix] GUI autostart pointed at target/release — a rebuild swapped the binary under the running tray app. Now ~/.local/bin
+23-08-2026 21:20 | Sun | hw | [pivot] mic1/mic2 deleted; group_links coalesces all categories. Two real mics are two nodes and still get two prompts
+23-08-2026 21:46 | Sun | hw | [drop] ask_each and the whole per-stream concept removed — the grant could never be used. String still parses, to ask
+23-08-2026 22:05 | Sun | hw | [fix] Hint::Resident kept the prompt on screen after the user clicked an answer. Timeout::Never alone was what was wanted
+23-08-2026 22:24 | Sun | hw | [note] 'hwprivacy cannot tell when access ends' was FALSE — layer 1 always saw it, and bpf_lsm_file_release was available all along
+23-08-2026 22:38 | Sun | hw | [add] while_in_use is a real session: no session -> ask, ends on release, keyed on (app, device) not a node id
+23-08-2026 23:02 | Sun | hw | [add] second BPF program on lsm/file_release — camera sessions. Allowlist entry added while live, removed on release
+23-08-2026 23:06 | Sun | hw | [note] camera sessions are UNVERIFIED — the BPF verifier has never seen the program. Script in claude-run needs sudo
+23-08-2026 23:10 | Sun | hw | [note] 152 -> 188 tests, 3 commits. Five tests initially passed with their bug present and were rewritten
