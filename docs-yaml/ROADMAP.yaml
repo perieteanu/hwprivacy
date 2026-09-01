@@ -1013,6 +1013,58 @@ next_up:
         counting only once the device is actually opened.
     mode: decide
 
+  - id: camera-session-ends-on-the-probe-close
+    what: >
+      A camera session ends ~111 ms after it starts, because the open COUNT
+      reaching zero is not the same event as the device being released.
+    severity: "high — the session is over while the call is still running"
+    measured_live_2026_09_01: |
+      20:02:33.712  firefox-esr -> camera -> ALLOWED          (1st open, count 1)
+      20:02:33.823  session ended: firefox released the camera (kernel)   [111 ms]
+      20:02:35.914  12 further allowed open(s) by firefox-esr  (the real capture)
+      20:02:38.317  Kernel layer: 2 executable(s) allowed      (exe REMOVED, mid-call)
+      Reproduced identically at 20:02:55.939 -> 20:02:56.039.
+    what_is_actually_happening: >
+      Firefox PROBES the camera before capturing: it opens /dev/video0, closes
+      it, and only then opens the handles it will record with. The probe close
+      drops open_counts to zero, so lsm/file_release emits a release and the
+      daemon ends the session — before the capture has begun. The remaining 12
+      opens then succeed only because they land in the ~2.5 s window before the
+      allowlist removal is pushed. The video worked BY RACE, not by policy.
+    why_it_was_invisible_until_now: >
+      Until the release path was keyed correctly (2026-09-01, commit 81bca1b)
+      the release matched no session and did nothing, so the probe close was
+      harmless. Fixing that bug is what exposed this one — the earlier
+      "successful" run at 19:48 ended via the kernel release too, but the call
+      had already finished by then, so the premature end and the real end were
+      indistinguishable.
+    why_a_count_is_the_wrong_instrument: >
+      "13 opens per session" was measured as a BURST and became the model. But
+      an open count is a transient: it legitimately touches zero between a
+      probe and a capture, between two tabs, between a device re-negotiation.
+      Zero means "no handle held RIGHT NOW", which is not "the application is
+      finished with the camera".
+    options_not_yet_chosen:
+      - >
+        A grace period on the release: do not end the session until the count
+        has stayed at zero for N ms. Cheap, and mirrors while_in_use_settle_secs
+        which exists for exactly this shape of gap on the PipeWire side. Needs a
+        number, and the number is a guess until measured.
+      - >
+        End the session on process EXIT rather than on the last close. Matches
+        "while in use" more honestly for a browser, but a long-lived browser
+        never exits, so the grant would effectively become `allow`.
+      - >
+        Require the count to have been ABOVE one before a zero counts as a
+        release — i.e. ignore a release from a session that only ever saw the
+        probe. Fragile: it encodes one application's behaviour.
+    do_not: >
+      Do not simply widen awaiting_open_secs. That knob bounds a session that
+      was never opened; this session WAS opened and then wrongly ended. Using it
+      here would mask the defect exactly as it did on 2026-09-01, where a 60 s
+      fallback hid a broken release path for an hour.
+    mode: decide
+
   - id: cpu-regression
     what: "Diagnose layer 1's idle cost: 1.24% of a core (2026-08-04) -> 2.93% (2026-08-21), same method."
     why: "Costin rejected 1.2% as 'very generous'. Measure before deciding whether layer 1 ships enabled by default."
