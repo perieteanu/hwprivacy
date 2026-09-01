@@ -415,7 +415,13 @@ async fn main() -> anyhow::Result<()> {
                     std::process::exit(2);
                 }
                 println!("{}", msg);
-                println!("The kernel layer picks it up within exe_recheck_secs.");
+                // Immediate since d-camera-sessions-via-file-release added
+                // DaemonState::policy_dirty. The old text said "within
+                // exe_recheck_secs" (30 s) and was wrong on a SUCCESS path,
+                // which is the worst place for it: a user told to wait half a
+                // minute for a grant that already landed will conclude the
+                // command failed and start debugging a working system.
+                println!("The kernel layer has it now.");
             }
             RulesAction::SetExe { app, path } => {
                 let (ok, msg) = proxy.set_rule_exe(&app, &path).await?;
