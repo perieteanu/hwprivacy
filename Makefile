@@ -1,7 +1,7 @@
 PREFIX ?= /usr
 DESTDIR ?=
 
-.PHONY: build install install-lsm clean deb doc-check gui-test check
+.PHONY: build install install-lsm clean deb doc-check gui-test tui-screen check
 
 build:
 	cargo build --release --workspace
@@ -21,6 +21,11 @@ doc-check:
 # prevent. Run it deliberately, after touching the GUI.
 gui-test:
 	@tools/gui-test
+
+# Not a pass/fail gate — it prints what the TUI actually looks like, which is
+# more than existed before. The TUI has no tests at all.
+tui-screen:
+	@tools/tui-screen $(PANEL)
 
 check: doc-check
 	cargo test --workspace

@@ -297,18 +297,41 @@ def main():
     # -- unset renders as a dash ------------------------------------------
     # The phantom-deny bug, seen at the UI. A rule that says nothing about a
     # category must not be drawn as denying it.
+    #
+    # Asked of the row the DAEMON says has an unset category, not of row 0.
+    # Row 0 was `pipewire`, which legitimately sets all three (deny/allow/deny)
+    # and therefore has no dash to find — so this failed on 2026-09-01 against
+    # a perfectly correct UI, and had only ever passed because row 0 happened
+    # to have a gap. A check that depends on which rule sorts first is not
+    # checking the thing it names.
     if rule_rows:
-        row_text = " ".join(labels(rule_rows[0]))
-        has_dash = "—" in row_text
-        check(
-            "an unset category shows as '—', never 'deny'",
-            has_dash or ": deny" not in row_text,
-            row_text[:160],
+        # daemon_rules rows are (app, mic, cam, mon, exe, note); an empty
+        # permission string is an unset category.
+        gapped = next(
+            (r for r in daemon_rules if not r[1] or not r[2] or not r[3]), None
         )
+        if gapped:
+            row_text = next(
+                (" ".join(labels(rr)) for rr in rule_rows
+                 if gapped[0] in " ".join(labels(rr))),
+                "",
+            )
+            check(
+                "an unset category shows as '—', never 'deny'",
+                "—" in row_text,
+                f"{gapped[0]} has an unset category; row reads: {row_text[:140]}",
+            )
+        else:
+            check(
+                "an unset category shows as '—', never 'deny'",
+                True,
+                "SKIPPED — no rule currently has an unset category to render",
+            )
+        row0 = " ".join(labels(rule_rows[0]))
         check(
             "a rule row names its binary",
-            "binary:" in row_text or "!" in row_text,
-            row_text[:160],
+            "binary:" in row0 or "!" in row0,
+            row0[:160],
         )
 
     # -- the denial list ---------------------------------------------------
