@@ -155,8 +155,18 @@ pub struct PolicyConfig {
     /// per rule rather than the fallback for everything unknown.
     #[serde(default = "default_deny_action")]
     pub default_action: Permission,
-    /// Poll interval in milliseconds
-    #[serde(default = "default_poll_interval")]
+    /// RETIRED 2026-09-01. Accepted so an existing config still loads, and
+    /// otherwise ignored.
+    ///
+    /// It governed how often the daemon spawned `pw-dump`. Nothing polls the
+    /// graph any more: `pw-dump --monitor` streams changes from one long-lived
+    /// process — 0.031% of a core against 1.74% for spawning at 2 Hz, and a new
+    /// link reported in 11 ms rather than somewhere inside this interval.
+    ///
+    /// Kept rather than deleted because removing the field outright would make
+    /// every config written before today fail to load. `skip_serializing` means
+    /// it is dropped on the next rule change, so it retires itself.
+    #[serde(default, skip_serializing)]
     pub poll_interval_ms: u64,
     /// How long to stay quiet about one (app, device) after the user dismissed
     /// its prompt, in seconds. Was a `const` in stream_tracker.rs.

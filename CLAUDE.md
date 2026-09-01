@@ -138,17 +138,15 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 - Config: `~/.config/hwprivacy/config.toml`. The daemon **rewrites the whole
   file** on any rule change — comments and hand-formatting are destroyed.
   Stop the daemon before hand-editing.
-- Measured idle cost of layer 1: **2.70–2.82% of a core** (2026-09-01).
-  **DIAGNOSED — not a regression in this code.** 62% of it is `pw-dump` spawn
-  cost: **1.74%** for 40 spawns in 20 s, measured with no daemon involved. The
-  graph did NOT grow (210 KB / 87 objects now, vs 272 KB in older docs), and
-  the startup device-rescan does stop after 120 s. The 1.24% reading from
-  2026-08-04 is the outlier, not today's figure.
-  **The fix is measured and unbuilt**: `pw-dump --monitor` costs **0.031%**
-  idle — a 56x reduction, putting layer 1 near 1.0%. See
-  `ROADMAP > cpu-regression`. Do NOT raise `poll_interval_ms`: most of the cost
-  is per-spawn, so halving the rate does not halve it, and it widens the race.
-  The kernel helper: **0.04%**.
+- Measured idle cost of layer 1: **0.033% of a core** (2026-09-01), down from
+  2.70-2.82%. `pw-dump --monitor` replaced polling: one long-lived process
+  streaming changes instead of a spawn twice a second, which was 62% of the old
+  cost. A new link is now seen in **11 ms**, not somewhere in a 0-500 ms window.
+  `poll_interval_ms` is retired — accepted so old configs load, ignored, and
+  dropped on the next rule write. See `d-monitor-stream-not-polling`.
+  **`pw-dump --monitor` exits 0 when PipeWire restarts**, so the daemon
+  supervises it: any exit is an anomaly, a respawn re-seeds rather than merges,
+  and a watchdog covers silence. The kernel helper: **0.04%**.
 - Measured cost of layer 2: **+13.75 ns per `open()`**, 95% CI `[+7.3, +20.2]`
   — 1.88% of a 733 ns `open()`, and **0% at idle**.
 

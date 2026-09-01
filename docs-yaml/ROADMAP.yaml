@@ -1066,7 +1066,7 @@ next_up:
     mode: decide
 
   - id: cpu-regression
-    status: "DIAGNOSED 2026-09-01. Not a regression in hwprivacy's code."
+    status: "DONE 2026-09-01. Diagnosed, then fixed: 2.70-2.82% -> 0.033%, measured on the live service."
     what: "Layer 1's idle cost: 1.24% of a core (2026-08-04) -> 2.70-2.82% (2026-09-01)."
     measured_2026_09_01:
       layer1_steady_state: "2.70-2.82% of one core (three readings, 13h average 2.75%)"

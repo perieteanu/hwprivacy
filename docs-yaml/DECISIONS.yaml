@@ -1146,3 +1146,63 @@ decisions:
       A way to distinguish "the open count reached zero" from "the application
       released the device". ROADMAP > camera-session-ends-on-the-probe-close
       holds the options, none chosen.
+
+  - id: d-monitor-stream-not-polling
+    date: "2026-09-01"
+    title: "The graph comes from `pw-dump --monitor`, not a spawn twice a second"
+    supersedes: d-event-driven-substrate
+    context: >
+      Layer 1 cost 2.70-2.82% of a core at idle, and 1.62 of those points were
+      fork/exec of pw-dump twice a second — 62% of the total, before a line of
+      hwprivacy's code ran. The race window between a link appearing and
+      enforcement seeing it was 0-500 ms.
+    the_two_candidates_and_why_pipewire_rs_lost: >
+      d-event-driven-substrate proposed pipewire-rs and deferred it over MSRV
+      and a new dependency. That objection is OBSOLETE — librust-pipewire-dev
+      0.8.0-7 is packaged in Debian 13. It lost on a different ground: the
+      `pw-dump --monitor` wire format is already what the daemon wants. Block 0
+      is a complete snapshot in the exact shape capture_graph() returns,
+      subsequent blocks carry only changed objects, and a removal is the object
+      with "info": null. parse_node/parse_port/parse_link are reused unchanged.
+      pipewire-rs would mean rewriting all of that against a C-binding API for
+      no measured gain.
+    measured_2026_09_01:
+      before: "2.70-2.82% of one core, 0-500 ms race window"
+      after: "0.033% of one core — an 82x reduction, measured on the live service over 40 s with the startup rescan window finished"
+      latency: "a new link reported 11 ms after it appears"
+      method: "cgroup CPUUsageNSec over wall time, the same method every earlier CPU figure in this project used"
+    the_hazard_that_shaped_the_design: >
+      `pw-dump --monitor` DIES when PipeWire restarts, and EXITS 0. Measured
+      before any code was written. A clean exit is indistinguishable from
+      success, so a bare child would leave the daemon permanently blind while
+      every status surface reported healthy — blocker b5's exact shape. The
+      polling design was immune to this because it respawned every tick; that
+      resilience had to be rebuilt deliberately.
+    the_three_rules_that_follow:
+      - "ANY exit is an anomaly, including 0. The monitor is meant to outlive everything, so its termination always gets a WARN."
+      - "A respawn RE-SEEDS, never merges. PipeWire ids are not stable across a server restart, so a merged graph carries dead ids a new object can later reuse — blocker b2."
+      - "Silence is not health. If no block arrives within the watchdog the child is killed and respawned even though it is alive; a wedged reader and a quiet system look identical."
+    verified_live: |
+      20:54:06  PipeWire graph seeded: 8 nodes, 15 ports
+      20:54:11  WARN `pw-dump --monitor` exited (Some(0)) after 46 block(s).
+                     This is never normal — PipeWire probably restarted.
+      20:54:13  PipeWire graph seeded: 8 nodes, 15 ports      (recovered in 2 s)
+      20:54:23  parecord -> microphone -> ASKED               (still enforcing)
+    poll_interval_ms_is_retired: >
+      Kept in the struct with #[serde(default, skip_serializing)] so an
+      existing config still loads, and dropped on the next rule write. Deleting
+      the field outright would make every config written before today fail to
+      parse — the knob retires itself instead.
+    what_did_not_change: >
+      policy_engine, config, D-Bus, the three frontends, and the kernel layer
+      are untouched. GraphState::snapshot() hands out the same GraphSnapshot the
+      rest of the daemon already consumed, which is why the substrate could be
+      replaced without touching enforcement.
+    a_worthless_test_worth_recording: >
+      The block splitter must ignore brackets inside strings. The first test
+      used "Firefox [pipewire-pulse]", where the brackets are BALANCED — a naive
+      counter's depth returns to zero in the same place, so it passed with the
+      bug fully present. The hazard is an UNBALANCED bracket: a lone ] truncates
+      the block, a lone [ swallows the rest of the stream forever. Rewritten
+      around both, and both verified to fail against a naive counter. Fourth
+      such test in two days.
