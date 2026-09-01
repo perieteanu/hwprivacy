@@ -21,7 +21,7 @@
 use crate::dbus_service::SharedState;
 use hwprivacy_common::short_name;
 use hwprivacy_common::stream::AccessAction;
-use hwprivacy_common::{DeviceCategory, Permission};
+use hwprivacy_common::{Config, DeviceCategory, Permission};
 use hwprivacy_proto::{
     encode_line, AccessEvent, PolicyEntry, Reply, Request, DEFAULT_SOCKET, PERM_CAMERA,
     PROTO_VERSION,
@@ -557,6 +557,26 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     .await;
 }
 
+/// Which rule an answered camera prompt should be written to.
+///
+/// Pure, and separate from the prompt task, because the prompt task cannot be
+/// reached by a unit test — it needs a notification daemon and a human. The
+/// decision inside it can be tested; the popup cannot. Same reasoning that put
+/// `notification::decide()` outside its `tokio::spawn`.
+///
+/// A kernel event carries only the executable, so writing under its short name
+/// blindly creates a second rule beside the user's own. Measured live
+/// 2026-09-01 after a successful camera session:
+///
+///     firefox      while_in_use  while_in_use  /usr/lib/firefox-esr/firefox-esr
+///     firefox-esr  —             while_in_use  /usr/lib/firefox-esr/firefox-esr
+fn rule_key_for(config: &Config, exe_path: &str, exe_short: &str) -> String {
+    config
+        .find_rule_by_exe(exe_path)
+        .map(|r| r.app_name.clone())
+        .unwrap_or_else(|| exe_short.to_string())
+}
+
 /// Ask the user about a camera the kernel just denied, and act on the answer.
 ///
 /// The grant applies to the user's NEXT attempt — the open() that produced this
@@ -607,43 +627,61 @@ async fn prompt_kernel_camera_denial(
         // again for the life of the daemon: no popup, no error, nothing logged.
         s.tracker.end_prompt(&exe_short, DeviceCategory::Camera);
 
+        // Write to the rule that ALREADY owns this binary, if there is one.
+        //
+        // The event carries only the executable's short name, so writing under
+        // that blindly creates a second rule beside the user's own. Observed
+        // live 2026-09-01: answering a prompt for `firefox-esr` left both
+        // `firefox` and `firefox-esr` pointing at the same binary, which is
+        // the "two rules for one application" case
+        // d-camera-grants-need-a-binary-and-say-so exists to prevent — and the
+        // allowlist would then carry the path twice from two rules that can
+        // disagree.
+        let target = rule_key_for(&s.config, &exe_path, &exe_short);
+
         match crate::notification::decide(&outcome) {
             crate::notification::PromptAction::SavePermanentRule(perm) => {
                 // The rule must carry the EXECUTABLE, because that is what the
                 // kernel matches. Attaching it first is not optional for a
                 // session: set_rule refuses camera = while_in_use without one,
                 // since presence in the allowlist IS the grant.
-                if s.config.find_rule(&exe_short).is_none()
-                    && !s.config.set_rule(&exe_short, &DeviceCategory::Camera, Permission::Deny)
+                if s.config.find_rule(&target).is_none()
+                    && !s.config.set_rule(&target, &DeviceCategory::Camera, Permission::Deny)
                 {
-                    warn!("Refused to create a rule for {:?}", exe_short);
+                    warn!("Refused to create a rule for {:?}", target);
                     return;
                 }
-                if let Err(e) = s.config.set_rule_exe(&exe_short, &exe_path) {
-                    warn!("Could not attach {} to rule {}: {}", exe_path, exe_short, e);
+                if let Err(e) = s.config.set_rule_exe(&target, &exe_path) {
+                    warn!("Could not attach {} to rule {}: {}", exe_path, target, e);
                     return;
                 }
                 if perm == Permission::WhileInUse {
                     // Opens the session NOW, in AwaitingFirstOpen: the device
                     // has not been opened and will not be until the user clicks
                     // again. Bounded by policy.awaiting_open_secs.
-                    s.tracker.begin_session(&exe_short, DeviceCategory::Camera);
+                    //
+                    // Keyed on the RULE's name, because that is what
+                    // kernel_camera_allowlist_with_sessions() passes to
+                    // session_live(). Keying on the executable here while the
+                    // rule is named `firefox` would leave the session live and
+                    // the allowlist empty — a grant that grants nothing.
+                    s.tracker.begin_session(&target, DeviceCategory::Camera);
                 }
-                if s.config.set_rule(&exe_short, &DeviceCategory::Camera, perm) {
+                if s.config.set_rule(&target, &DeviceCategory::Camera, perm) {
                     if let Err(e) = s.config.save() {
                         error!("Failed to save config after user decision: {}", e);
                     }
-                    info!("User set rule: {} → camera = {}", exe_short, perm);
+                    info!("User set rule: {} → camera = {}", target, perm);
                     // The allowlist must change before the user clicks again,
                     // not at the next exe_recheck tick — 30 s of latency reads
                     // as the click having failed.
                     s.policy_dirty.notify_waiters();
                 } else {
-                    warn!("Refused to save camera rule for {:?}", exe_short);
+                    warn!("Refused to save camera rule for {:?}", target);
                 }
             }
             crate::notification::PromptAction::SaveNothingAndCooldown => {
-                s.tracker.record_dismiss(&exe_short, DeviceCategory::Camera);
+                s.tracker.record_dismiss(&target, DeviceCategory::Camera);
             }
         }
     });
@@ -1140,5 +1178,44 @@ mod tests {
         assert_eq!(opened.len(), 1);
         assert_eq!(opened[0].0, "chrome");
         assert_eq!(closed, vec!["firefox".to_string()]);
+    }
+
+    /// An answered camera prompt writes to the rule that already owns the
+    /// binary, not to a new one named after the executable.
+    ///
+    /// Fails against `let target = exe_short`, which is what shipped for one
+    /// evening and produced two rules for one binary — see
+    /// `rule_key_for`'s doc comment for the live evidence.
+    #[test]
+    fn an_answer_lands_on_the_rule_that_owns_the_binary() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        c.set_rule_exe("firefox", "/bin/sh").expect("binary");
+
+        assert_eq!(
+            rule_key_for(&c, "/bin/sh", "sh"),
+            "firefox",
+            "the user's own rule owns this binary; do not create a second one"
+        );
+    }
+
+    /// With no rule for that binary, the executable's own name is right — that
+    /// is how a new consumer gets its first rule.
+    #[test]
+    fn an_answer_for_an_unknown_binary_uses_the_executable_name() {
+        let c = Config::default();
+        assert_eq!(rule_key_for(&c, "/usr/bin/obs", "obs"), "obs");
+    }
+
+    /// A rule with no binary must not capture an unrelated executable.
+    #[test]
+    fn a_rule_without_a_binary_owns_nothing() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Microphone, Permission::Allow));
+        assert_eq!(
+            rule_key_for(&c, "/usr/bin/obs", "obs"),
+            "obs",
+            "a rule naming no exe_path cannot own one"
+        );
     }
 }

@@ -514,6 +514,31 @@ impl Config {
     ///
     /// `Err` carries the reason so the caller can log or show it; the caller
     /// is expected to treat any `Err` as "nothing was written".
+    /// The rule that already owns this executable, if any.
+    ///
+    /// The kernel layer's principal is the BINARY, and more than one rule
+    /// naming the same binary is incoherent: `kernel_camera_allowlist()`
+    /// would emit the path twice and the two rules could disagree about the
+    /// camera, with nothing to say which wins.
+    ///
+    /// This exists because answering a kernel camera prompt writes a rule, and
+    /// the only name that event carries is the executable's short name
+    /// (`firefox-esr`). Writing under that name blindly produced a SECOND rule
+    /// beside the user's own `firefox` — observed live 2026-09-01:
+    ///
+    /// ```text
+    /// firefox      while_in_use  while_in_use  /usr/lib/firefox-esr/firefox-esr
+    /// firefox-esr  —             while_in_use  /usr/lib/firefox-esr/firefox-esr
+    /// ```
+    ///
+    /// which is exactly the "two rules for one application" that
+    /// `d-camera-grants-need-a-binary-and-say-so` exists to prevent.
+    pub fn find_rule_by_exe(&self, exe_path: &str) -> Option<&AppRule> {
+        self.rules
+            .iter()
+            .find(|r| r.exe_path.as_deref() == Some(exe_path))
+    }
+
     pub fn set_rule_exe(&mut self, app_name: &str, exe_path: &str) -> Result<(), String> {
         let Some(rule) = self.find_rule_mut(app_name) else {
             return Err(format!("no rule for '{app_name}' — create one first"));
@@ -609,11 +634,29 @@ impl Config {
     ///
     /// A rule with no `exe_path` is PipeWire-only and is skipped.
     pub fn kernel_camera_allowlist(&self) -> Vec<(String, Permission)> {
-        self.rules
-            .iter()
-            .filter(|r| r.camera == Some(Permission::Allow))
-            .filter_map(|r| r.exe_path.clone().map(|p| (p, Permission::Allow)))
-            .collect()
+        Self::dedup_by_path(
+            self.rules
+                .iter()
+                .filter(|r| r.camera == Some(Permission::Allow))
+                .filter_map(|r| r.exe_path.clone().map(|p| (p, Permission::Allow)))
+                .collect(),
+        )
+    }
+
+    /// One binary, one allowlist entry.
+    ///
+    /// The kernel keys on (dev, ino), so a duplicate is at best wasted map
+    /// space and at worst two rules disagreeing about the same executable with
+    /// nothing to say which wins. Rules SHOULD be unique by exe_path —
+    /// `find_rule_by_exe` is what keeps new ones that way — but a config can be
+    /// hand-edited, and an older one may already carry a pair: 2026-09-01
+    /// produced exactly that, `firefox` and `firefox-esr` both naming
+    /// /usr/lib/firefox-esr/firefox-esr. Collapsing here means a stale config
+    /// degrades to correct behaviour instead of a doubled entry.
+    fn dedup_by_path(mut v: Vec<(String, Permission)>) -> Vec<(String, Permission)> {
+        let mut seen = std::collections::HashSet::new();
+        v.retain(|(p, _)| seen.insert(p.clone()));
+        v
     }
 
     /// The camera allowlist including `while_in_use` rules whose session is
@@ -632,15 +675,17 @@ impl Config {
     where
         F: Fn(&str) -> bool,
     {
-        self.rules
-            .iter()
-            .filter(|r| match r.camera {
-                Some(Permission::Allow) => true,
-                Some(Permission::WhileInUse) => session_live(&r.app_name),
-                _ => false,
-            })
-            .filter_map(|r| r.exe_path.clone().map(|p| (p, Permission::Allow)))
-            .collect()
+        Self::dedup_by_path(
+            self.rules
+                .iter()
+                .filter(|r| match r.camera {
+                    Some(Permission::Allow) => true,
+                    Some(Permission::WhileInUse) => session_live(&r.app_name),
+                    _ => false,
+                })
+                .filter_map(|r| r.exe_path.clone().map(|p| (p, Permission::Allow)))
+                .collect(),
+        )
     }
 
     /// Rules that ask for camera access but cannot get it at the kernel layer
@@ -1393,5 +1438,59 @@ microphone = "ask_each"
         assert_eq!(short_name("/opt/google/chrome/chrome"), "chrome");
         assert_eq!(short_name("bare"), "bare");
         assert_eq!(short_name("/trailing/"), "/trailing/", "no empty name");
+    }
+
+    /// Answering a kernel camera prompt must land on the rule that ALREADY
+    /// owns that binary, not create a second one beside it.
+    ///
+    /// Observed live 2026-09-01, after a successful camera session:
+    ///
+    ///     firefox      while_in_use  while_in_use  /usr/lib/firefox-esr/firefox-esr
+    ///     firefox-esr  —             while_in_use  /usr/lib/firefox-esr/firefox-esr
+    ///
+    /// Two rules, one binary. kernel_camera_allowlist() then emits the path
+    /// twice from two rules that can disagree about the camera, with nothing
+    /// to say which one wins.
+    #[test]
+    fn the_owning_rule_is_found_by_its_binary() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        c.set_rule_exe("firefox", "/bin/sh").expect("binary");
+
+        let owner = c.find_rule_by_exe("/bin/sh").expect("a rule owns /bin/sh");
+        assert_eq!(
+            owner.app_name, "firefox",
+            "the prompt must write here, not to a new 'sh' rule"
+        );
+    }
+
+    /// And nothing is claimed when no rule names that binary — the caller then
+    /// creates one under the executable's own name, which is correct.
+    #[test]
+    fn an_unowned_binary_has_no_rule() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        c.set_rule_exe("firefox", "/bin/sh").expect("binary");
+        assert!(
+            c.find_rule_by_exe("/usr/bin/env").is_none(),
+            "a different binary must not match an existing rule"
+        );
+    }
+
+    /// One binary must never end up in the kernel allowlist twice. This is the
+    /// consequence the duplicate rule actually had.
+    #[test]
+    fn one_binary_appears_once_in_the_allowlist() {
+        let mut c = Config::default();
+        for app in ["firefox", "firefox-esr"] {
+            assert!(c.set_rule(app, &DeviceCategory::Camera, Permission::Allow));
+            c.set_rule_exe(app, "/bin/sh").expect("binary");
+        }
+        let allow = c.kernel_camera_allowlist();
+        assert_eq!(
+            allow.len(),
+            1,
+            "the same binary must not be allowlisted twice: {allow:?}"
+        );
     }
 }
