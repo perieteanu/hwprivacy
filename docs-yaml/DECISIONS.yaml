@@ -935,8 +935,97 @@ decisions:
       is meaningful for a portal app on the PipeWire route, a while_in_use
       camera rule with no exe_path has nothing to add to the allowlist and could
       do nothing at all.
-    not_verified_yet: >
-      The program compiles; the BPF VERIFIER has never seen it, because loading
-      needs root. `~/projects/claude-run/hwprivacy-camera-sessions-20260823.sh`
-      installs it and proves an open/close cycle end to end. Until that has run,
-      camera sessions are unproven against a live kernel.
+    verified_2026_09_01: >
+      The BPF VERIFIER ACCEPTED the program. The helper carrying both
+      lsm/file_open and lsm/file_release was installed to /usr/bin and
+      hwprivacy-lsm.service came up active, enforcing. This ADR's "not verified
+      yet" is retired. What the same session then found is that acceptance was
+      never the blocker — see d-camera-sessions-cannot-be-started, which
+      SUPERSEDES the half of this ADR that let a camera take `while_in_use`.
+    superseded_in_part_by: d-camera-sessions-cannot-be-started
+
+  - id: d-camera-sessions-cannot-be-started
+    date: "2026-09-01"
+    title: "while_in_use is microphone and monitor only; the camera refuses it"
+    supersedes_part_of: d-camera-sessions-via-file-release
+    context: >
+      d-camera-sessions-via-file-release solved how a camera session ENDS. It
+      did not ask how one BEGINS, and the answer is that nothing can begin one
+      for the applications layer 2 exists to guard.
+    measured_live: |
+      18:53:09  Rule set: firefox -> cam = while_in_use   (allowlist 3 -> 2)
+      18:53:33  Kernel layer DENIED firefox-esr -> /dev/video0
+      18:54:15  DENIED again
+      18:54:57  DENIED again ... permanently, with no way to answer
+    the_deadlock: >
+      A while_in_use rule with no live session removes the executable from the
+      kernel allowlist -- that is exactly what makes it not a synonym for
+      `allow`. Firefox then opens /dev/video0 through V4L2, never through
+      PipeWire, so no link is created and no PipeWire prompt is raised. The
+      denial arrives instead from the kernel, whose notification is
+      INFORMATIONAL WITH NO BUTTONS -- deliberately, because the action path
+      carries b1. So there is no prompt to answer, no answer to open a session,
+      and the camera stays denied forever.
+    why_the_file_release_hook_did_not_fix_this: >
+      It addressed the other half of the lifecycle. `begin_session()` is reached
+      from exactly two places, both on the PipeWire link path in main.rs. An
+      app on the V4L2 route reaches neither. Ending was the visible gap;
+      starting was the silent one.
+    decision: >
+      `set_rule()` refuses `camera = while_in_use` outright, whatever else the
+      rule carries. The earlier guard checked only for an exe_path, which was
+      necessary and not sufficient -- it is what permitted the deadlock above.
+      The microphone and the playback monitor keep while_in_use: both are gated
+      by PipeWire, which prompts.
+    why_refuse_rather_than_warn: >
+      A rule that can never reach a live state is the same lying surface as the
+      old `while_in_use == allow`, failing closed instead of open. Worse, in
+      this direction it costs the user their camera mid-call.
+    the_message_had_to_change_too: >
+      The CLI previously said "attach a binary and retry". That retry is now
+      refused as well, so the message prescribed a command guaranteed to fail.
+      It now names the reason and points at allow/deny, and says which devices
+      DO support while_in_use.
+    what_would_reopen_this: >
+      A camera denial that can raise an ACTIONABLE notification. That requires
+      b1 to be fixed first -- routing a new event source into the action path
+      before then inherits the bug on day one, which is the standing rule. If
+      that lands, delete the guard in config.rs::set_rule and this ADR with it.
+    also_corrected: >
+      notification.rs withheld the While in Use button for cameras already, but
+      its comment gave the OBSOLETE reason ("the kernel never observes a
+      release"), untrue since 2026-08-23. Left alone, the next reader would have
+      restored the button on a dead rationale.
+
+  - id: d-a-session-must-be-visible
+    date: "2026-09-01"
+    title: "A live session is shown in status, or the feature cannot be checked"
+    context: >
+      Until now the only evidence a while_in_use session was open was the kernel
+      allowlist COUNT moving -- a number that also moves when a rule changes or
+      a binary is replaced. An ambiguous signal is why while_in_use went months
+      being believed rather than checked, and why it turned out to be a synonym
+      for `allow`.
+    decision: >
+      D-Bus `GetSessions` -> (app, device, age_secs), rendered by
+      `hwprivacy-ctl status` as a `Live sessions` block. Additive, like
+      GetHistory: GetKernelStatus keeps its tuple so the TUI and GUI stay
+      working untouched.
+    printed_only_when_non_empty: >
+      A permanent "Sessions: 0" line teaches the reader to skip the row, and
+      this row exists to be noticed.
+    one_liveness_rule: >
+      `live_sessions()` and `session_live()` share the predicate, so what the
+      status prints and what the kernel allowlist contains cannot disagree. A
+      readout that says "open" after the grant was withdrawn would be worse than
+      printing nothing.
+    verified_live_2026_09_01: |
+      Live sessions (while_in_use — access ends when the device is released)
+        parecord             microphone   open 8s
+      12s later: block absent, GetSessions empty, SESSION_ENDED logged.
+    the_first_full_lifecycle: |
+      Firefox video call, the same evening -- ask, grant, use, release, end:
+      19:06:46  Firefox [pipewire-pulse] -> microphone -> ASKED
+      19:06:50  User set rule: Firefox -> Microphone = while_in_use
+      19:07:00  while_in_use session ended: firefox released Microphone
+      19:07:00  Event: firefox (pid:0) -> microphone -> SESSION_ENDED

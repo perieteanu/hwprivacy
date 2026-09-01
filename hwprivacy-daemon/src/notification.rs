@@ -355,10 +355,18 @@ pub async fn ask_user_permission(
         // was "ask me this again shortly". "Allow Stream"/"Deny Stream" are
         // gone with the whole per-stream branch.
         notif.action("allow", "Always Allow");
-        // Not offered for the camera: the kernel layer never observes a release,
-        // so the session could not be ended and the grant would quietly behave
-        // as `allow`. A button that does something other than what it says is
-        // the defect this whole permission was rewritten to remove.
+        // Not offered for the camera. The ORIGINAL reason — "the kernel never
+        // observes a release" — stopped being true on 2026-08-23, when the
+        // lsm/file_release hook landed. Do not restore the button on that
+        // basis: the reason is now the opposite half of the lifecycle.
+        //
+        // A camera session cannot be STARTED. `begin_session()` is only ever
+        // reached from the PipeWire link path, and an app that takes the camera
+        // through V4L2 (Firefox, Chrome — the apps layer 2 exists for) never
+        // produces a link. Its denial comes from the kernel as an
+        // informational popup with no buttons, so there is nothing to answer:
+        // the rule would deny the camera forever. Measured live 2026-09-01,
+        // config.rs::set_rule now refuses the rule outright.
         if device != DeviceCategory::Camera {
             notif.action("while_in_use", "While in Use");
         }

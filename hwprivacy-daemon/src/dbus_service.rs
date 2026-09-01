@@ -90,9 +90,11 @@ impl HwPrivacyService {
         if !state.config.set_rule(app_name, &category, perm) {
             if category == DeviceCategory::Camera && perm == Permission::WhileInUse {
                 tracing::warn!(
-                    "Rejected '{}' camera = while_in_use: a camera session is enforced \
-                     by adding and removing the executable from the kernel allowlist, \
-                     and this rule names no exe_path. Attach one first.",
+                    "Rejected '{}' camera = while_in_use: a camera session cannot be \
+                     STARTED. Nothing opens one for an app that reaches the camera \
+                     through V4L2 — a kernel denial is informational and has no \
+                     buttons — so the rule would deny the camera permanently with no \
+                     way to answer. Use 'allow' or 'deny'. Measured 2026-09-01.",
                     app_name
                 );
             } else {
@@ -305,6 +307,25 @@ impl HwPrivacyService {
             k.unresolved.len() as u32,
             k.last_error.clone().unwrap_or_default(),
         )
+    }
+
+    /// Live `while_in_use` sessions: (app, device, age_secs).
+    ///
+    /// A session is the difference between `while_in_use` and `allow`, and
+    /// until this existed the only evidence one was open was the kernel
+    /// allowlist count — a number that moves for several reasons. Making the
+    /// session itself visible is what lets the feature be checked rather than
+    /// believed.
+    async fn get_sessions(&self) -> Vec<(String, String, u32)> {
+        let state = self.state.read().await;
+        let settle =
+            std::time::Duration::from_secs(state.config.policy.while_in_use_settle_secs);
+        state
+            .tracker
+            .live_sessions(settle)
+            .into_iter()
+            .map(|(app, cat, age)| (app, cat.to_string(), age.as_secs() as u32))
+            .collect()
     }
 
     /// Persistent denial counters: (identity, device, source, denied,

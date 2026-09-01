@@ -223,6 +223,35 @@ impl StreamTracker {
         })
     }
 
+    /// Every live `while_in_use` session, as (app, device, age).
+    ///
+    /// Exists so a session is VISIBLE. Before this, "is a session open" could
+    /// only be inferred from the kernel allowlist count moving — which is
+    /// exactly what made `while_in_use` unfalsifiable for months: a feature
+    /// whose only evidence is a number that also moves for other reasons is a
+    /// feature nobody can check. Same argument as notify-on-allow.
+    ///
+    /// Uses the same liveness rule as `session_live`, so what this prints and
+    /// what the kernel allowlist contains cannot disagree.
+    pub fn live_sessions(
+        &self,
+        settle: std::time::Duration,
+    ) -> Vec<(String, DeviceCategory, std::time::Duration)> {
+        let mut out: Vec<(String, DeviceCategory, std::time::Duration)> = self
+            .while_in_use
+            .iter()
+            .filter(|((app, cat), granted_at)| {
+                self.has_active_link(app, *cat) || granted_at.elapsed() < settle
+            })
+            .map(|((app, cat), granted_at)| (app.clone(), *cat, granted_at.elapsed()))
+            .collect();
+        // Sorted on the rendered category rather than deriving Ord on the
+        // shared DeviceCategory: a stable readout is not a reason to widen a
+        // type every crate depends on.
+        out.sort_by(|a, b| a.0.cmp(&b.0).then(format!("{:?}", a.1).cmp(&format!("{:?}", b.1))));
+        out
+    }
+
     /// End every session whose device has been released and whose settle window
     /// has passed. Returns the sessions that ended, for logging.
     ///
@@ -451,5 +480,61 @@ mod tests {
         t.begin_session("Firefox [pipewire-pulse]", DeviceCategory::Microphone);
         assert!(t.session_live("firefox", DeviceCategory::Microphone, SETTLE));
         assert!(!t.session_live("obs", DeviceCategory::Microphone, SETTLE));
+    }
+
+    /// The readout and the enforcement must agree. `live_sessions()` and
+    /// `session_live()` share a liveness rule for exactly this reason: a
+    /// status line that says "open" while the kernel allowlist has already
+    /// dropped the executable would be worse than printing nothing.
+    #[test]
+    fn live_sessions_agrees_with_session_live() {
+        let settle = std::time::Duration::from_secs(10);
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Camera);
+
+        let listed = t.live_sessions(settle);
+        assert_eq!(listed.len(), 1, "a session was just opened");
+        assert_eq!(listed[0].0, "firefox");
+        assert!(
+            t.session_live("firefox", DeviceCategory::Camera, settle),
+            "the two must never disagree"
+        );
+
+        // The direction that actually catches a wrong implementation: when
+        // session_live() says NO, live_sessions() must not list it. Asserting
+        // only the agreeing-yes case passes against a live_sessions() that
+        // lists the whole map and never checks anything — verified by
+        // reintroducing exactly that.
+        let zero = std::time::Duration::from_secs(0);
+        assert!(
+            !t.session_live("firefox", DeviceCategory::Camera, zero),
+            "precondition: settle=0 and no link means not live"
+        );
+        assert!(
+            t.live_sessions(zero).is_empty(),
+            "live_sessions must agree with session_live in the NO direction too"
+        );
+    }
+
+    /// A session that has aged past the settle window with no link is NOT
+    /// live, and must not be listed. This is the assertion that fails if
+    /// live_sessions() ever filters on mere presence in the map — which is
+    /// the obvious wrong implementation, and the one that would report a
+    /// session forever.
+    #[test]
+    fn an_expired_session_is_not_listed() {
+        let zero = std::time::Duration::from_secs(0);
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Camera);
+
+        // No active link, and a settle window of zero -> already expired.
+        assert!(
+            !t.session_live("firefox", DeviceCategory::Camera, zero),
+            "precondition: with settle=0 and no link this session is over"
+        );
+        assert!(
+            t.live_sessions(zero).is_empty(),
+            "an expired session must not be reported as live"
+        );
     }
 }

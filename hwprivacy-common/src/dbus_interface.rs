@@ -65,6 +65,12 @@ pub trait HwPrivacy {
     /// (connected, enforcing_camera, allowed_exes, unresolved, last_error)
     fn get_kernel_status(&self) -> zbus::Result<(bool, bool, u32, u32, String)>;
 
+    /// Live `while_in_use` sessions: (app, device, age_secs).
+    ///
+    /// Additive, like GetKernelStatus and GetHistory — GetKernelStatus keeps
+    /// its tuple so the TUI and GUI stay working untouched.
+    fn get_sessions(&self) -> zbus::Result<Vec<(String, String, u32)>>;
+
     /// Persistent denial counters, most persistent first:
     /// (identity, device, source, denied, first_seen, last_seen)
     ///

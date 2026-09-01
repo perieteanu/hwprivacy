@@ -176,6 +176,30 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Live while_in_use sessions. Printed whenever one is open, and
+            // silent otherwise — a permanent "Sessions: 0" line teaches the
+            // reader to skip the row, and this row exists to be noticed.
+            //
+            // This is the only surface on which a session is directly visible.
+            // Without it "is a session live" could only be inferred from the
+            // kernel allowlist count, which also moves when a rule changes or
+            // a binary is replaced — an ambiguous signal is why while_in_use
+            // went months without anyone being able to falsify it.
+            if let Ok(sessions) = proxy.get_sessions().await {
+                if !sessions.is_empty() {
+                    println!();
+                    println!("Live sessions (while_in_use — access ends when the device is released)");
+                    for (app, device, age) in &sessions {
+                        let age = if *age >= 60 {
+                            format!("{}m{:02}s", age / 60, age % 60)
+                        } else {
+                            format!("{}s", age)
+                        };
+                        println!("  {:<20} {:<12} open {}", app, device, age);
+                    }
+                }
+            }
+
             // Kernel layer. Reported separately and always — "not connected"
             // is real information, not an absence worth hiding.
             match proxy.get_kernel_status().await {
@@ -308,10 +332,10 @@ async fn main() -> anyhow::Result<()> {
                     // executable — the field that decides whether a camera
                     // grant does anything.
                     println!(
-                        "{:<20} {:<11} {:<9} {:<9} {}",
+                        "{:<20} {:<13} {:<13} {:<13} {}",
                         "App", "Mic", "Camera", "Monitor", "Executable"
                     );
-                    println!("{}", "-".repeat(78));
+                    println!("{}", "-".repeat(90));
                     let mut any_unset = false;
                     let mut gaps = Vec::new();
                     for (app, mic, cam, mon, exe, note) in &rules {
@@ -322,7 +346,7 @@ async fn main() -> anyhow::Result<()> {
                         let cell = perm_cell;
                         let exe_cell = if exe.is_empty() { "(none)" } else { exe.as_str() };
                         println!(
-                            "{:<20} {:<11} {:<9} {:<9} {}{}",
+                            "{:<20} {:<13} {:<13} {:<13} {}{}",
                             app,
                             cell(mic),
                             cell(cam),
@@ -407,17 +431,28 @@ async fn main() -> anyhow::Result<()> {
                 if ok {
                     println!("Rule set: {} → {} = {}", app, device, permission);
                 } else if device.starts_with("cam") && permission == "while_in_use" {
+                    // Do NOT tell the user to attach a binary and retry: that
+                    // retry is now refused too, and a message that prescribes a
+                    // failing command is worse than none. The old text did
+                    // exactly that.
                     eprintln!(
-                        "Refused: a camera session needs a binary.\n\
+                        "Refused: the camera cannot use while_in_use.\n\
                          \n\
-                         The session is enforced by adding and removing the executable\n\
-                         from the kernel allowlist, and there is nothing to add without\n\
-                         one. Attach it first:\n\
+                         A session has to be STARTED by answering a prompt, and an\n\
+                         application that reaches the camera through V4L2 — Firefox and\n\
+                         Chrome among them — never produces one. Its denial arrives from\n\
+                         the kernel as an informational popup with no buttons, so there\n\
+                         is nothing to answer and the camera would stay denied forever.\n\
+                         Measured live on 2026-09-01.\n\
                          \n\
-                         \x20   hwprivacy-ctl rules denied-cameras\n\
+                         Use allow or deny instead:\n\
+                         \n\
                          \x20   hwprivacy-ctl rules allow-camera <path> --as {}\n\
-                         \x20   hwprivacy-ctl rules set {} cam while_in_use",
-                        app, app
+                         \x20   hwprivacy-ctl rules set {} cam deny\n\
+                         \n\
+                         The microphone and the playback monitor DO support\n\
+                         while_in_use — they are gated by PipeWire, which prompts."
+                        , app, app
                     );
                     std::process::exit(2);
                 } else {
