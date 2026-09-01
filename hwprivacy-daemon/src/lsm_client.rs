@@ -574,6 +574,29 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     // a kernel mic denial cannot name the application responsible and a prompt
     // asking about "pipewire" would be unanswerable.
     if category == DeviceCategory::Camera {
+        // Only ASK when the user has not already answered. An explicit
+        // `camera = deny` is a decision, and re-prompting for it would turn
+        // the user's own rule into a recurring question — the app retries
+        // every ~18 s, so a denied browser would nag indefinitely.
+        //
+        // A rule that says nothing about the camera still prompts: that is the
+        // discovery path, and it is how a new consumer gets its first rule
+        // under deny-by-default.
+        let already_decided = {
+            let s = state.read().await;
+            camera_already_denied_by_rule(&s.config, &ev.exe_path, &app)
+        };
+        if already_decided {
+            crate::notification::notify_kernel_denial(
+                &app,
+                ev.pid,
+                category,
+                &ev.device,
+                "Blocked by the kernel — you set this app's camera to deny.",
+            )
+            .await;
+            return;
+        }
         prompt_kernel_camera_denial(state, &ev, &app).await;
         return;
     }
@@ -586,6 +609,25 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
         "Blocked by the kernel.",
     )
     .await;
+}
+
+/// Has the user already said "deny" for this executable's camera?
+///
+/// Its own function so a test can pin the call site — the prompt task itself
+/// needs a notification daemon and a human, and cannot be reached by a test.
+/// Three tests today passed with their bug present by asserting through
+/// something that had its own reason to hold; this is the shape that avoids it.
+///
+/// Only an explicit `Deny` counts. `None` means the rule has no opinion about
+/// the camera and falls through to `default_action` — under deny-by-default
+/// that still denies, but the user has not been asked yet, and asking is the
+/// discovery path for a new consumer.
+fn camera_already_denied_by_rule(config: &Config, exe_path: &str, exe_short: &str) -> bool {
+    let key = rule_key_for(config, exe_path, exe_short);
+    config
+        .find_rule(&key)
+        .and_then(|r| r.camera)
+        .is_some_and(|p| p == Permission::Deny)
 }
 
 /// Which rule an answered camera prompt should be written to.
@@ -1297,5 +1339,51 @@ mod tests {
             released_under, "sh",
             "keying the release on the executable is the 2026-09-01 defect"
         );
+    }
+
+    /// An explicit `camera = deny` must NOT re-prompt. The user answered; the
+    /// app retries every ~18 s, so asking again turns their own rule into a
+    /// recurring nag.
+    #[test]
+    fn an_explicit_camera_deny_is_not_asked_about_again() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Deny));
+        c.set_rule_exe("firefox", "/bin/sh").expect("binary");
+        assert!(
+            camera_already_denied_by_rule(&c, "/bin/sh", "sh"),
+            "the user set deny; do not ask again"
+        );
+    }
+
+    /// A rule with no camera opinion DOES prompt. Under deny-by-default the
+    /// access is refused either way, but the user has never been asked — this
+    /// is how a new consumer gets its first rule.
+    #[test]
+    fn a_rule_with_no_camera_opinion_is_still_asked_about() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Microphone, Permission::Allow));
+        c.set_rule_exe("firefox", "/bin/sh").expect("binary");
+        assert!(
+            !camera_already_denied_by_rule(&c, "/bin/sh", "sh"),
+            "no camera opinion is not an answer — ask"
+        );
+    }
+
+    /// And an app with no rule at all is asked about. Deny-by-default without
+    /// a prompt would make every new application silently broken.
+    #[test]
+    fn an_unknown_app_is_asked_about() {
+        let c = Config::default();
+        assert!(!camera_already_denied_by_rule(&c, "/usr/bin/obs", "obs"));
+    }
+
+    /// camera = allow is not a denial and must not suppress anything — if such
+    /// an app is somehow denied, that is a genuine surprise worth asking about.
+    #[test]
+    fn an_allowed_camera_is_not_treated_as_decided_deny() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        c.set_rule_exe("firefox", "/bin/sh").expect("binary");
+        assert!(!camera_already_denied_by_rule(&c, "/bin/sh", "sh"));
     }
 }
