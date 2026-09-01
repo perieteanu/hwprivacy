@@ -430,6 +430,21 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     if ev.released {
         let app = short_name(&ev.exe_path);
         let mut s = state.write().await;
+        // KEPT DELIBERATELY, though no camera session can currently exist for
+        // it to end: the camera takes allow or deny only since 2026-09-01.
+        //
+        // Three reasons not to delete it. The BPF program on lsm/file_release
+        // is attached and verifier-accepted, so the events arrive whatever
+        // userspace does — handling them is cheaper than filtering them out.
+        // The removal is a no-op against an empty map, so it costs one lookup.
+        // And it is the working half of the mechanism: what defeated camera
+        // sessions is that an open COUNT reaching zero is not the same event
+        // as the device being released, which is a question about WHEN to
+        // believe this, not about whether the signal exists.
+        //
+        // If camera sessions return (ROADMAP >
+        // camera-session-ends-on-the-probe-close), this is what they will use.
+        //
         // End the session under the RULE's name, not the executable's.
         //
         // A session is opened under whichever rule owns the binary — `firefox`,
@@ -685,18 +700,9 @@ async fn prompt_kernel_camera_denial(
                     warn!("Could not attach {} to rule {}: {}", exe_path, target, e);
                     return;
                 }
-                if perm == Permission::WhileInUse {
-                    // Opens the session NOW, in AwaitingFirstOpen: the device
-                    // has not been opened and will not be until the user clicks
-                    // again. Bounded by policy.awaiting_open_secs.
-                    //
-                    // Keyed on the RULE's name, because that is what
-                    // kernel_camera_allowlist_with_sessions() passes to
-                    // session_live(). Keying on the executable here while the
-                    // rule is named `firefox` would leave the session live and
-                    // the allowlist empty — a grant that grants nothing.
-                    s.tracker.begin_session(&target, DeviceCategory::Camera);
-                }
+                // No begin_session() here. The camera takes allow or deny
+                // only (2026-09-01) — a camera session ended itself 111 ms in,
+                // on Firefox's probe close, mid-call. See config.rs::set_rule.
                 if s.config.set_rule(&target, &DeviceCategory::Camera, perm) {
                     if let Err(e) = s.config.save() {
                         error!("Failed to save config after user decision: {}", e);

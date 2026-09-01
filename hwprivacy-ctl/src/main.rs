@@ -436,14 +436,13 @@ async fn main() -> anyhow::Result<()> {
                     // failing command is worse than none. The old text did
                     // exactly that.
                     eprintln!(
-                        "Refused: the camera cannot use while_in_use.\n\
+                        "Refused: the camera takes allow or deny, not while_in_use.\n\
                          \n\
-                         A session has to be STARTED by answering a prompt, and an\n\
-                         application that reaches the camera through V4L2 — Firefox and\n\
-                         Chrome among them — never produces one. Its denial arrives from\n\
-                         the kernel as an informational popup with no buttons, so there\n\
-                         is nothing to answer and the camera would stay denied forever.\n\
-                         Measured live on 2026-09-01.\n\
+                         A camera session ends 111 ms after it starts. Firefox probes\n\
+                         the camera before capturing — open, close, then open the\n\
+                         handles it records with — and that probe close takes the open\n\
+                         count to zero, which ends the session while the call is still\n\
+                         running. Measured live on 2026-09-01, twice.\n\
                          \n\
                          Use allow or deny instead:\n\
                          \n\

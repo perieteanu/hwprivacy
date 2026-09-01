@@ -236,7 +236,17 @@ regression → only then touch the substrate.
   begins; the session ends when the device is released and the next open asks
   again. Keyed on **(app, device)**, never a node id — that is what pruned the
   old per-stream grants before they could be used.
-- **The camera HAS sessions** since 2026-08-23 (`d-camera-sessions-via-file-release`).
+- **The camera does NOT have sessions.** `while_in_use` is **microphone and
+  monitor only** (`d-camera-is-allow-or-deny`, 2026-09-01). It was built, it
+  worked end to end on real hardware, and it was then withdrawn because a
+  session ends **111 ms after it starts**: Firefox probes the camera (open,
+  close, then open the capture handles), the probe close takes the open count
+  to zero, and `file_release` ends the session mid-call. An open count is a
+  transient, not a session. `set_rule` refuses the permission and a doc-check
+  sentinel refuses the button. The `lsm/file_release` program stays attached —
+  it is the working half, and what is missing is a way to tell "count reached
+  zero" from "the device was released".
+- *(historical, superseded)* **The camera HAS sessions** since 2026-08-23 (`d-camera-sessions-via-file-release`).
   A second BPF program on `lsm/file_release` reports the release; the session is
   enforced by adding/removing the executable from the kernel allowlist, so a
   camera `while_in_use` rule REQUIRES an `exe_path` and is refused without one.

@@ -1093,3 +1093,56 @@ decisions:
       cannot be written as a forbidden string. Remove the prompt and config.rs
       keeps accepting the rule while every unit test still passes — that is
       exactly the shape of the 2026-09-01 defect.
+
+  - id: d-camera-is-allow-or-deny
+    date: "2026-09-01"
+    title: "The camera takes allow or deny. while_in_use is microphone and monitor only."
+    supersedes: d-camera-sessions-need-an-answerable-denial
+    ruling: "Costin, 2026-09-01, after three live runs in one evening."
+    context: >
+      This assertion was inverted twice in a day, and the sequence is the
+      argument. Refused first because a session could not be STARTED — nothing
+      could raise an answerable prompt for a V4L2 application. That was fixed,
+      and the whole arc then ran on real hardware: prompt, answer, allowlist
+      2 -> 3, live session shown in status, SESSION_ENDED from the kernel,
+      allowlist back to 2. The feature demonstrably worked.
+    what_defeated_it: >
+      A camera session ends 111 ms after it begins, while the call is running.
+    measured_live: |
+      20:02:33.712  firefox-esr -> camera -> ALLOWED       (1st open, count 1)
+      20:02:33.823  session ended: released the camera (kernel)      [111 ms]
+      20:02:35.914  12 further allowed open(s)             <- the real capture
+      20:02:38.317  Kernel layer: 2 executable(s) allowed  <- removed MID-CALL
+      Reproduced identically 22 seconds later.
+    the_mechanism: >
+      Firefox PROBES the camera before capturing: it opens /dev/video0, closes
+      it, then opens the handles it will record with. The probe close takes
+      open_counts to zero, lsm/file_release emits a release, and the session
+      ends before capture starts. The call survived only because the capture
+      opens beat the allowlist removal by about 2.5 seconds — a race, not a
+      policy decision.
+    the_model_was_wrong_not_the_code: >
+      "A camera session is 13 opens" was measured as a BURST on 2026-08-05 and
+      quietly became the design. An open count is a TRANSIENT: zero means "no
+      handle held right now", which is not "the application has finished with
+      the camera". It legitimately reaches zero between a probe and a capture.
+    why_not_just_add_a_grace_period: >
+      That is the likely fix and it is not a decision to take at speed: the
+      value is a guess until the probe-to-capture gap is measured across more
+      than one application. Shipping a permission that ends itself mid-call is
+      worse than not offering it — a surface that lies is the defect class this
+      project exists to remove, and a camera that dies during a call is the
+      most expensive way to express it.
+    what_stays:
+      - "The lsm/file_release BPF program stays attached. It is verifier-accepted, the events arrive regardless, and removal against an empty map costs one lookup. It is the working half of the mechanism."
+      - "The actionable camera prompt stays, offering Allow and Deny. Being able to grant a camera from the notification instead of hand-editing config.toml is worth keeping on its own."
+      - "RETRY_HINT stays and is still required: even Always Allow takes effect on the user's NEXT attempt, because the open() that raised the prompt was denied before anyone saw it."
+      - "The microphone and monitor keep while_in_use. They are gated by PipeWire, whose link lifetime IS the use — proven repeatedly the same evening."
+    guarded_by: >
+      A doc-check sentinel refuses the While in Use button in the camera
+      prompt, verified to trip. set_rule refuses the permission itself, with a
+      test proven to fail against acceptance.
+    what_would_reopen_it: >
+      A way to distinguish "the open count reached zero" from "the application
+      released the device". ROADMAP > camera-session-ends-on-the-probe-close
+      holds the options, none chosen.

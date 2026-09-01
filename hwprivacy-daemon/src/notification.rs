@@ -301,6 +301,9 @@ pub async fn notify_kernel_gap(app_name: &str, why: &str) {
 /// that silently rots.
 pub const RETRY_HINT: &str =
     "Answering allows the NEXT attempt — click the camera button again.";
+// Still required with allow/deny only: the open() that raised this prompt was
+// denied before anyone saw it, so even "Always Allow" takes effect on the
+// user's next click, never on the attempt being asked about.
 
 /// Ask about a camera access the KERNEL denied.
 ///
@@ -345,9 +348,10 @@ pub async fn ask_kernel_camera_permission(
             .timeout(Timeout::Never);
 
         notif.action("allow", "Always Allow");
-        // Offered here, unlike on the PipeWire path, because a kernel camera
-        // session is exactly what this prompt exists to start.
-        notif.action("while_in_use", "While in Use");
+        // NO "While in Use" for the camera. set_rule refuses it, so the button
+        // would write nothing and the user would conclude the click was
+        // ignored. Removed 2026-09-01 with the permission itself — see
+        // config.rs::set_rule and d-camera-is-allow-or-deny.
         notif.action("deny", "Always Deny");
 
         match notif.show() {
@@ -356,7 +360,9 @@ pub async fn ask_kernel_camera_permission(
                 handle.wait_for_action(|action| {
                     let perm = match action {
                         "allow" => Some(Permission::Allow),
-                        "while_in_use" => Some(Permission::WhileInUse),
+                        // No while_in_use arm: the button is gone, and a
+                        // notification daemon replaying a stale action id must
+                        // not write a rule set_rule would refuse anyway.
                         "deny" => Some(Permission::Deny),
                         "__closed" => {
                             info!(
