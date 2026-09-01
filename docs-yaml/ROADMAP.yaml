@@ -936,6 +936,83 @@ next_up:
       - "baseline (pipewire, wireplumber, xdg-desktop-portal) ships in the generated default config; applications are opt-in presets"
     mode: execute
 
+  - id: camera-sessions-need-an-answerable-denial
+    what: >
+      Make a kernel camera denial ACTIONABLE, so a camera session can be
+      started and `camera = while_in_use` can be re-enabled.
+    why: >
+      Costin, 2026-09-01, after the microphone session ran end to end: do the
+      same for the camera. The camera is the device layer 2 exists for, and it
+      is the one device that cannot express "only while in use".
+    blocked_on: "nothing structural any more — see below. This is buildable."
+    the_constraint_that_does_not_move: >
+      The BPF program must return a verdict in nanoseconds. There is no way to
+      hold an open() pending a human, so the FIRST open is always denied. A
+      camera session cannot be granted at the moment of asking; it can only be
+      granted for the RETRY.
+    why_that_is_acceptable_and_measured: >
+      Firefox retries on user action and picks up the new policy on the SAME
+      process. Measured twice. 2026-08-05: "Retry after allowing is ONE CLICK
+      in the already-running browser. Same pid 3271 across both phases — no tab
+      reload, no Firefox restart." And again 2026-09-01, pid 3246 held across
+      three denials (18:53:33, 18:54:15, 18:54:57), a grant at 18:55:53, and an
+      ALLOWED at 19:06:45 — one process throughout. The user experience is
+      therefore: click the camera button, get a prompt, answer it, click again.
+      That is one extra click, not a broken feature.
+    the_pieces_already_exist:
+      - "lsm/file_release — the END of a session. Landed 2026-08-23, verifier-accepted 2026-09-01."
+      - "policy_dirty — an immediate allowlist push, so the grant lands before the user's second click."
+      - "begin_session()/session_live()/expire_sessions() — the whole session lifecycle, proven on the microphone."
+      - "kernel_camera_allowlist_with_sessions() — already gates the allowlist on a live session."
+      - "GetSessions + the ctl status block — a session is now visible."
+    what_is_missing: >
+      One thing: a kernel camera denial currently raises an INFORMATIONAL
+      notification with no buttons, so there is nothing to answer.
+    why_that_rule_existed_and_why_it_can_now_be_revisited: >
+      "Do not route kernel denials through the action path" was written because
+      the action path carried b1 — dismissing wrote a permanent deny. b1 was
+      FIXED on 2026-08-21: notification::decide() maps a dismissal to
+      SaveNothingAndCooldown and a Failed prompt likewise. The premise of the
+      prohibition is gone. It should be retired deliberately, in writing, not
+      quietly stepped over.
+    design_sketch:
+      - "On a kernel CAMERA denial, raise the ACTION notification (Always Allow / While in Use / Always Deny) instead of the informational one."
+      - "An answer of while_in_use: write the rule, begin_session(app, Camera), notify policy_dirty. The exe enters the allowlist immediately."
+      - "The user clicks the camera button again; the retry is allowed; the 13-open burst proceeds."
+      - "lsm/file_release fires at zero opens -> expire_sessions -> the exe leaves the allowlist. Already built and already correct."
+      - "The prompt MUST name the retry: 'Answering allows the next attempt — click the camera button again.' A prompt that silently requires a second click reads as a prompt that did nothing."
+    the_trap_to_avoid: >
+      Do NOT re-enable the button before the retry text exists. The whole defect
+      class this project keeps removing is a surface that promises something it
+      does not do, and "click While in Use and video appears" is exactly such a
+      promise — video will NOT appear until the user acts again.
+    a_rule_with_no_exe_path_still_cannot_have_a_session: >
+      The existing exe_path requirement stays. Presence in the allowlist is the
+      grant, and there is nothing to add without a binary.
+    unresolved:
+      - "Which app identity does the prompt use? The kernel knows firefox-esr (the executable); the PipeWire layer says firefox. A camera prompt naming 'firefox-esr' while every other prompt says 'firefox' is a new inconsistency. See d-executable-is-the-principal."
+      - "Coalescing: a camera session is 13 opens. The prompt must fire ONCE for the burst, not 13 times. The burst machinery exists; it must gate the prompt too."
+      - >
+        RESOLVED 2026-09-01 by reading the code: the kernel release path in
+        lsm_client.rs removes the (app, camera) key from tracker.while_in_use
+        DIRECTLY, independent of expire_sessions() and has_active_link. So a
+        V4L2 app's session does end correctly on file_release. But that only
+        covers the case where the device WAS opened.
+      - >
+        THE REMAINING HAZARD, and it must be answered before implementation:
+        the user answers `while_in_use` and then never clicks the camera button
+        again. The exe is in the allowlist, no open() ever happens, so no
+        file_release ever fires. expire_sessions() cannot help — it keys on
+        has_active_link, and a V4L2 app produces no PipeWire link, so the OR
+        with the settle window is the only branch that can ever be true. Once
+        settle (10s) passes, expire_sessions() WILL end it — which means the
+        opposite failure: the grant may expire before the user's second click.
+        A settle window tuned for "the app reconnects in a moment" is the wrong
+        instrument for "the human clicks again". Needs a distinct timeout for a
+        camera session awaiting its first open, or a session that starts
+        counting only once the device is actually opened.
+    mode: decide
+
   - id: cpu-regression
     what: "Diagnose layer 1's idle cost: 1.24% of a core (2026-08-04) -> 2.93% (2026-08-21), same method."
     why: "Costin rejected 1.2% as 'very generous'. Measure before deciding whether layer 1 ships enabled by default."
