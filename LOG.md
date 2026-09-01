@@ -179,3 +179,18 @@
 23-08-2026 23:02 | Sun | hw | [add] second BPF program on lsm/file_release — camera sessions. Allowlist entry added while live, removed on release
 23-08-2026 23:06 | Sun | hw | [note] camera sessions are UNVERIFIED — the BPF verifier has never seen the program. Script in claude-run needs sudo
 23-08-2026 23:10 | Sun | hw | [note] 152 -> 188 tests, 3 commits. Five tests initially passed with their bug present and were rewritten
+01-09-2026 23:17 | Tue | hw | [note] 188 -> 210 tests, 10 commits. Three more tests passed with their bug present — all asserted through a path with its own escape hatch
+01-09-2026 23:18 | Tue | hw | [fix] b6 silent re-denial: both skip sites logged at debug! under RUST_LOG=info, so a waiting prompt looked like a broken feature
+01-09-2026 23:19 | Tue | hw | [done] BPF verifier accepted the second program — lsm/file_release loaded on a live kernel, service active
+01-09-2026 23:20 | Tue | hw | [fix] pipewire/wireplumber were deleted 08-23 by accident, not decision; baseline restored, PipeWire camera node exists for the first time
+01-09-2026 23:21 | Tue | hw | [done] first full while_in_use session lifecycle recorded: ask -> grant -> use -> release -> SESSION_ENDED (microphone)
+01-09-2026 23:22 | Tue | hw | [add] GetSessions + 'Live sessions' block in ctl status — a session was previously only inferable from the allowlist count
+01-09-2026 23:23 | Tue | hw | [add] camera sessions: SessionState AwaitingFirstOpen/Open, clock starts on first open, awaiting_open_secs=60
+01-09-2026 23:24 | Tue | hw | [add] a denied camera raises an ACTIONABLE prompt; retired the CLAUDE.md rule against it, whose premise (b1) was fixed 08-21
+01-09-2026 23:25 | Tue | hw | [fix] an answered camera prompt wrote a duplicate rule for the same binary; allowlists now dedup by path
+01-09-2026 23:26 | Tue | hw | [fix] kernel release was keyed on the executable while the session was opened under the rule name — release matched nothing
+01-09-2026 23:27 | Tue | hw | [drop] camera while_in_use withdrawn: session ended 111ms in on Firefox's probe close, mid-call. Camera is allow/deny only
+01-09-2026 23:28 | Tue | hw | [note] the model was wrong, not the code — '13 opens' was a BURST; an open count is a transient, zero != finished
+01-09-2026 23:29 | Tue | hw | [fix] an explicit camera deny is no longer re-asked; it retried every ~18s and would have nagged indefinitely
+01-09-2026 23:30 | Tue | hw | [done] CPU regression diagnosed: 62% is pw-dump spawn cost. pw-dump --monitor measured at 0.031% vs 1.74% (56x), not built
+01-09-2026 23:31 | Tue | hw | [done] README/MISSION corrected — posture, hand-started helper, ask_each, config example, V4L2 'coverage nil'. Publication blocker cleared
