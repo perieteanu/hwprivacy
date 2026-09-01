@@ -188,6 +188,27 @@ pub struct PolicyConfig {
     #[serde(default = "default_while_in_use_settle")]
     pub while_in_use_settle_secs: u64,
 
+    /// How long a camera session may sit GRANTED BUT UNUSED, in seconds.
+    ///
+    /// A camera session is answered before the device is opened, never during:
+    /// the LSM hook must return a verdict in nanoseconds, so the first open()
+    /// is always denied and the grant applies to the RETRY. Between the click
+    /// and that retry the session is live and nothing has been opened.
+    ///
+    /// It needs its own bound because the ordinary one cannot apply. A session
+    /// normally ends when the device is released, and `while_in_use_settle_secs`
+    /// covers the gap while an app reconnects — but an application on the V4L2
+    /// route never produces a PipeWire link, so `has_active_link()` is
+    /// structurally false for it and a settle window tuned for "the app
+    /// reconnects in a moment" would reap the grant before the human clicked
+    /// again. That is the loop that killed the old per-stream grant.
+    ///
+    /// Without any bound the opposite happens: a grant nobody uses sits in the
+    /// kernel allowlist forever, which is a grant outliving its use — the exact
+    /// thing `while_in_use` exists to prevent. Set 0 to disable the bound.
+    #[serde(default = "default_awaiting_open")]
+    pub awaiting_open_secs: u64,
+
     /// Notify when access is ALLOWED, not only when it is denied.
     ///
     /// Measured 2026-08-21: firefox-esr opened the camera twice in one morning
@@ -241,6 +262,13 @@ fn default_exe_recheck() -> u64 {
     30
 }
 
+fn default_awaiting_open() -> u64 {
+    // Costin, 2026-09-01: long enough to find and click the camera button
+    // again after answering, short enough that a forgotten grant does not
+    // stand indefinitely.
+    60
+}
+
 fn default_notify_allow_grace() -> u64 {
     60
 }
@@ -257,6 +285,7 @@ impl Default for PolicyConfig {
             dismiss_cooldown_secs: default_dismiss_cooldown(),
             exe_recheck_secs: default_exe_recheck(),
             while_in_use_settle_secs: default_while_in_use_settle(),
+            awaiting_open_secs: default_awaiting_open(),
             notify_on_allow: true,
             notify_allow_grace_secs: default_notify_allow_grace(),
             notify_allow_cooldown_secs: default_notify_allow_cooldown(),

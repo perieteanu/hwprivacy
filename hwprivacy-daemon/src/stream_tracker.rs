@@ -4,6 +4,48 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use tracing::{debug, info};
 
+/// Where a `while_in_use` session is in its life.
+///
+/// # Why a session has two states and not one timestamp
+///
+/// The microphone answers a prompt while the device is being asked for, so
+/// "granted" and "in use" are the same moment and one `Instant` said
+/// everything. The camera cannot work that way: the LSM hook must return a
+/// verdict in nanoseconds, so there is no holding an `open()` for a human. The
+/// first open is ALWAYS denied and the grant applies to the RETRY — which
+/// means there is a real interval where the session is live and the device has
+/// never been opened.
+///
+/// Collapsing that interval into the ordinary "released" logic is what would
+/// break it. `expire_sessions()` reaps on `!has_active_link() && elapsed >=
+/// settle`, and an application on the V4L2 route never produces a PipeWire
+/// link — so `has_active_link()` is permanently false for it and the settle
+/// window (10 s, tuned for "an app is reconnecting") would withdraw the grant
+/// before the user clicked the camera button again. That is precisely the loop
+/// that killed the old per-stream grant, arriving by a different road.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionState {
+    /// Answered, but the device has not been opened yet. The session clock has
+    /// NOT started; this is bounded by `policy.awaiting_open_secs` instead, so
+    /// a grant nobody uses cannot stand forever.
+    AwaitingFirstOpen { granted_at: Instant },
+    /// The device has been opened at least once. This is what the bare
+    /// `Instant` meant before, and the microphone path only ever sees this.
+    Open { since: Instant },
+}
+
+impl SessionState {
+    /// When this session was granted, whichever state it is in. Used for the
+    /// age shown in `hwprivacy-ctl status`, which should count from the user's
+    /// answer — that is the moment they will remember.
+    pub fn granted_at(&self) -> Instant {
+        match self {
+            SessionState::AwaitingFirstOpen { granted_at } => *granted_at,
+            SessionState::Open { since } => *since,
+        }
+    }
+}
+
 /// Tracks active streams, pending requests, and event log.
 pub struct StreamTracker {
     /// Active connections: link_id → ActiveConnection
@@ -21,7 +63,7 @@ pub struct StreamTracker {
     ///
     /// (app, device) survives that churn: the app reconnects with a fresh node
     /// and a fresh link, and the session is still the same session.
-    pub while_in_use: HashMap<(String, DeviceCategory), Instant>,
+    pub while_in_use: HashMap<(String, DeviceCategory), SessionState>,
     /// Recent events log (ring buffer, max 500)
     pub events: Vec<AccessEvent>,
     /// Counter for blocked access attempts
@@ -189,7 +231,51 @@ impl StreamTracker {
     /// Open a `while_in_use` session for (app, device).
     pub fn begin_session(&mut self, app_name: &str, category: DeviceCategory) {
         self.while_in_use
-            .insert((normalize_app_name(app_name), category), Instant::now());
+            .insert(
+                (normalize_app_name(app_name), category),
+                // A new session has not seen an open() yet. For the microphone
+                // the very next poll promotes it, because answering the prompt
+                // is followed by a real link; for the camera it may sit here
+                // until the user clicks again.
+                SessionState::AwaitingFirstOpen { granted_at: Instant::now() },
+            );
+    }
+
+    /// Record that the device has actually been opened, starting the session
+    /// clock.
+    ///
+    /// Idempotent: a camera session is 13 `open()` calls and the microphone
+    /// path calls this on every poll it holds a link. Promoting more than once
+    /// would keep resetting `since`, so a session would never expire — the
+    /// grant would outlive the use, which is the one thing `while_in_use` is
+    /// for. Returns true only on the transition, so the caller can log it.
+    pub fn mark_session_opened(&mut self, app_name: &str, category: DeviceCategory) -> bool {
+        let key = (normalize_app_name(app_name), category);
+        match self.while_in_use.get(&key) {
+            Some(SessionState::AwaitingFirstOpen { .. }) => {
+                self.while_in_use
+                    .insert(key, SessionState::Open { since: Instant::now() });
+                true
+            }
+            // Already open, or no session at all. An open() with no session is
+            // not an error here: `allow` rules open devices constantly.
+            _ => false,
+        }
+    }
+
+    /// Restart the settle window for a session already in use.
+    ///
+    /// Separate from `begin_session` because the two are not the same act, and
+    /// conflating them is a real hazard: `begin_session` resets the state to
+    /// `AwaitingFirstOpen`, which is judged against `awaiting_open` rather than
+    /// `settle`, so an hour-long call refreshed that way would be reaped the
+    /// moment the awaiting bound elapsed. A no-op unless the session is `Open`.
+    pub fn refresh_session(&mut self, app_name: &str, category: DeviceCategory) {
+        let key = (normalize_app_name(app_name), category);
+        if let Some(SessionState::Open { .. }) = self.while_in_use.get(&key) {
+            self.while_in_use
+                .insert(key, SessionState::Open { since: Instant::now() });
+        }
     }
 
     /// Is there a live `while_in_use` session for (app, device)?
@@ -212,7 +298,15 @@ impl StreamTracker {
         let Some(granted_at) = self.while_in_use.get(&key) else {
             return false;
         };
-        self.has_active_link(&key.0, category) || granted_at.elapsed() < settle
+        match granted_at {
+            // Not yet opened: the grant IS the point — it exists so the retry
+            // can succeed. Live until awaiting_open bounds it, which
+            // expire_sessions owns.
+            SessionState::AwaitingFirstOpen { .. } => true,
+            SessionState::Open { since } => {
+                self.has_active_link(&key.0, category) || since.elapsed() < settle
+            }
+        }
     }
 
     /// Does the app hold at least one live link to this device category?
@@ -241,9 +335,17 @@ impl StreamTracker {
             .while_in_use
             .iter()
             .filter(|((app, cat), granted_at)| {
-                self.has_active_link(app, *cat) || granted_at.elapsed() < settle
+                match granted_at {
+                    SessionState::AwaitingFirstOpen { .. } => true,
+                    SessionState::Open { since } => {
+                        self.has_active_link(app, *cat) || since.elapsed() < settle
+                    }
+                }
             })
-            .map(|((app, cat), granted_at)| (app.clone(), *cat, granted_at.elapsed()))
+            // Age counts from the user's ANSWER in both states — that is the
+            // moment they will remember, not the moment the app got round to
+            // opening the device.
+            .map(|((app, cat), st)| (app.clone(), *cat, st.granted_at().elapsed()))
             .collect();
         // Sorted on the rendered category rather than deriving Ord on the
         // shared DeviceCategory: a stable readout is not a reason to widen a
@@ -257,12 +359,29 @@ impl StreamTracker {
     ///
     /// This is the whole point of `while_in_use`: the grant must not outlive the
     /// use. Called once per poll, after stale connections have been pruned.
-    pub fn expire_sessions(&mut self, settle: std::time::Duration) -> Vec<(String, DeviceCategory)> {
+    pub fn expire_sessions(
+        &mut self,
+        settle: std::time::Duration,
+        awaiting_open: std::time::Duration,
+    ) -> Vec<(String, DeviceCategory)> {
         let ended: Vec<(String, DeviceCategory)> = self
             .while_in_use
             .iter()
             .filter(|((app, cat), granted_at)| {
-                !self.has_active_link(app, *cat) && granted_at.elapsed() >= settle
+                match granted_at {
+                    // NEVER reaped on has_active_link: a V4L2 application
+                    // produces no PipeWire link, so that test is permanently
+                    // false for exactly the sessions this state exists for.
+                    // Bounded by awaiting_open instead, so an answered-but-
+                    // unused grant cannot stand forever.
+                    SessionState::AwaitingFirstOpen { granted_at } => {
+                        awaiting_open > std::time::Duration::ZERO
+                            && granted_at.elapsed() >= awaiting_open
+                    }
+                    SessionState::Open { since } => {
+                        !self.has_active_link(app, *cat) && since.elapsed() >= settle
+                    }
+                }
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -392,6 +511,10 @@ mod tests {
     }
 
     const SETTLE: Duration = Duration::from_secs(10);
+    /// Large on purpose: these cases predate AwaitingFirstOpen and are about
+    /// the Open state. A short value here would expire them for an unrelated
+    /// reason and hide what they actually assert.
+    const AWAITING: Duration = Duration::from_secs(3600);
 
     #[test]
     fn no_session_exists_until_one_is_granted() {
@@ -414,11 +537,18 @@ mod tests {
     }
 
     /// Once the settle window has passed with no link, the session is over.
+    ///
+    /// The session is marked opened first, because that is what the microphone
+    /// path does the moment a link appears — and the settle window only governs
+    /// a session that has actually been used. An un-opened session is bounded
+    /// by `awaiting_open` instead; see
+    /// `an_unopened_session_is_not_reaped_by_the_settle_window`.
     #[test]
     fn a_grant_the_app_never_used_expires() {
         let mut t = StreamTracker::new();
         t.begin_session("firefox", DeviceCategory::Microphone);
-        let ended = t.expire_sessions(Duration::ZERO);
+        t.mark_session_opened("firefox", DeviceCategory::Microphone);
+        let ended = t.expire_sessions(Duration::ZERO, AWAITING);
         assert_eq!(ended, vec![("firefox".to_string(), DeviceCategory::Microphone)]);
         assert!(!t.session_live("firefox", DeviceCategory::Microphone, SETTLE));
     }
@@ -436,7 +566,7 @@ mod tests {
             DeviceCategory::Microphone,
             Permission::WhileInUse,
         );
-        assert!(t.expire_sessions(Duration::ZERO).is_empty(), "still in use");
+        assert!(t.expire_sessions(Duration::ZERO, AWAITING).is_empty(), "still in use");
         assert!(t.session_live("firefox", DeviceCategory::Microphone, Duration::ZERO));
     }
 
@@ -452,11 +582,12 @@ mod tests {
             DeviceCategory::Microphone,
             Permission::WhileInUse,
         );
-        assert!(t.expire_sessions(Duration::ZERO).is_empty());
+        t.mark_session_opened("firefox", DeviceCategory::Microphone);
+        assert!(t.expire_sessions(Duration::ZERO, AWAITING).is_empty());
 
         t.remove_connection(7); // the app closed the microphone
         assert_eq!(
-            t.expire_sessions(Duration::ZERO),
+            t.expire_sessions(Duration::ZERO, AWAITING),
             vec![("firefox".to_string(), DeviceCategory::Microphone)],
             "grant must not outlive the use"
         );
@@ -505,6 +636,10 @@ mod tests {
         // only the agreeing-yes case passes against a live_sessions() that
         // lists the whole map and never checks anything — verified by
         // reintroducing exactly that.
+        //
+        // Opened first: an AwaitingFirstOpen session is live BY DESIGN however
+        // old it is, so the settle window cannot make it say NO.
+        t.mark_session_opened("firefox", DeviceCategory::Camera);
         let zero = std::time::Duration::from_secs(0);
         assert!(
             !t.session_live("firefox", DeviceCategory::Camera, zero),
@@ -527,7 +662,8 @@ mod tests {
         let mut t = StreamTracker::new();
         t.begin_session("firefox", DeviceCategory::Camera);
 
-        // No active link, and a settle window of zero -> already expired.
+        // Opened, then no active link and a settle window of zero -> expired.
+        t.mark_session_opened("firefox", DeviceCategory::Camera);
         assert!(
             !t.session_live("firefox", DeviceCategory::Camera, zero),
             "precondition: with settle=0 and no link this session is over"
@@ -535,6 +671,147 @@ mod tests {
         assert!(
             t.live_sessions(zero).is_empty(),
             "an expired session must not be reported as live"
+        );
+    }
+
+    // ── AwaitingFirstOpen: the camera-session state ──────────────────────
+    //
+    // Every one of these was run against the reintroduced defect and observed
+    // to FAIL before being kept.
+
+    /// THE test for Costin's choice: a session that has been answered but not
+    /// yet used must NOT be reaped by the settle window.
+    ///
+    /// Fails against the old single-state model, where an unopened session was
+    /// judged by `!has_active_link && elapsed >= settle` — permanently true for
+    /// a V4L2 app, which produces no PipeWire link. The grant would vanish
+    /// before the user clicked the camera button again.
+    #[test]
+    fn an_unopened_session_is_not_reaped_by_the_settle_window() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Camera);
+
+        // settle=0 would expire an OPEN session instantly. There is no link,
+        // and there never will be one — this is the V4L2 route.
+        assert!(
+            t.expire_sessions(Duration::ZERO, AWAITING).is_empty(),
+            "an answered-but-unused grant must survive the settle window"
+        );
+        assert!(
+            t.session_live("firefox", DeviceCategory::Camera, Duration::ZERO),
+            "and it must still be live, or the retry is denied"
+        );
+    }
+
+    /// But it does not stand forever: a grant nobody uses is a grant outliving
+    /// its use, which is the one thing while_in_use exists to prevent.
+    #[test]
+    fn an_unopened_session_is_reaped_after_awaiting_open_secs() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Camera);
+
+        // 1ns, not ZERO: zero means "no bound" (see
+        // awaiting_open_zero_disables_the_bound), so using it here would test
+        // the opposite of what this asserts. Caught by that neighbouring test
+        // failing when this one was first written with ZERO.
+        let ended = t.expire_sessions(SETTLE, Duration::from_nanos(1));
+        assert_eq!(
+            ended,
+            vec![("firefox".to_string(), DeviceCategory::Camera)],
+            "an unused grant must be withdrawn once its bound elapses"
+        );
+        assert!(!t.session_live("firefox", DeviceCategory::Camera, SETTLE));
+    }
+
+    /// awaiting_open = 0 disables the bound, like every other 0-means-off knob
+    /// in this config. Without this the knob would mean "expire immediately",
+    /// which is the opposite of off.
+    #[test]
+    fn awaiting_open_zero_disables_the_bound() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Camera);
+        assert!(
+            t.expire_sessions(Duration::ZERO, Duration::ZERO).is_empty(),
+            "0 must mean 'no bound', not 'expire at once'"
+        );
+    }
+
+    /// The first open starts the clock, and only the first.
+    #[test]
+    fn the_first_open_promotes_the_session() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Camera);
+        assert!(
+            t.mark_session_opened("firefox", DeviceCategory::Camera),
+            "the first open is the transition"
+        );
+        // Now it is an ordinary session again: no link, settle=0 -> over.
+        assert_eq!(
+            t.expire_sessions(Duration::ZERO, AWAITING),
+            vec![("firefox".to_string(), DeviceCategory::Camera)],
+            "once opened, the settle window governs"
+        );
+    }
+
+    /// A camera session is 13 opens. Promotion must be idempotent, or `since`
+    /// is reset on every one of them and the session never expires — the grant
+    /// would outlive the use.
+    #[test]
+    fn a_burst_promotes_the_session_once() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Camera);
+        assert!(t.mark_session_opened("firefox", DeviceCategory::Camera));
+        for _ in 0..12 {
+            assert!(
+                !t.mark_session_opened("firefox", DeviceCategory::Camera),
+                "only the first open of a burst is a transition"
+            );
+        }
+    }
+
+    /// Marking an open for an app with no session must not invent one.
+    /// `allow` rules open devices constantly and must stay unaffected.
+    #[test]
+    fn an_open_without_a_session_creates_nothing() {
+        let mut t = StreamTracker::new();
+        assert!(!t.mark_session_opened("vlc", DeviceCategory::Camera));
+        assert!(t.live_sessions(SETTLE).is_empty(), "no session was granted");
+    }
+
+    /// refresh_session must not resurrect the un-opened state. If it did, a
+    /// long call refreshed on every poll would be judged against awaiting_open
+    /// instead of settle and reaped mid-call.
+    #[test]
+    fn refresh_never_returns_a_session_to_awaiting() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Microphone);
+        t.mark_session_opened("firefox", DeviceCategory::Microphone);
+        t.refresh_session("firefox", DeviceCategory::Microphone);
+
+        // Asserted on the STATE, not through expire_sessions. Routing this
+        // through expiry passed with the bug fully present: a reverted session
+        // is AwaitingFirstOpen, awaiting_open=0 means "no bound", so nothing
+        // was reaped and the assertion held for the wrong reason. Verified by
+        // reintroducing the revert and watching the expiry version stay green.
+        //
+        // mark_session_opened() returns true only on the transition, so a
+        // session still Open must report false.
+        assert!(
+            !t.mark_session_opened("firefox", DeviceCategory::Microphone),
+            "refresh must leave the session Open, not return it to awaiting"
+        );
+    }
+
+    /// And refresh on an un-opened session does nothing at all — it is not a
+    /// back door into promotion.
+    #[test]
+    fn refresh_does_not_promote_an_unopened_session() {
+        let mut t = StreamTracker::new();
+        t.begin_session("firefox", DeviceCategory::Camera);
+        t.refresh_session("firefox", DeviceCategory::Camera);
+        assert!(
+            t.mark_session_opened("firefox", DeviceCategory::Camera),
+            "still awaiting its first open, so this is still the transition"
         );
     }
 }

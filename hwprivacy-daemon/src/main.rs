@@ -501,10 +501,24 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                         );
                     }
                     if perm == Permission::WhileInUse {
-                        // Refresh the session: the app is demonstrably using
-                        // the device right now, so the settle window restarts
-                        // from here rather than from the original grant.
-                        s.tracker.begin_session(&stream.app_name, device.category);
+                        // A live link IS the device being open, so this is the
+                        // promotion point for the PipeWire route: it starts the
+                        // session clock the first time, and refreshes the settle
+                        // window on every poll after that.
+                        //
+                        // begin_session() must NOT be used here. It resets the
+                        // state to AwaitingFirstOpen, which is bounded by
+                        // awaiting_open rather than settle — a session held open
+                        // by a live link would then be judged by the wrong
+                        // clock, and an hour-long call would be reaped at the
+                        // 60 s mark.
+                        if s.tracker.mark_session_opened(&stream.app_name, device.category) {
+                            debug!(
+                                "while_in_use session for {} → {:?} is now in use",
+                                stream.app_name, device.category
+                            );
+                        }
+                        s.tracker.refresh_session(&stream.app_name, device.category);
                     }
                     s.log_allowed(
                         &stream.app_name,
@@ -735,7 +749,12 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
             let settle = std::time::Duration::from_secs(
                 s.config.policy.while_in_use_settle_secs,
             );
-            for (app, cat) in s.tracker.expire_sessions(settle) {
+            // A session that has been answered but never used is bounded
+            // separately — see SessionState::AwaitingFirstOpen.
+            let awaiting_open = std::time::Duration::from_secs(
+                s.config.policy.awaiting_open_secs,
+            );
+            for (app, cat) in s.tracker.expire_sessions(settle, awaiting_open) {
                 // Logged, because it is otherwise completely invisible: no
                 // notification fires, and the next thing the user sees is a
                 // prompt they may not expect.
