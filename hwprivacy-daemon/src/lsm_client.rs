@@ -430,25 +430,41 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     if ev.released {
         let app = short_name(&ev.exe_path);
         let mut s = state.write().await;
+        // End the session under the RULE's name, not the executable's.
+        //
+        // A session is opened under whichever rule owns the binary — `firefox`,
+        // typically, not `firefox-esr` — because that is the key
+        // kernel_camera_allowlist_with_sessions() passes to session_live().
+        // Removing `firefox-esr` here therefore matched nothing, and the
+        // session survived its own release: measured live 2026-09-01,
+        //
+        //   19:56:08  ALLOWED  (session open, allowlist 3)
+        //   19:56:34  call ended, camera released — kernel release found no key
+        //   19:57:03  session ended: firefox released Camera   <- expire_sessions
+        //
+        // 29 seconds late, and only because awaiting_open_secs reaped it. The
+        // fallback masked the failure, which is the worst way for this to
+        // break: the feature looks like it works, slowly.
+        let key = session_key_for_release(&s.config, &ev.exe_path, &app);
         // Ending a session that is not open is a no-op. That matters: the BPF
         // side can emit a duplicate release when two threads drop an
         // executable's last two handles at once, and it does so deliberately —
         // ending twice is harmless, never ending is the bug.
         if s.tracker.while_in_use.remove(&(
-            hwprivacy_common::normalize_app_name(&app),
+            hwprivacy_common::normalize_app_name(&key),
             category,
         )).is_some()
         {
             info!(
                 "while_in_use session ended: {} released the camera (kernel)",
-                app
+                key
             );
             s.tracker.log_event(
-                &app, ev.pid, category, &ev.exe_path, AccessAction::SessionEnded,
+                &key, ev.pid, category, &ev.exe_path, AccessAction::SessionEnded,
             );
             s.policy_dirty.notify_waiters();
         } else {
-            debug!("Kernel reported {} released the camera; no session was open", app);
+            debug!("Kernel reported {} released the camera; no session was open", key);
         }
         return;
     }
@@ -575,6 +591,20 @@ fn rule_key_for(config: &Config, exe_path: &str, exe_short: &str) -> String {
         .find_rule_by_exe(exe_path)
         .map(|r| r.app_name.clone())
         .unwrap_or_else(|| exe_short.to_string())
+}
+
+/// The session key a kernel RELEASE must remove.
+///
+/// Exists as its own function purely so a test can pin the call site. An
+/// earlier version keyed this on `short_name(exe_path)` while the prompt
+/// opened the session under the owning rule's name, and nothing caught it:
+/// asserting that `rule_key_for(..) == rule_key_for(..)` passes trivially
+/// whatever the release path actually does.
+///
+/// It must agree with `rule_key_for`, which is what the prompt uses. Defined
+/// in terms of it rather than beside it, so the two cannot drift apart.
+fn session_key_for_release(config: &Config, exe_path: &str, exe_short: &str) -> String {
+    rule_key_for(config, exe_path, exe_short)
 }
 
 /// Ask the user about a camera the kernel just denied, and act on the answer.
@@ -1216,6 +1246,50 @@ mod tests {
             rule_key_for(&c, "/usr/bin/obs", "obs"),
             "obs",
             "a rule naming no exe_path cannot own one"
+        );
+    }
+
+    /// The session-OPEN key and the session-END key must be the same string.
+    ///
+    /// They are chosen in two different places from two different inputs: the
+    /// prompt opens under the owning rule's name, and the kernel release path
+    /// only knows the executable. When those disagreed, `file_release` removed
+    /// nothing and the session outlived its own release — measured live
+    /// 2026-09-01:
+    ///
+    /// ```text
+    /// 19:56:08  ALLOWED, session open, allowlist 3
+    /// 19:56:34  call ended, camera released -> kernel release matched no key
+    /// 19:57:03  session ended: firefox released Camera  <- expire_sessions, 29s late
+    /// ```
+    ///
+    /// The awaiting_open fallback reaped it eventually, which is what made the
+    /// bug hard to see: the feature appeared to work, slowly.
+    ///
+    /// The FIRST version of this test was worthless — it asserted
+    /// `rule_key_for(..) == rule_key_for(..)`, which holds no matter what the
+    /// release path does. It passed with the bug fully reintroduced. Pinning
+    /// `session_key_for_release` is what makes it catch anything.
+    #[test]
+    fn the_release_key_matches_the_key_the_session_was_opened_under() {
+        let mut c = Config::default();
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
+        c.set_rule_exe("firefox", "/bin/sh").expect("binary");
+
+        let opened_under = rule_key_for(&c, "/bin/sh", "sh");
+        let released_under = session_key_for_release(&c, "/bin/sh", "sh");
+
+        assert_eq!(
+            released_under, opened_under,
+            "open and release must agree, or a session survives its own release"
+        );
+        assert_eq!(
+            released_under, "firefox",
+            "the RULE's name — that is what session_live() is asked about"
+        );
+        assert_ne!(
+            released_under, "sh",
+            "keying the release on the executable is the 2026-09-01 defect"
         );
     }
 }
