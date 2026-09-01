@@ -1,5 +1,5 @@
 use hwprivacy_common::{sanitize_rule_name, DeviceCategory, Permission};
-use notify_rust::{Hint, Notification, Urgency};
+use notify_rust::{Hint, Notification, Urgency, Timeout};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
@@ -287,6 +287,106 @@ pub async fn notify_kernel_gap(app_name: &str, why: &str) {
 ///
 /// Blocks until the user responds or the popup times out. See [`PromptOutcome`]
 /// for why the answer is not an `Option<Permission>`.
+/// The sentence a camera prompt MUST carry.
+///
+/// A camera grant applies to the NEXT attempt, never the one being asked
+/// about: the LSM hook returns a verdict in nanoseconds, so the open() that
+/// triggered this prompt was already denied by the time anybody saw it.
+/// Without saying so, the prompt promises video that will not appear until the
+/// user acts again — the same lying-surface class this project has spent
+/// weeks removing. Costin, 2026-09-01: mandatory, not nice-to-have.
+///
+/// Pulled out as a constant so a test can pin it. Notifications are invisible
+/// to any automated check, and wording that only a human can verify is wording
+/// that silently rots.
+pub const RETRY_HINT: &str =
+    "Answering allows the NEXT attempt — click the camera button again.";
+
+/// Ask about a camera access the KERNEL denied.
+///
+/// Separate from `ask_user_permission` for three reasons, none cosmetic:
+///
+/// * The principal is the EXECUTABLE, not a PipeWire client name. Costin,
+///   2026-09-01: show `firefox-esr` explicitly. `firefox` would name the
+///   PipeWire identity while the kernel grants by executable inode — two
+///   different things, and a rule written against the wrong one does nothing
+///   (`d-executable-is-the-principal`, and blocker b4 before it).
+/// * It must carry `RETRY_HINT`. The PipeWire path has no retry to explain.
+/// * There is no pid to speak of on a burst summary, and the device is a node
+///   path rather than a PipeWire node name.
+pub async fn ask_kernel_camera_permission(
+    exe_short: &str,
+    exe_path: &str,
+    pid: u32,
+    device_path: &str,
+) -> PromptOutcome {
+    let summary = format!("Camera blocked: {}", exe_short);
+    let body = format!(
+        "<b>{}</b> (pid:{}) was denied the <b>camera</b> by the kernel.\n\
+         Device: {}\n\
+         Binary: {}\n\
+         \n\
+         {}\n\
+         \n\
+         A video call may also lose its audio — the browser asks for camera \
+         and microphone together.",
+        exe_short, pid, device_path, exe_path, RETRY_HINT
+    );
+
+    let result = tokio::task::spawn_blocking(move || -> PromptOutcome {
+        let chosen = Arc::new(Mutex::new(None::<Permission>));
+        let mut notif = Notification::new();
+        notif
+            .summary(&summary)
+            .body(&body)
+            .icon(device_icon(DeviceCategory::Camera))
+            .urgency(Urgency::Critical)
+            .hint(Hint::Category("device".to_string()))
+            .timeout(Timeout::Never);
+
+        notif.action("allow", "Always Allow");
+        // Offered here, unlike on the PipeWire path, because a kernel camera
+        // session is exactly what this prompt exists to start.
+        notif.action("while_in_use", "While in Use");
+        notif.action("deny", "Always Deny");
+
+        match notif.show() {
+            Ok(handle) => {
+                let chosen_c = chosen.clone();
+                handle.wait_for_action(|action| {
+                    let perm = match action {
+                        "allow" => Some(Permission::Allow),
+                        "while_in_use" => Some(Permission::WhileInUse),
+                        "deny" => Some(Permission::Deny),
+                        "__closed" => {
+                            info!(
+                                "Camera prompt dismissed — no rule saved, will ask again later"
+                            );
+                            None
+                        }
+                        other => {
+                            warn!("Unknown notification action: {}", other);
+                            None
+                        }
+                    };
+                    *chosen_c.lock().unwrap() = perm;
+                });
+                match chosen.lock().unwrap().take() {
+                    Some(p) => PromptOutcome::Chosen(p),
+                    None => PromptOutcome::Dismissed,
+                }
+            }
+            Err(e) => PromptOutcome::Failed(e.to_string()),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(outcome) => outcome,
+        Err(e) => PromptOutcome::Failed(format!("prompt task failed: {e}")),
+    }
+}
+
 pub async fn ask_user_permission(
     app_name: &str,
     pid: u32,
@@ -504,4 +604,25 @@ mod tests {
 
     // The per-stream tests lived here until 2026-08-23. `ask_each` is gone,
     // so every answer now writes a rule and there is no second shape to test.
+
+    /// The camera prompt must tell the user their answer applies to the NEXT
+    /// attempt. Without it the prompt promises video that will not appear
+    /// until they click again, and the first thing they will conclude is that
+    /// hwprivacy ignored the answer.
+    ///
+    /// Notifications are invisible to every automated check in this project —
+    /// C4 was scored wrong twice because verification depended on a human
+    /// seeing a popup. Pinning the sentence as a constant is what makes it
+    /// checkable at all.
+    #[test]
+    fn the_retry_hint_says_the_answer_applies_to_the_next_attempt() {
+        assert!(
+            RETRY_HINT.contains("NEXT attempt"),
+            "the hint must name the retry: {RETRY_HINT}"
+        );
+        assert!(
+            RETRY_HINT.contains("again"),
+            "and must tell the user to act again: {RETRY_HINT}"
+        );
+    }
 }

@@ -17,7 +17,7 @@ family. Three tranches followed: staleness + b1/b2/b4 + posture; then b3 and
 the first tests `classify_link()` has ever had; then notify-on-allow and the
 `offenders` → `history` rename.
 
-`git`: **uncommitted**. **172 tests**, all passing (was 78). 7 crates, 12234 LOC.
+`git`: **uncommitted**. **201 tests**, all passing. 7 crates, 13651 LOC.
 
 ### The find: enforcement silently stopped for sixteen hours
 

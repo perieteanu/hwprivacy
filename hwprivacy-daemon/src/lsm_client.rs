@@ -527,24 +527,126 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
         ev.total_opens()
     );
 
-    // Informational only — no action buttons.
+    // A denied CAMERA gets an ACTIONABLE prompt; everything else stays
+    // informational.
     //
-    // Deliberate: the action-notification path (notification::ask_user_permission)
-    // has defect b1, where dismissing writes a permanent deny rule. Wiring a new
-    // event source into it would inherit that bug on day one. Kernel policy is
-    // edited in config.toml until b1 is fixed.
-    let detail = if category == DeviceCategory::Camera {
-        // Measured 2026-08-05: WhatsApp reported "camera or microphone not
-        // found" although only the camera was denied. getUserMedia({audio,
-        // video}) fails as a unit, so a camera denial kills call audio too.
-        // Saying so here prevents a phantom microphone bug hunt later.
-        "Blocked by the kernel. A video call may also lose its audio — the browser \
-         asks for camera and microphone together."
-    } else {
-        "Blocked by the kernel."
-    };
+    // The old blanket rule was "never route a kernel denial through the action
+    // path, because that path carries b1 (dismissing wrote a permanent deny)".
+    // b1 was FIXED on 2026-08-21 — notification::decide() maps a dismissal to
+    // SaveNothingAndCooldown, and a doc-check sentinel refuses the old
+    // expression. The premise is gone, so the rule is retired deliberately
+    // here rather than stepped over quietly. If b1 ever returns, this must be
+    // reconsidered with it.
+    //
+    // The microphone keeps the informational path for a reason that has not
+    // changed: /dev/snd is opened by /usr/bin/pipewire on everyone's behalf, so
+    // a kernel mic denial cannot name the application responsible and a prompt
+    // asking about "pipewire" would be unanswerable.
+    if category == DeviceCategory::Camera {
+        prompt_kernel_camera_denial(state, &ev, &app).await;
+        return;
+    }
 
-    crate::notification::notify_kernel_denial(&app, ev.pid, category, &ev.device, detail).await;
+    crate::notification::notify_kernel_denial(
+        &app,
+        ev.pid,
+        category,
+        &ev.device,
+        "Blocked by the kernel.",
+    )
+    .await;
+}
+
+/// Ask the user about a camera the kernel just denied, and act on the answer.
+///
+/// The grant applies to the user's NEXT attempt — the open() that produced this
+/// event was denied before any human saw it, because the LSM hook must answer
+/// in nanoseconds. `notification::RETRY_HINT` says so on the prompt; that is a
+/// correctness requirement, not politeness (Costin, 2026-09-01).
+async fn prompt_kernel_camera_denial(
+    state: &SharedState,
+    ev: &AccessEvent,
+    app: &str,
+) {
+    // b6's guard: one pending question per (app, device). A camera session is
+    // 13 opens, and without this a single call raises thirteen popups — the
+    // defect coalescing exists to prevent, arriving from a new direction.
+    {
+        let mut s = state.write().await;
+        if !s.tracker.try_begin_prompt(app, DeviceCategory::Camera) {
+            debug!(
+                "Camera prompt for {} already pending; blocking silently",
+                app
+            );
+            return;
+        }
+    }
+
+    let exe_short = app.to_string();
+    let exe_path = ev.exe_path.clone();
+    let device_path = ev.device.clone();
+    let pid = ev.pid;
+    let st = state.clone();
+
+    tokio::spawn(async move {
+        let outcome = crate::notification::ask_kernel_camera_permission(
+            &exe_short, &exe_path, pid, &device_path,
+        )
+        .await;
+
+        if let crate::notification::PromptOutcome::Failed(e) = &outcome {
+            warn!(
+                "Could not prompt for the camera ({}). Access stayed blocked and \
+                 NO rule was saved.",
+                e
+            );
+        }
+
+        let mut s = st.write().await;
+        // Released on EVERY path out, or this executable is never asked about
+        // again for the life of the daemon: no popup, no error, nothing logged.
+        s.tracker.end_prompt(&exe_short, DeviceCategory::Camera);
+
+        match crate::notification::decide(&outcome) {
+            crate::notification::PromptAction::SavePermanentRule(perm) => {
+                // The rule must carry the EXECUTABLE, because that is what the
+                // kernel matches. Attaching it first is not optional for a
+                // session: set_rule refuses camera = while_in_use without one,
+                // since presence in the allowlist IS the grant.
+                if s.config.find_rule(&exe_short).is_none()
+                    && !s.config.set_rule(&exe_short, &DeviceCategory::Camera, Permission::Deny)
+                {
+                    warn!("Refused to create a rule for {:?}", exe_short);
+                    return;
+                }
+                if let Err(e) = s.config.set_rule_exe(&exe_short, &exe_path) {
+                    warn!("Could not attach {} to rule {}: {}", exe_path, exe_short, e);
+                    return;
+                }
+                if perm == Permission::WhileInUse {
+                    // Opens the session NOW, in AwaitingFirstOpen: the device
+                    // has not been opened and will not be until the user clicks
+                    // again. Bounded by policy.awaiting_open_secs.
+                    s.tracker.begin_session(&exe_short, DeviceCategory::Camera);
+                }
+                if s.config.set_rule(&exe_short, &DeviceCategory::Camera, perm) {
+                    if let Err(e) = s.config.save() {
+                        error!("Failed to save config after user decision: {}", e);
+                    }
+                    info!("User set rule: {} → camera = {}", exe_short, perm);
+                    // The allowlist must change before the user clicks again,
+                    // not at the next exe_recheck tick — 30 s of latency reads
+                    // as the click having failed.
+                    s.policy_dirty.notify_waiters();
+                } else {
+                    warn!("Refused to save camera rule for {:?}", exe_short);
+                }
+            }
+            crate::notification::PromptAction::SaveNothingAndCooldown => {
+                s.tracker.record_dismiss(&exe_short, DeviceCategory::Camera);
+            }
+        }
+    });
 }
 
 /// Announce an allowed kernel access, if this one is worth announcing.

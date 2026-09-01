@@ -1029,3 +1029,67 @@ decisions:
       19:06:50  User set rule: Firefox -> Microphone = while_in_use
       19:07:00  while_in_use session ended: firefox released Microphone
       19:07:00  Event: firefox (pid:0) -> microphone -> SESSION_ENDED
+
+  - id: d-camera-sessions-need-an-answerable-denial
+    date: "2026-09-01"
+    title: "A denied camera prompts, because that is the only way a session can start"
+    supersedes: d-camera-sessions-cannot-be-started
+    context: >
+      d-camera-sessions-cannot-be-started refused `camera = while_in_use`
+      outright, and was right to at the time: a session had no way to BEGIN.
+      That ADR named what would reopen it — "a camera denial that can raise an
+      ACTIONABLE notification" — and this is that change.
+    what_unblocked_it: >
+      Nothing new in the kernel. The blocker was a house rule: "don't route
+      kernel denials through the action-notification path, because that path
+      carries b1". b1 — dismissing a prompt wrote a permanent deny — was fixed
+      on 2026-08-21, and notification::decide() now maps a dismissal to
+      SaveNothingAndCooldown with a doc-check sentinel guarding the old
+      expression. The prohibition outlived its reason by eleven days.
+    decision: >
+      A denied CAMERA raises an actionable prompt (Always Allow / While in Use /
+      Always Deny) via lsm_client::prompt_kernel_camera_denial. The microphone
+      and monitor keep the informational path.
+    why_the_microphone_does_not_change: >
+      /dev/snd is opened by /usr/bin/pipewire on behalf of every application, so
+      a kernel microphone denial cannot name who is responsible. A prompt asking
+      about "pipewire" would be unanswerable, and the PipeWire layer already
+      prompts for the microphone with the real application name.
+    the_grant_applies_to_the_retry: >
+      The LSM hook must return a verdict in nanoseconds, so the open() that
+      triggered the prompt was denied before any human saw it. A camera grant
+      can only ever apply to the NEXT attempt. Measured twice that this is
+      workable: 2026-08-05, same pid 3271 across deny and allow, one click, no
+      tab reload; 2026-09-01, pid 3246 held across three denials, a grant, and
+      an ALLOWED eleven minutes later — one process throughout.
+    the_prompt_must_say_so: >
+      notification::RETRY_HINT — "Answering allows the NEXT attempt — click the
+      camera button again." Costin, 2026-09-01: mandatory, not politeness.
+      Without it the prompt promises video that does not appear until the user
+      acts again, and the obvious conclusion is that hwprivacy ignored the
+      answer. Pinned as a constant so a test can assert it: notifications are
+      invisible to every automated check here, and C4 was scored wrong twice
+      because verification depended on a human seeing a popup.
+    the_identity_is_the_executable: >
+      Costin, 2026-09-01: show `firefox-esr` explicitly, not `firefox`. The
+      kernel grants by executable inode, and the rule this prompt writes carries
+      an exe_path. Naming the PipeWire identity would name a different principal
+      from the one being granted — see d-executable-is-the-principal, and b4
+      before it, where the string a user copied was not the string that worked.
+    one_prompt_per_burst: >
+      A camera session is 13 opens. The b6 claim (try_begin_prompt /
+      end_prompt, keyed on the normalised name) gates it, so one call raises one
+      question. The claim is released on EVERY path out, or that executable is
+      never asked about again for the life of the daemon.
+    the_exe_path_requirement_stays: >
+      Unchanged from the superseded ADR. The session is enforced by adding and
+      removing the executable from the kernel allowlist, so presence in that
+      list IS the grant and there is nothing to add without a binary. The prompt
+      attaches it from the event, which is why answering works where typing a
+      name never could.
+    guarded_by: >
+      tools/doc-check gained a REQUIRED check, not a sentinel. SENTINELS catch a
+      defect coming BACK; this catches a fix going AWAY, which is an absence and
+      cannot be written as a forbidden string. Remove the prompt and config.rs
+      keeps accepting the rule while every unit test still passes — that is
+      exactly the shape of the 2026-09-01 defect.

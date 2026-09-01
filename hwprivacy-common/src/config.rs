@@ -460,28 +460,30 @@ impl Config {
         // which is meaningful for a portal app on the PipeWire route, a
         // while_in_use camera rule with no binary can do nothing at all.
         //
-        // MEASURED 2026-09-01, and this is the half `file_release` did NOT fix.
-        // That hook made a session ENDABLE. Nothing made one STARTABLE from the
-        // kernel side: `begin_session()` is reached from exactly two places,
-        // both on the PipeWire link path in main.rs, and a kernel denial is
-        // informational with no action buttons (deliberately — the action path
-        // carries b1). So for an application that takes the camera through
-        // V4L2 rather than PipeWire, the sequence is:
+        // MEASURED 2026-09-01: this guard was briefly a BLANKET refusal, and
+        // the reason is worth keeping. `file_release` (2026-08-23) made a
+        // camera session ENDABLE; nothing had made one STARTABLE, because
+        // begin_session() was reached only from the PipeWire link path and a
+        // kernel denial raised an informational popup with no buttons. So a
+        // V4L2 application on while_in_use was denied its camera permanently:
         //
-        //     no session -> exe removed from the allowlist -> open() denied
-        //     -> informational popup with no buttons -> still no session
-        //
-        // Firefox and Chrome are exactly those applications; g5 is why layer 2
-        // exists at all. Live evidence, 2026-09-01 18:53:
         //     18:53:09  Rule set: firefox -> cam = while_in_use  (allowlist 3->2)
         //     18:53:33  Kernel layer DENIED firefox-esr -> /dev/video0
-        //     18:54:15  DENIED again ... permanently, with no way to answer
+        //     18:54:57  DENIED again ... with no way to answer
         //
-        // Refusing here rather than at the prompt: a rule that can never reach
-        // a live state is the same lying surface as the old while_in_use ==
-        // allow, just failing closed instead of open. When a camera prompt can
-        // be raised from a kernel denial, delete this and the guard above it.
-        if *category == super::DeviceCategory::Camera && perm == Permission::WhileInUse {
+        // A camera denial now raises an ACTIONABLE prompt
+        // (lsm_client::prompt_kernel_camera_denial), so a session can be
+        // started and the blanket refusal is lifted. The exe_path requirement
+        // stays and is not negotiable: the session is enforced by adding and
+        // removing the executable from the kernel allowlist, so presence in
+        // that list IS the grant and there is nothing to add without a binary.
+        // Unlike a plain `camera = allow`, which still means something for a
+        // portal app on the PipeWire route, a while_in_use camera rule with no
+        // binary can do nothing at all.
+        if *category == super::DeviceCategory::Camera
+            && perm == Permission::WhileInUse
+            && self.find_rule(&key).and_then(|r| r.exe_path.clone()).is_none()
+        {
             return false;
         }
         if let Some(rule) = self.find_rule_mut(&key) {
@@ -1339,31 +1341,26 @@ microphone = "ask_each"
         assert_eq!(c.find_rule("firefox").unwrap().camera, None, "nothing written");
     }
 
-    /// A camera session is refused EVEN WITH a binary attached.
+    /// A camera session IS accepted once a binary is attached — but only
+    /// because a camera denial can now be answered.
     ///
-    /// The binary was never the whole requirement. A session has to be
-    /// startable, and nothing can start one for an application that reaches
-    /// the camera through V4L2: `begin_session()` is only ever called from the
-    /// PipeWire link path, and a kernel denial raises an informational popup
-    /// with no buttons. Firefox on `while_in_use` was therefore denied the
-    /// camera permanently, measured live on 2026-09-01.
+    /// This assertion was inverted between 2026-09-01 18:53 and the same
+    /// evening's fix, and the history matters more than the assertion. A
+    /// camera session was accepted with a binary but could never be STARTED:
+    /// begin_session() was reached only from the PipeWire link path, and a
+    /// V4L2 application produces no link, so firefox on while_in_use lost its
+    /// camera permanently. The rule was refused outright until
+    /// lsm_client::prompt_kernel_camera_denial made the denial actionable.
     ///
-    /// This test replaces `a_camera_session_with_a_binary_is_accepted`, which
-    /// asserted the behaviour that produced that deadlock.
+    /// If that prompt is ever reverted to the informational path, this test
+    /// keeps passing while the feature is broken — which is why doc-check
+    /// carries a sentinel for it as well.
     #[test]
-    fn a_camera_session_is_refused_even_with_a_binary() {
+    fn a_camera_session_with_a_binary_is_accepted() {
         let mut c = Config::default();
         assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
         c.set_rule_exe("firefox", "/bin/sh").expect("binary");
-        assert!(
-            !c.set_rule("firefox", &DeviceCategory::Camera, Permission::WhileInUse),
-            "a camera session cannot be STARTED, so the rule must be refused"
-        );
-        assert_eq!(
-            c.find_rule("firefox").unwrap().camera,
-            Some(Permission::Allow),
-            "the refusal must leave the previous permission untouched"
-        );
+        assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::WhileInUse));
     }
 
     /// The refusal is specific to the camera. Microphone and monitor go through

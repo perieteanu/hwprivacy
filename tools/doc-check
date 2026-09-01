@@ -273,14 +273,6 @@ SENTINELS = [
      "the session-blind allowlist is back in use. A while_in_use camera must be "
      "allowlisted ONLY while its session is live — use "
      "kernel_camera_allowlist_with_sessions(). See d-camera-sessions-via-file-release."),
-    ("&& self.find_rule(&key).and_then(|r| r.exe_path.clone()).is_none()",
-     "the camera while_in_use guard was loosened back to 'refuse only when "
-     "there is no exe_path'. That is necessary and NOT sufficient: a camera "
-     "session cannot be STARTED at all — begin_session() is only reached from "
-     "the PipeWire link path, and a V4L2 app (Firefox, Chrome) never produces "
-     "a link, while the kernel denial has no buttons to answer. Measured live "
-     "2026-09-01: firefox was denied its camera permanently. See "
-     "d-camera-sessions-cannot-be-started."),
     ("Hint::Resident(true)",
      "the action prompt stayed on screen after the user clicked an answer — the "
      "spec says resident means exactly that. Timeout::Never alone gives "
@@ -306,6 +298,42 @@ for dirpath, dirnames, filenames in os.walk(ROOT):
                 fail("regression", rel, f"{token!r} is back. {why}")
 if _sentinel_hits == 0:
     ok(f"no fixed defect has reappeared ({len(SENTINELS)} sentinels)")
+
+# ══════════════════════════════════════════════════════════════════
+# 5b. Code that must NOT disappear.
+#
+#     SENTINELS catch a defect coming BACK. This catches a fix going AWAY,
+#     which is a different shape and cannot be expressed as a forbidden
+#     string: the defect here is an absence.
+#
+#     OCCURRED 2026-09-01: a camera while_in_use rule was accepted while
+#     nothing could start its session, because a kernel camera denial raised
+#     an informational popup with no buttons. Firefox lost its camera
+#     permanently. If the actionable prompt is removed, config.rs will happily
+#     keep accepting the rule and every unit test will keep passing.
+# ══════════════════════════════════════════════════════════════════
+REQUIRED = [
+    ("hwprivacy-daemon/src/lsm_client.rs", "prompt_kernel_camera_denial",
+     "a denied CAMERA must raise an ACTIONABLE prompt. Without it a "
+     "while_in_use camera session can never be started, and the rule denies "
+     "the camera permanently — measured live 2026-09-01. See "
+     "d-camera-sessions-need-an-answerable-denial."),
+    ("hwprivacy-daemon/src/notification.rs", "RETRY_HINT",
+     "the camera prompt must say the answer applies to the NEXT attempt. The "
+     "grant cannot apply to the open() being asked about — the LSM hook "
+     "answers in nanoseconds — so without this the prompt promises video that "
+     "will not appear until the user clicks again."),
+]
+_missing = 0
+for rel, token, why in REQUIRED:
+    body = read(rel)
+    if body is None:
+        continue
+    if token not in body:
+        _missing += 1
+        fail("required", rel, f"{token!r} is GONE. {why}")
+if _missing == 0:
+    ok(f"code that must not disappear is present ({len(REQUIRED)} checks)")
 
 # ══════════════════════════════════════════════════════════════════
 # 6. Both layers described.  OCCURRED: ARCHITECTURE.yaml and README described

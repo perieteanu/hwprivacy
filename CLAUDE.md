@@ -5,7 +5,7 @@ Android-style hardware permission manager for the Linux desktop. Gates native
 **playback monitor** across **two enforcement layers**: the PipeWire graph, and
 an eBPF LSM in the kernel.
 
-Rust workspace, **7 crates, 12234 LOC** (BPF C included; generated `vmlinux.h`
+Rust workspace, **7 crates, 13651 LOC** (BPF C included; generated `vmlinux.h`
 excluded). Debian 13 / PipeWire / KDE + GNOME.
 Registered in project-tracker as `hwprivacy`, short name `hw`.
 
@@ -318,9 +318,17 @@ regression → only then touch the substrate.
   does not need more surface, it needs the surface it has to behave.
 - Don't trust README on behaviour, and don't trust it at all on the kernel
   layer. Verify against the running daemon.
-- Don't route kernel denials through the action-notification path. They use an
-  *informational* notification with no buttons **on purpose** — the action path
-  carries b1, and a new event source wired into it inherits that bug on day one.
+- **RETIRED 2026-09-01** — was: "don't route kernel denials through the
+  action-notification path". The premise was that the action path carried b1
+  (dismissing wrote a permanent deny). **b1 was fixed 2026-08-21**:
+  `notification::decide()` maps a dismissal to `SaveNothingAndCooldown`, and a
+  doc-check sentinel refuses the old expression. A denied **camera** now raises
+  an actionable prompt — that is the only way a camera session can be started
+  (`d-camera-sessions-need-an-answerable-denial`). The **microphone keeps the
+  informational path**, for a reason that has not changed: `/dev/snd` is opened
+  by `/usr/bin/pipewire` on everyone's behalf, so a kernel mic denial cannot
+  name the app responsible and a prompt about "pipewire" is unanswerable.
+  **If b1 ever regresses, reconsider this with it.**
 - Don't claim the security model is stronger than it is: a process running as
   the same user can `systemctl --user stop hwprivacy`. The kernel layer raises
   the floor for the camera but is not pinned, so killing the root helper
