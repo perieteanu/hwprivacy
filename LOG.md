@@ -194,3 +194,11 @@
 01-09-2026 23:29 | Tue | hw | [fix] an explicit camera deny is no longer re-asked; it retried every ~18s and would have nagged indefinitely
 01-09-2026 23:30 | Tue | hw | [done] CPU regression diagnosed: 62% is pw-dump spawn cost. pw-dump --monitor measured at 0.031% vs 1.74% (56x), not built
 01-09-2026 23:31 | Tue | hw | [done] README/MISSION corrected — posture, hand-started helper, ask_each, config example, V4L2 'coverage nil'. Publication blocker cleared
+02-09-2026 00:05 | Wed | hw | [decide] pw-dump --monitor over pipewire-rs — the wire format is already GraphSnapshot's shape; parsers reused unchanged
+02-09-2026 00:06 | Wed | hw | [note] pipewire-rs IS packaged in Debian 13 (librust-pipewire-dev 0.8.0-7) — d-event-driven-substrate's MSRV objection was obsolete
+02-09-2026 00:07 | Wed | hw | [done] graph streams instead of polling: idle CPU 2.70-2.82% -> 0.033% (82x), link latency 0-500ms -> 11ms, measured live
+02-09-2026 00:08 | Wed | hw | [note] pw-dump --monitor DIES on a PipeWire restart and EXITS 0 — supervisor treats any exit as an anomaly, re-seeds, never merges
+02-09-2026 00:09 | Wed | hw | [drop] poll_interval_ms retired — kept with skip_serializing so old configs load, dropped on the next rule write
+02-09-2026 00:10 | Wed | hw | [fix] gui-test false failure: the unset-category check read row 0 (pipewire, all three set) instead of the rule with a gap
+02-09-2026 00:11 | Wed | hw | [add] tools/tui-screen — first thing that can look at the TUI; pty needs TIOCSWINSZ or ratatui draws nothing into 0x0
+02-09-2026 00:12 | Wed | hw | [done] both frontends verified against the new rule shape; all four TUI panels and 16/16 gui-test checks

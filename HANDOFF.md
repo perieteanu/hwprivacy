@@ -1,9 +1,9 @@
-# HANDOFF — 2026-09-01
+# HANDOFF — 2026-09-02 (00:15, one long session)
 
 Read this first, then `CLAUDE.md`, then `docs-yaml/ROADMAP.yaml`.
 
 **Run `make doc-check` before trusting any number here.** Green as of this
-commit: 7 crates, **14042 LOC**, 5 binaries, **210 tests**, 0 failures.
+commit: 7 crates, **14636 LOC**, 5 binaries, **225 tests**, 0 failures.
 
 ---
 
@@ -16,6 +16,11 @@ first `lsm/file_release` hook this project has ever loaded.
 
 Do not reconstruct today from the commit titles alone — parts 1 and 2 land a
 feature that 9a0085b then removes. The sequence is the point.
+
+**Then the second half of the session replaced the monitoring substrate.**
+Layer 1's idle cost went from 2.70-2.82% of a core to **0.033%** — 82x — and a
+new link is now seen in 11 ms instead of somewhere in a 0-500 ms poll window.
+Both frontends were verified afterwards; both are fine.
 
 ---
 
@@ -83,6 +88,50 @@ camera".
 
 Costin's ruling: **allow or deny only.** `d-camera-is-allow-or-deny`.
 
+### 5. The graph streams instead of being polled
+
+`pw-dump --monitor` replaced spawning `pw-dump` twice a second. Measured on the
+live service:
+
+```
+layer 1 idle CPU   2.70-2.82%  ->  0.033%     (82x)
+link latency       0-500 ms    ->  11 ms
+```
+
+**`pipewire-rs` was considered and lost** — and not on the numbers. Its recorded
+objection in `d-event-driven-substrate` (MSRV, a new dependency) is obsolete:
+`librust-pipewire-dev 0.8.0-7` **is** packaged in Debian 13. It lost because the
+`--monitor` wire format is already what the daemon wants — block 0 is a complete
+snapshot in `GraphSnapshot`'s exact shape, later blocks carry only changes, and
+a removal is the object with `"info": null`. The existing parsers are reused
+unchanged.
+
+**The hazard that shaped the design**, measured before any code was written:
+`pw-dump --monitor` **dies when PipeWire restarts, and exits 0**. A clean exit
+is indistinguishable from success, so a bare child would leave the daemon
+permanently blind while every status surface reported healthy — b5's exact
+shape. The polling design was immune because it respawned every tick.
+
+Hence: any exit is an anomaly including 0; a respawn **re-seeds, never merges**
+(PipeWire ids are not stable across a server restart, so a merged graph carries
+dead ids a new object can reuse — b2); and a watchdog covers silence, because a
+wedged reader and a quiet system look identical. Verified live — see
+`d-monitor-stream-not-polling`.
+
+`poll_interval_ms` is retired: kept with `skip_serializing` so an existing
+config still loads, ignored, and dropped on the next rule write.
+
+### 6. Both frontends verified
+
+They had not been checked since the rules surface changed on 2026-08-23.
+
+- **`make gui-test` 16/16**, after one FALSE failure: the unset-category check
+  read `rule_rows[0]`, which is `pipewire` — a rule that legitimately sets all
+  three categories and so has no dash to find. It had only ever passed because
+  row 0 happened to have a gap.
+- **`tools/tui-screen` is new** and is the first thing that can look at the TUI
+  at all. All four panels verified.
+
 ---
 
 ## What is running right now
@@ -101,67 +150,54 @@ Costin's ruling: **allow or deny only.** `d-camera-is-allow-or-deny`.
 
 ## Pick up here
 
-### 1. README and MISSION are done — check, do not redo
+### 1. README's unread sections — the last publication item
 
-Both were rewritten today and are no longer the publication blocker. README's
-posture note, the hand-started-helper claim, the `ask_each` permission table,
-the config example and Known Limitations are corrected; MISSION no longer files
-the kernel layer under "what would fix it" in the conditional.
+**Start here. Highest value, lowest effort, and the only thing blocking a
+stated goal.**
 
-**What to verify before publishing**: the README sections nobody re-read today —
-Architecture, the D-Bus API, the phase history. `doc-check` cannot see a stale
-prose claim.
+README and MISSION were corrected on 2026-09-01 and are no longer the blocker:
+the posture note, the hand-started-helper claim, the `ask_each` permission
+table, the config example and Known Limitations are all fixed, and MISSION no
+longer files the kernel layer under "what would fix it" in the conditional.
 
-### 2. The CPU regression — diagnosed, with a measured fix waiting
+**What was never re-read**: README's Architecture section, the D-Bus API, and
+the phase history. `doc-check` checks counts, anchors and sentinels — it
+structurally cannot see a stale prose claim, which is exactly how the posture
+note survived eleven days while the gate ran green every time.
 
-**Not a regression in hwprivacy's code.**
+~40 minutes. Also: the config example and CPU figures in README may now
+disagree with the substrate change — check them against
+`d-monitor-stream-not-polling`.
 
-```
-layer 1 steady state         2.70-2.82% of one core
-pw-dump alone at 2 Hz        1.74%   <- 62% of the total, before our code runs
-daemon's own work           ~1.0%
-kernel helper                0.041%
-```
-
-Ruled out: the graph did not grow (210 KB / 87 objects now, vs 272 KB in the
-docs), and the startup device-rescan DOES stop after 120 s — verified by
-counting rescans in a clean 60 s window (zero). The 1.24% reading from
-2026-08-04 is the outlier, not today's 2.8%.
-
-**The fix is measured and not built**: `pw-dump --monitor`, one long-lived
-process streaming changes instead of a spawn twice a second.
-
-```
-pw-dump --monitor, idle   0.031% of one core
-spawning pw-dump at 2 Hz  1.74%              <- 56x
-```
-
-That puts layer 1 near **1.0%**, below the figure Costin already called "very
-generous". Not trivial: `capture_graph()` returns a full snapshot and every
-caller assumes that shape, while `--monitor` emits increments, so the daemon
-must maintain the graph itself. Decide between this and
-`d-event-driven-substrate` (pipewire-rs) before writing code — see
-`ROADMAP > cpu-regression`.
-
-### 3. The probe-close problem, if camera sessions are ever wanted back
+### 2. The probe-close problem, if camera sessions are ever wanted back
 
 Needs a way to tell "the open count reached zero" from "the application released
 the device". Options in `ROADMAP > camera-session-ends-on-the-probe-close`, none
 chosen. A release grace period is the likely answer, and **the value is a guess
-until the probe-to-capture gap is measured across more than one application.**
+until the probe-to-capture gap is measured across more than one application** —
+so this is an instrumentation task before it is a coding task. Nothing is broken
+while it waits: the permission is withdrawn.
 
 Do NOT reach for `awaiting_open_secs` — it bounds a session that was never
 opened, and using it here would mask the defect exactly as a 60 s fallback hid a
-broken release path for an hour today.
+broken release path for an hour.
+
+### 3. Phase 5 — the ALSA backstop
+
+The largest remaining hole: g6 means any process can still take the microphone
+via ALSA directly, which undercuts the project's own description. Also the
+largest blast radius in the project — **you cannot deny major 116**, because
+that denies `/usr/bin/pipewire`, which is everyone's microphone. Needs an
+observe-only pass first to find what actually opens capture devices on this
+machine. Book it as its own session.
 
 ### 4. Still open from before
 
 - **g2**: Block All does not stop anything already recording.
 - **g3**: the event log is a 500-entry in-memory ring buffer. (The `history`
   table does survive restarts.)
-- **Phase 5**, the ALSA backstop: not started. You cannot simply deny major 116
-  — that denies `/usr/bin/pipewire`, which is everyone's microphone.
-- **The TUI has no tests.** `tools/gui-test` is GTK-only.
+- **The TUI has no tests.** `tools/tui-screen` can now RENDER it, which is new,
+  but nothing asserts on what it renders.
 
 ---
 
@@ -187,18 +223,31 @@ broken release path for an hour today.
   "no prompt appeared". Both b6 skip sites now log at `info!` for this reason.
 - **The daemon rewrites `config.toml` from memory on shutdown.** Editing the
   file while it holds state does nothing. Use the CLI.
+- **A pty from `pty.fork()` is 0x0, and ratatui draws NOTHING into it.** It
+  emits the alternate-screen and cursor-hide sequences and then paints empty
+  frames forever, which reads exactly like a hung TUI. `TIOCSWINSZ` on the
+  master fd first. And ratatui **redraws in place**, so concatenating raw
+  output gives every frame smeared together, not a screen — `tools/tui-screen`
+  replays the escape sequences onto a grid for this reason.
+- **`pw-dump --monitor` exits 0 when PipeWire restarts.** Any supervisor over
+  it must treat a clean exit as an anomaly.
+- **A test that names an invariant but reads a fixed row is not testing it.**
+  gui-test's unset-category check read row 0 and passed only because row 0
+  happened to have a gap; it failed against a correct UI the moment the rule
+  order changed.
 
 ---
 
 ## Deliberately NOT done
 
 - **The probe-close fix.** Options recorded, no number measured, nothing built.
-- **`pw-dump --monitor`.** Measured, not implemented.
+- **README's unread sections.** Architecture, D-Bus API, phase history.
 - **Camera sessions.** Withdrawn, and `lsm/file_release` deliberately left
   attached — it is the working half, and detaching it would mean re-earning a
   verifier acceptance already paid for.
-- **`make gui-test` was not run today.** The GUI was rebuilt and reinstalled,
-  but its AT-SPI checks have not been re-run against the new rules surface.
-- **The TUI and GUI were not re-verified** after the rule-shape changes.
-  `hwprivacy-ctl` was exercised heavily; the other two were not.
+- **A gui-test flake was observed, not chased**: "clicking a denial opens the
+  grant dialog" failed on one run and passed on a slower re-run. Back-to-back
+  invocations race the dialog.
+- **Nothing asserts on the TUI's rendering.** `tools/tui-screen` prints it; no
+  test compares it to anything.
 - **No `.deb` has ever been built**, and `make install` has never been run.
