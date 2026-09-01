@@ -60,20 +60,33 @@ threat_model:
     - "Careless PipeWire-routed microphone access, which is how most desktop apps take the mic."
     - "Not knowing. The event log and notifications make PipeWire-path access visible."
   does_not_defend_against:
-    - "Direct V4L2 camera access — i.e. how Firefox and Chrome actually use the camera. Coverage here is effectively nil."
-    - "Direct ALSA microphone capture. Trivially available to any process."
-    - "A process running as your user: it can `systemctl --user stop hwprivacy`."
-    - "An app that re-creates the link faster than enforcement notices."
-    - "Name spoofing: identity is the PipeWire `application.name` property, which the app declares about itself."
+    - "A process running as your user: it can `systemctl --user stop hwprivacy`, and root can stop the kernel helper. The BPF program is never pinned, so stopping the helper restores normal access."
+    - "Direct ALSA microphone capture. Trivially available to any process — the kernel layer covers the camera only. Phase 5 would close it and has not started."
+    - "An app that re-creates a PipeWire link faster than enforcement notices (~500 ms window)."
+    - "Name spoofing at layer 1: `application.name` is what the app declares about itself. Layer 2 is not spoofable — it matches the executable's inode — but it only covers the camera."
+    - "An already-open fd. The LSM hook is on open(), not read: a camera opened before a deny took effect keeps working."
+    - "Which WEBSITE asked. The executable is the principal, so allowing firefox allows every site that has a grant inside it."
+  fixed_2026_08:
+    - >
+      Direct V4L2 camera access — how Firefox and Chrome actually take the
+      camera — WAS the headline gap and is now enforced by the kernel layer,
+      by executable inode. Measured: ffmpeg and a real browser both denied with
+      EPERM, and allowed again on a grant. This entry is kept rather than
+      deleted because every document in this repo asserted the opposite for a
+      month, and 'the camera is not covered' is the single most likely thing a
+      cold reader still believes.
   honest_framing: >
-    'Guards the PipeWire path, well.' NOT 'a hardware permission manager'.
-    Any wording stronger than this — including the current README — overstates
-    what the code does.
-  what_would_fix_it: >
-    Only a layer below PipeWire: eBPF LSM on security_file_open, AppArmor
-    profiles, or device-node ACLs. This machine already has BPF LSM active
-    (`bpf` present in /sys/kernel/security/lsm, CONFIG_BPF_LSM=y,
-    CONFIG_DEBUG_INFO_BTF=y, kernel 6.12) with no boot-parameter change needed.
+    'Guards the PipeWire path well, and the camera device node below it.' NOT
+    'a hardware permission manager'. The microphone is still PipeWire-path
+    only: /dev/snd is opened by /usr/bin/pipewire on everyone's behalf, so the
+    kernel can see THAT the mic was opened but not by whom.
+  what_fixed_it: >
+    The eBPF LSM layer, built 2026-08-04 onward and running as a boot-time
+    service since 2026-08-20. Attaches to lsm/file_open (enforcement) and
+    lsm/file_release (release detection); both verifier-accepted on Debian 13,
+    kernel 6.12. Measured cost: +13.75 ns per open(), 0% at idle.
+    This section said 'what WOULD fix it', in the conditional, until
+    2026-09-01 — five weeks after the layer shipped.
 
 motivation_context:
   reopened: "2026-08-04"

@@ -1066,9 +1066,50 @@ next_up:
     mode: decide
 
   - id: cpu-regression
-    what: "Diagnose layer 1's idle cost: 1.24% of a core (2026-08-04) -> 2.93% (2026-08-21), same method."
-    why: "Costin rejected 1.2% as 'very generous'. Measure before deciding whether layer 1 ships enabled by default."
-    mode: execute
+    status: "DIAGNOSED 2026-09-01. Not a regression in hwprivacy's code."
+    what: "Layer 1's idle cost: 1.24% of a core (2026-08-04) -> 2.70-2.82% (2026-09-01)."
+    measured_2026_09_01:
+      layer1_steady_state: "2.70-2.82% of one core (three readings, 13h average 2.75%)"
+      pw_dump_alone_at_2hz: "1.74% of one core — 40 spawns in 20 s, no daemon involved"
+      daemons_own_work: "~1.0% — parse, diff, policy"
+      layer2_kernel_helper: "0.041-0.045%"
+    the_finding: >
+      62% of layer 1's idle cost is fork/exec of an external binary twice a
+      second, before a line of hwprivacy's code runs. capture_graph() spawns
+      pw-dump every tick: process spawn, PipeWire connect/enumerate/disconnect,
+      210 KB of JSON serialised by pw-dump and re-parsed by serde.
+    ruled_out: >
+      The graph did NOT grow. Docs record 272 KB; it is 210 KB / 87 objects now,
+      ~9 ms per dump. Fewer rules today (1 -> 4) than in August. The startup
+      device-rescan window is also NOT leaking: it does stop after 120 s,
+      verified by counting rescans in a clean 60 s window (zero). An earlier
+      count of 55 in 10 minutes was an artifact of repeated daemon restarts
+      during testing.
+    honest_conclusion: >
+      The 1.24% reading is the outlier, not the 2.8%. Both used cgroup CPU over
+      uptime, but the 2026-08-04 daemon ran on a machine in a state that cannot
+      be reconstructed. What IS established: the current cost is structural, and
+      most of it is not hwprivacy's code.
+    the_fix_and_its_measurement:
+      what: "`pw-dump --monitor` — one long-lived process streaming changes, instead of a spawn twice a second."
+      measured: "0.031% of one core at idle, vs 1.74% for spawning at 2 Hz. A 56x reduction, measured 2026-09-01 the same way (systemd scope, cgroup cpu.stat)."
+      projected: "layer 1 falls from ~2.7% to ~1.0% — below the 1.24% Costin already called 'very generous'."
+      why_it_is_not_trivial: >
+        It replaces the monitoring substrate: capture_graph() returns a full
+        snapshot today and every caller assumes that shape. --monitor emits
+        incremental changes, so the daemon must maintain the graph itself. That
+        is most of the work d-event-driven-substrate describes, without the
+        pipewire-rs dependency or the MSRV question.
+      relationship_to_event_driven_substrate: >
+        A cheaper path to the same place. pipewire-rs would also remove the ~500
+        ms race window and g1 (grandfathered links); --monitor removes the CPU
+        cost and the spawn, and MAY narrow the race, but that has not been
+        measured. Decide between them before writing code.
+    do_not: >
+      Do not raise poll_interval_ms. It buys CPU by widening the race window,
+      and most of the cost is per-spawn overhead rather than per-poll work, so
+      halving the rate does not halve the cost.
+    mode: decide
 
   - id: doc-check-host-tier
     what: "`make doc-check --host` — query systemd, cgroup CPU, and re-stat recorded inodes."

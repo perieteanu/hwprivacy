@@ -9,10 +9,12 @@ the kernel**. Neither is sufficient alone — see [How It Works](#how-it-works).
 
 Built for Debian 13 (Trixie) with PipeWire/WirePlumber. Works on KDE Plasma and GNOME.
 
-> **Default policy is currently `ask`, not deny-all.** The shipped config sets
-> `default_action = "ask"`. Deny-by-default is the stated intent but has not
-> been settled — see `docs-yaml/DECISIONS.yaml > d-posture-unsettled`. Earlier
-> versions of this README claimed deny-all; that was never what the code did.
+> **The default policy is `deny`.** An application with no rule is denied and
+> gets a notification saying so. `ask` still exists and is opt-in per rule.
+> Settled 2026-08-21 — see `docs-yaml/DECISIONS.yaml > d-deny-by-default`.
+> A config written before that date may set `default_action = "ask"`
+> explicitly, and is left alone; the default only applies when the key is
+> absent.
 
 ---
 
@@ -116,9 +118,12 @@ The **playback-monitor feature has no kernel equivalent** — there is no
 straightforward way to tap a sink monitor below PipeWire. That is why layer 1
 is not merely legacy.
 
-> **The kernel layer is not running by default.** It has no systemd unit yet,
-> and the BPF program is never pinned — killing the helper detaches it and
-> restores normal access. It currently runs only when started by hand as root.
+> **The kernel layer runs at boot.** `hwprivacy-lsm.service` is installed and
+> enabled, starts before the user daemon, and enforces from
+> `/var/lib/hwprivacy/policy`. The BPF program is **never pinned**, so stopping
+> the service detaches it and restores normal access — that is deliberate, and
+> it is also the honest limit of the protection: anything that can stop a root
+> service can turn the camera back on.
 
 ---
 
@@ -173,25 +178,47 @@ is not merely legacy.
 
 | Permission | Behavior | Best for |
 |------------|----------|----------|
-| `allow` | All streams from this app auto-allowed | Trusted apps (OBS, dedicated voice app) |
-| `ask_each` | Every new stream triggers a prompt | Browsers (per-tab gating) |
-| `while_in_use` | Allowed while app's PipeWire client is active | Messaging apps (Telegram, Signal) |
-| `ask` | Prompt once, save permanent rule | Unknown apps (default) |
-| `deny` | Always blocked, instant notification shown | Untrusted apps |
+| `allow` | All access from this app auto-allowed | Trusted apps (OBS, dedicated voice app) |
+| `while_in_use` | A **session**: allowed from your answer until the device is released | Messaging apps (Telegram, Signal) |
+| `ask` | Prompt once, save a permanent rule | Unknown apps |
+| `deny` | Always blocked, notification shown | Untrusted apps |
 
-### Per-Stream Gating (The Browser Solution)
+`while_in_use` is **microphone and playback monitor only**. The camera takes
+`allow` or `deny` — see [The camera has no sessions](#the-camera-has-no-sessions).
 
-Browsers are mini operating systems — one "Firefox" PipeWire client serves dozens
-of tabs. At the PipeWire level, all tabs share one client name. However, each tab
-that requests mic/camera access creates a **separate PipeWire node** with unique
-properties (`object.serial`, `node.name`, `media.name`).
+`ask_each` was removed in 2026-08. The string still parses, as `ask`, so an
+older config keeps loading.
 
-HWPrivacy gates this in two *stages* (note: unrelated to the two enforcement
-**layers** above — this is entirely inside the PipeWire layer):
+### The camera has no sessions
 
-- **App rule**: "Firefox may use the mic" — baseline permission
-- **Per-stream gating**: With `ask_each`, every NEW capture node from
-  Firefox triggers a notification. Shady JavaScript in a background tab gets caught.
+`camera = while_in_use` was built, worked end to end against a live kernel, and
+was withdrawn the same day. A camera session ended **111 ms after it started**,
+while the call was still running:
+
+```
+20:02:33.712  ALLOWED (first open)
+20:02:33.823  session ended: released the camera (kernel)     [111 ms]
+20:02:35.914  12 further allowed open(s)   <- the actual capture
+20:02:38.317  executable removed from the allowlist, MID-CALL
+```
+
+Firefox *probes* the camera before capturing — open, close, then open the
+handles it records with. The probe close takes the open count to zero, so the
+release fires before capture begins. An open count is a **transient**: zero
+means "no handle held right now", not "finished with the camera".
+
+The microphone and monitor are unaffected, because PipeWire gives them a link
+whose lifetime genuinely is the use. Details: `d-camera-is-allow-or-deny`.
+
+### Browsers: one client, many tabs
+
+Browsers are mini operating systems — one "Firefox" PipeWire client serves
+dozens of tabs, and at the PipeWire level they share one client name.
+
+**hwprivacy does not gate per tab.** Per-stream grants were removed in 2026-08
+(`d-no-per-stream-grants`): the deny path destroys a link that the allow path
+cannot recreate, so a grant could never actually be used. The executable is the
+principal — allowing `firefox` allows every site Firefox has a grant for.
 
 ### Notification Behavior
 
@@ -201,8 +228,11 @@ HWPrivacy gates this in two *stages* (note: unrelated to the two enforcement
    Tells the user immediately that an access attempt was caught and blocked.
 
 2. **Stage 2 — Action prompt** (persistent, waits for user response):
-   Presents buttons to set a rule. For `ask`: [Always Allow] [Ask Each Time]
-   [While in Use] [Always Deny]. For `ask_each`: [Allow Stream] [Deny Stream].
+   Presents buttons to set a rule: [Always Allow] [While in Use] [Always Deny].
+   A **camera** prompt from the kernel layer offers [Always Allow] [Always Deny]
+   only, and says that the answer applies to your NEXT attempt — the open() that
+   raised it was already refused, because the LSM hook must answer in
+   nanoseconds.
 
 **Dismiss behavior — DEFECT, this section describes the intent, not the code:**
 
@@ -267,7 +297,7 @@ Command-line interface for all operations.
 hwprivacy-ctl status                          # daemon status summary
 hwprivacy-ctl devices                         # list discovered devices
 hwprivacy-ctl rules list                      # show all rules
-hwprivacy-ctl rules set firefox mic ask_each  # set a rule
+hwprivacy-ctl rules set firefox mic while_in_use   # set a rule
 hwprivacy-ctl rules remove firefox            # remove all rules for app
 hwprivacy-ctl streams                         # show active streams
 hwprivacy-ctl streams --app firefox           # filter by app
@@ -286,7 +316,7 @@ htop-like terminal interface built with ratatui. Four panels:
 - **Events**: real-time log of access attempts and decisions
 
 Keyboard: `Tab` switch panels, `↑↓` navigate, `a` allow, `d` deny,
-`e` ask_each, `w` while_in_use, `x` delete rule, `r` refresh, `q` quit.
+`w` while_in_use, `x` delete rule, `r` refresh, `q` quit.
 
 ### hwprivacy-gui
 
@@ -411,10 +441,11 @@ hwprivacy-ctl status
 
 ```bash
 # Browsers: ask for every new stream (per-tab security)
-hwprivacy-ctl rules set firefox mic ask_each
-hwprivacy-ctl rules set firefox cam ask_each
-hwprivacy-ctl rules set "Firefox Developer Edition" mic ask_each
-hwprivacy-ctl rules set chromium mic ask_each
+hwprivacy-ctl rules set firefox mic while_in_use
+# The camera needs the BINARY, because the kernel matches by inode:
+hwprivacy-ctl rules allow-camera /usr/lib/firefox-esr/firefox-esr --as firefox
+# Find the path for anything the kernel has denied:
+hwprivacy-ctl rules denied-cameras
 
 # Messaging: allow while app is running
 hwprivacy-ctl rules set telegram-desktop mic while_in_use
@@ -458,34 +489,54 @@ Config file: `~/.config/hwprivacy/config.toml`
 
 ```toml
 [policy]
-default_action = "ask"       # what to do for unknown apps: "ask" or "deny"
-poll_interval_ms = 500       # how often to check PipeWire graph
+default_action = "deny"          # unknown apps: "deny" (default) or "ask"
+poll_interval_ms = 500           # how often to read the PipeWire graph
+dismiss_cooldown_secs = 60       # after a dismissed prompt, before asking again
+while_in_use_settle_secs = 10    # a released device stays granted this long,
+                                 # covering the gap while an app reconnects
+exe_recheck_secs = 30            # re-resolve allowlisted binaries (catches a
+                                 # package upgrade changing an inode)
+notify_on_allow = true           # announce ALLOWED access, not only denials
 
 [devices]
-microphone = true            # guard microphones
-camera = true                # guard cameras
-monitor = true               # guard playback monitor (eavesdrop protection)
+microphone = true                # guard microphones
+camera = true                    # guard cameras
+monitor = true                   # guard playback monitor (eavesdrop protection)
 
+# The audio/video servers. Without these the camera has no PipeWire node at
+# all — import them with: hwprivacy-ctl preset import desktop-baseline --apply
+[[rules]]
+app_name = "pipewire"
+camera = "allow"
+exe_path = "/usr/bin/pipewire"
+
+[[rules]]
+app_name = "wireplumber"
+camera = "allow"
+exe_path = "/usr/bin/wireplumber"
+
+# exe_path is what the KERNEL layer matches, by inode. Without it a camera
+# rule does nothing for an app that uses V4L2 directly — which is how Firefox
+# and Chrome take the camera.
 [[rules]]
 app_name = "firefox"
-microphone = "ask_each"
-camera = "ask_each"
-monitor = "deny"
-
-[[rules]]
-app_name = "telegram-desktop"
 microphone = "while_in_use"
-camera = "while_in_use"
-monitor = "deny"
+camera = "allow"
+exe_path = "/usr/lib/firefox-esr/firefox-esr"
 
 [[rules]]
 app_name = "obs"
 microphone = "allow"
-camera = "allow"
 monitor = "allow"
 ```
 
-Rules are automatically saved when set via CLI, TUI, GUI, or notification actions.
+A category the rule says nothing about is **unset**, not denied: it falls
+through to `default_action` and prints as `—`. Setting one category writes one
+category.
+
+Rules are saved automatically when set via CLI, TUI, GUI, or a notification
+action. **The daemon rewrites the whole file on any rule change**, so comments
+and hand-formatting are lost — stop the daemon before editing by hand.
 
 ---
 
@@ -548,9 +599,12 @@ Rules are automatically saved when set via CLI, TUI, GUI, or notification action
 
 ### Short-term improvements
 
-- [ ] **While-in-use lifecycle tracking**: currently `while_in_use` allows the
-      stream but doesn't actively revoke when the PipeWire client disconnects.
-      Needs monitoring of client disconnect events to revoke permissions.
+- [x] **While-in-use lifecycle tracking** — done 2026-08-23. `while_in_use` is
+      a SESSION: no session means ask, answering opens it, and the session ends
+      when the device is released. Keyed on (app, device). **Microphone and
+      playback monitor only** — the camera takes `allow` or `deny`, because a
+      camera session ended itself 111 ms in on a browser's probe close
+      (`d-camera-is-allow-or-deny`).
 - [ ] **GUI rule editing**: the GUI displays rules but doesn't yet have inline
       editing (dropdowns to change permissions). Currently rules must be changed
       via CLI or TUI.
@@ -602,14 +656,18 @@ Rules are automatically saved when set via CLI, TUI, GUI, or notification action
    hundred milliseconds of audio might be captured before being cut. This is
    acceptable for v1. The v2 WirePlumber hook approach eliminates this entirely.
 
-2. **PipeWire node names as identity**: Apps are identified by their PipeWire
-   `application.name` property. A malicious app could spoof this name. Process
-   path identity (v2 feature) would mitigate this.
+2. **Two identities, and only one is spoof-proof.** At the PipeWire layer an
+   app is its self-declared `application.name`, which any app can lie about. At
+   the kernel layer it is the executable's inode, which it cannot. A rule
+   carries both: `app_name` for layer 1, `exe_path` for layer 2. A camera rule
+   with no `exe_path` grants nothing to a V4L2 application, whatever name you
+   typed.
 
-3. **No browser tab URL visibility**: PipeWire cannot see which website triggered
-   a mic/camera request inside a browser. The `ask_each` mode mitigates this by
-   prompting for every new stream, but the user cannot see "site xyz.com wants mic"
-   — only "Firefox wants mic (new stream)".
+3. **The executable is the principal.** Allowing `firefox` allows every website
+   that has ever obtained a grant inside Firefox. hwprivacy cannot see which
+   site asked, and does not gate per tab — per-stream grants were removed in
+   2026-08 because the deny path destroys a link the allow path cannot recreate
+   (`d-no-per-stream-grants`).
 
 4. **Debian Rust 1.85 constraints**: Several crate versions are pinned to older
    releases for MSRV compatibility. This will resolve as Debian ships newer Rust.

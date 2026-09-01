@@ -681,8 +681,13 @@ async fn prompt_kernel_camera_denial(
     {
         let mut s = state.write().await;
         if !s.tracker.try_begin_prompt(app, DeviceCategory::Camera) {
-            debug!(
-                "Camera prompt for {} already pending; blocking silently",
+            // info!, not debug! — see the matching site in main.rs. A
+            // denial whose reason is invisible reads as a broken feature,
+            // and the camera retries every ~18 s, so this is the line that
+            // explains three DENIED rows in a row.
+            info!(
+                "Blocked {} → camera; a prompt for it is already waiting for an \
+                 answer (check your notifications)",
                 app
             );
             return;

@@ -5,11 +5,11 @@ Android-style hardware permission manager for the Linux desktop. Gates native
 **playback monitor** across **two enforcement layers**: the PipeWire graph, and
 an eBPF LSM in the kernel.
 
-Rust workspace, **7 crates, 13651 LOC** (BPF C included; generated `vmlinux.h`
+Rust workspace, **7 crates, 14042 LOC** (BPF C included; generated `vmlinux.h`
 excluded). Debian 13 / PipeWire / KDE + GNOME.
 Registered in project-tracker as `hwprivacy`, short name `hw`.
 
-Verified against the filesystem and the live daemon on **2026-08-21**.
+Verified against the filesystem and the live daemon on **2026-09-01**.
 Run `make doc-check` before trusting any number in this file.
 
 ---
@@ -138,11 +138,17 @@ journalctl --user -u hwprivacy -f      # the defects are visible here, not just 
 - Config: `~/.config/hwprivacy/config.toml`. The daemon **rewrites the whole
   file** on any rule change — comments and hand-formatting are destroyed.
   Stop the daemon before hand-editing.
-- Measured idle cost of layer 1: `pw-dump` (272 KB JSON) twice a second.
-  **1.24% of a core on 2026-08-04; 2.93% on 2026-08-21** (same method —
-  cgroup CPU ÷ uptime; 3.03% over the full 16h session of 08-20). Costin
-  rejected 1.2% as "very generous"; the regression is undiagnosed.
-  The kernel helper over the same window: **0.04%**.
+- Measured idle cost of layer 1: **2.70–2.82% of a core** (2026-09-01).
+  **DIAGNOSED — not a regression in this code.** 62% of it is `pw-dump` spawn
+  cost: **1.74%** for 40 spawns in 20 s, measured with no daemon involved. The
+  graph did NOT grow (210 KB / 87 objects now, vs 272 KB in older docs), and
+  the startup device-rescan does stop after 120 s. The 1.24% reading from
+  2026-08-04 is the outlier, not today's figure.
+  **The fix is measured and unbuilt**: `pw-dump --monitor` costs **0.031%**
+  idle — a 56x reduction, putting layer 1 near 1.0%. See
+  `ROADMAP > cpu-regression`. Do NOT raise `poll_interval_ms`: most of the cost
+  is per-spawn, so halving the rate does not halve it, and it widens the race.
+  The kernel helper: **0.04%**.
 - Measured cost of layer 2: **+13.75 ns per `open()`**, 95% CI `[+7.3, +20.2]`
   — 1.88% of a 733 ns `open()`, and **0% at idle**.
 

@@ -620,8 +620,16 @@ async fn monitoring_loop(state: SharedState, poll_interval_ms: u64) {
                     if already_asking {
                         let mut s = state.write().await;
                         s.log_denied(&app, pid, cat, &node);
-                        debug!(
-                            "Blocked {} → {:?}; a prompt for it is already waiting for an answer",
+                        // info!, not debug!. The service runs RUST_LOG=info, so
+                        // at debug this line does not exist in the journal —
+                        // and a silent re-denial is indistinguishable from a
+                        // broken feature. Cost an hour on 2026-09-01: three
+                        // camera denials in a row read as "the prompt never
+                        // appeared" when a prompt was in fact waiting in the
+                        // Plasma notification tray the whole time.
+                        info!(
+                            "Blocked {} → {:?}; a prompt for it is already waiting for \
+                             an answer (check your notifications)",
                             app, cat
                         );
                         continue;
