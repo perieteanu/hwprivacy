@@ -28,18 +28,24 @@ systemctl stop hwprivacy-lsm 2>/dev/null; sleep 1
 
 echo
 echo "[A] What userspace resolved, and what the KERNEL holds:"
-"$BIN" --enforce-audio --policy-file "$POL" --dump-policy 2>&1 | grep -E "perms|policy as|empty|minors" | head -12
+# --duration is REQUIRED: --dump-policy prints and then falls through to
+    # attach + the event loop, so without a bound this call never returns. That
+    # hung the first probe attempt.
+    timeout 20 "$BIN" --enforce-audio --policy-file "$POL" --dump-policy --duration 5 2>&1 \
+      | grep -E "perms=|policy as|empty|capture minors" | head -14
 
 echo
 echo "[B] Live run: is ffmpeg denied, and what does the helper record?"
-"$BIN" --enforce-audio --policy-file "$POL" --duration 12 --json > "$LOG" 2>&1 &
+timeout 20 "$BIN" --enforce-audio --policy-file "$POL" --duration 12 --json > "$LOG" 2>&1 &
 H=$!
 sleep 3
 echo -n "    ffmpeg exit: "
-sudo -u perieteanu ffmpeg -hide_banner -loglevel error -f alsa -i hw:0,0 -t 2 -f null - >/tmp/hwp-ff.txt 2>&1
+timeout 15 sudo -u perieteanu ffmpeg -hide_banner -loglevel error -f alsa -i hw:0,0 -t 2 -f null - >/tmp/hwp-ff.txt 2>&1
 echo "$?"
 echo "    ffmpeg said:"; tail -2 /tmp/hwp-ff.txt | sed 's/^/      /'
-wait $H 2>/dev/null
+# Bounded: `timeout` above guarantees the child dies, but never wait
+# unbounded on something whose whole job is to run until told to stop.
+wait $H 2>/dev/null || true
 
 echo
 echo "[C] Helper's own records (stderr banner + AUDIO events):"
