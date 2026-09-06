@@ -19,3 +19,6 @@ hwprivacy-lsm/src/bpf/vmlinux.h
 __pycache__/
 *.pyc
 target/openprobe
+
+# Stray ImageMagick dump, committed by accident 2026-09-01 (187 MB).
+sys
