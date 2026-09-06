@@ -28,6 +28,38 @@ UNIT=/usr/lib/systemd/system/hwprivacy-lsm.service
 PROBE=$REPO/target/openprobe
 CAP=/dev/snd/pcmC0D0c
 
+# Keep a copy of whatever is working now, and put it back on ANY failure.
+#
+# The camera is enforced by this service. A half-applied upgrade that leaves it
+# crash-looping means the eBPF program is detached and the camera is
+# UNPROTECTED — which is exactly what happened on the first attempt. Failing
+# safe here means failing back to the state that was already working.
+UNIT_BAK=$(mktemp); BIN_BAK=$(mktemp)
+cp "$UNIT" "$UNIT_BAK" 2>/dev/null || true
+cp /usr/bin/hwprivacy-lsm "$BIN_BAK" 2>/dev/null || true
+OK=0
+rollback() {
+  if [[ $OK -eq 1 ]]; then
+    rm -f "$UNIT_BAK" "$BIN_BAK"
+    return 0
+  fi
+  echo
+  echo "    !! aborting — restoring the previous helper and unit"
+  systemctl stop hwprivacy-lsm 2>/dev/null || true
+  [[ -s $BIN_BAK ]] && install -m 0755 "$BIN_BAK" /usr/bin/hwprivacy-lsm
+  [[ -s $UNIT_BAK ]] && cp "$UNIT_BAK" "$UNIT"
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl start hwprivacy-lsm 2>/dev/null || true
+  sleep 2
+  if systemctl is-active hwprivacy-lsm >/dev/null 2>&1; then
+    echo "    restored: hwprivacy-lsm is active again (camera protected)"
+  else
+    echo "    *** COULD NOT RESTORE. Run: sudo systemctl restart hwprivacy-lsm"
+  fi
+  rm -f "$UNIT_BAK" "$BIN_BAK"
+}
+trap rollback EXIT INT TERM
+
 gcc -o "$PROBE" "$REPO/tools/acceptance/openprobe.c" 2>/dev/null || {
   echo "cannot build the open() probe"; exit 1; }
 ask(){ timeout 10 sudo -u perieteanu "$PROBE" "$CAP" 2>&1; }
@@ -41,8 +73,27 @@ echo "    $(ask)"
 
 echo
 echo "[2] Installing the Phase 5 helper and unit"
-cp "$REPO/target/release/hwprivacy-lsm" /usr/bin/hwprivacy-lsm
+# STOP FIRST, and use `install`, not `cp`.
+#
+# `cp` writes THROUGH to the existing inode, which the kernel refuses while
+# that binary is executing: "Text file busy". On 2026-09-06 that left the old
+# binary in place while the new unit demanded --enforce-audio, and the service
+# crash-looped with the eBPF program detached — i.e. the CAMERA was
+# unprotected. `install` renames a new file over the old one, which is atomic
+# and works on a running executable.
+systemctl stop hwprivacy-lsm 2>/dev/null || true
+sleep 1
+install -m 0755 "$REPO/target/release/hwprivacy-lsm" /usr/bin/hwprivacy-lsm || {
+  echo "    could not install the helper binary"; exit 1; }
 cp "$REPO/debian/hwprivacy-lsm.service" "$UNIT"
+
+# The binary must actually understand the flag the unit is about to pass. Order
+# matters: verify BEFORE daemon-reload, so a mismatch never reaches systemd.
+if ! /usr/bin/hwprivacy-lsm --help 2>&1 | grep -q -- --enforce-audio; then
+  echo "    INSTALLED BINARY DOES NOT SUPPORT --enforce-audio — aborting"
+  echo "    (the unit was NOT reloaded; restart the service to recover)"
+  exit 1
+fi
 echo "    binary: $(date -r /usr/bin/hwprivacy-lsm '+%Y-%m-%d %H:%M')"
 grep -q -- --enforce-audio "$UNIT" && echo "    unit carries --enforce-audio" \
                                    || { echo "    UNIT MISSING THE FLAG"; exit 1; }
@@ -75,4 +126,5 @@ $PA hwprivacy-ctl status 2>&1 | sed -n '/Kernel layer/,$p' | sed 's/^/      /'
 echo "    --- helper journal ---"
 journalctl -u hwprivacy-lsm --since "1 min ago" --no-pager 2>/dev/null \
   | grep -iE "backstop|capture minors|denied" | tail -4 | sed 's/^/      /'
+OK=1
 echo "════ TO HERE ════"
