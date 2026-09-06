@@ -1,0 +1,83 @@
+# Audio backstop — who may open an ALSA capture device directly.
+#
+# WHY THIS EXISTS
+#
+# With the kernel audio backstop enforcing, an executable that is not in this
+# list gets EPERM when it opens /dev/snd/pcmC*D*c. That closes the bypass where
+# any process could record the microphone by talking to ALSA and never touching
+# PipeWire — measured 2026-08-04, `ffmpeg -f alsa -i hw:0,0` captured three
+# seconds of real audio with nothing logged.
+#
+# WHAT THIS IS NOT
+#
+# It is NOT per-application microphone policy, and it cannot be. /dev/snd is
+# opened by /usr/bin/pipewire on behalf of every application, so the kernel sees
+# the audio server, not the app behind it. Per-app microphone identity exists
+# only in layer 1, where it works. This list answers a narrower question: which
+# binaries may take the microphone WITHOUT going through PipeWire.
+#
+# WHY IMPORTING THIS IS NOT OPTIONAL IF YOU ENFORCE
+#
+# Denying the audio server the microphone denies EVERY application's microphone.
+# The first three entries are the audio stack and must be present.
+#
+# WHAT WAS MEASURED (this machine, 30 days of the helper's own journal)
+#
+#   27064  /usr/bin/wireplumber
+#   10549  /usr/bin/pipewire
+#    7032  /usr/lib/virtualbox/VirtualBoxVM   <- a real direct-ALSA application
+#     692  /usr/sbin/alsactl                  <- restores mixer state at boot
+#       9  /usr/bin/amixer
+#
+# VirtualBox is here because it genuinely opens capture devices directly. Left
+# out, a VM loses its microphone and the failure surfaces mid-call. If you do
+# not run VirtualBox, remove that entry — every line here is a grant.
+
+name = "audio-backstop"
+description = "Binaries allowed to open an ALSA capture device directly — the audio stack, plus measured direct-ALSA applications"
+
+[[app]]
+name = "pipewire"
+microphone = "allow"
+exe_candidates = [
+  "/usr/bin/pipewire",
+  "/usr/local/bin/pipewire",
+]
+
+[[app]]
+name = "wireplumber"
+microphone = "allow"
+exe_candidates = [
+  "/usr/bin/wireplumber",
+  "/usr/local/bin/wireplumber",
+]
+
+[[app]]
+name = "pipewire-pulse"
+microphone = "allow"
+exe_candidates = [
+  "/usr/bin/pipewire-pulse",
+  "/usr/local/bin/pipewire-pulse",
+]
+
+[[app]]
+name = "alsactl"
+microphone = "allow"
+exe_candidates = [
+  "/usr/sbin/alsactl",
+  "/sbin/alsactl",
+]
+
+[[app]]
+name = "amixer"
+microphone = "allow"
+exe_candidates = [
+  "/usr/bin/amixer",
+]
+
+[[app]]
+name = "virtualbox"
+microphone = "allow"
+exe_candidates = [
+  "/usr/lib/virtualbox/VirtualBoxVM",
+]

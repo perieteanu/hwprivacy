@@ -712,6 +712,39 @@ impl Config {
         )
     }
 
+    /// Executables allowed to open an ALSA CAPTURE node at the kernel layer.
+    ///
+    /// # This is a backstop, not per-application microphone policy
+    ///
+    /// `/dev/snd/pcmC0D0c` is opened by `/usr/bin/pipewire` on behalf of every
+    /// application, so the kernel sees the audio server and cannot tell which
+    /// app is behind it. What this list expresses is "these binaries may take
+    /// the microphone directly" — in practice the audio stack, plus anything
+    /// that genuinely bypasses PipeWire. Per-application mic identity lives in
+    /// layer 1 and is unaffected.
+    ///
+    /// # Why `while_in_use` is deliberately NOT accepted here
+    ///
+    /// Unlike the camera, the microphone accepts `while_in_use` at layer 1 and
+    /// that keeps working — a PipeWire link's lifetime genuinely is the use.
+    /// But a kernel audio session would have to end on an open COUNT reaching
+    /// zero, and that is a transient, not a release: it is exactly the defect
+    /// that killed camera sessions 111 ms in (`d-camera-is-allow-or-deny`).
+    /// Only `Allow` reaches the kernel. A `while_in_use` microphone rule
+    /// therefore gates at layer 1 and is NOT in the kernel allowlist, which
+    /// means such an app cannot bypass PipeWire — the correct outcome.
+    ///
+    /// Do not "fix" this asymmetry without solving the probe-close problem.
+    pub fn kernel_audio_allowlist(&self) -> Vec<(String, Permission)> {
+        Self::dedup_by_path(
+            self.rules
+                .iter()
+                .filter(|r| r.microphone == Some(Permission::Allow))
+                .filter_map(|r| r.exe_path.clone().map(|p| (p, Permission::Allow)))
+                .collect(),
+        )
+    }
+
     /// Rules that ask for camera access but cannot get it at the kernel layer
     /// because they name no executable, with the reason.
     ///
@@ -743,6 +776,49 @@ impl Config {
     /// app without a camera rule is allowed at layer 1 and denied at layer 2,
     /// because the kernel allowlist is built from `exe_path` and an unruled app
     /// has none. Reported once at startup rather than once per rule.
+    /// The reason the audio backstop must NOT be switched on right now, if any.
+    ///
+    /// # Why this is a hard interlock and not a warning
+    ///
+    /// Every application's microphone goes through the audio server: the kernel
+    /// sees `/usr/bin/pipewire` opening `/dev/snd/pcmC0D0c`, never the app
+    /// behind it. Enforce with the server absent from the allowlist and the
+    /// FIRST thing denied is the server, so every microphone on the machine
+    /// stops working at once — including the audio the user is on a call with.
+    ///
+    /// This is not hypothetical. The shipped `desktop-baseline` preset sets
+    /// `microphone = "deny"` for pipewire and wireplumber (correctly, for
+    /// layer 1: it stops them being a catch-all mic identity), and an import
+    /// never modifies a rule you already have. So the default path into this
+    /// feature is a config where enforcing would break all audio.
+    ///
+    /// Returning `Some` here keeps `enforce_audio` off. Refusing to enforce is
+    /// recoverable and visible; enforcing wrongly is neither.
+    pub fn audio_backstop_blocker(&self) -> Option<String> {
+        if self.kernel_audio_allowlist().is_empty() {
+            return Some(
+                "no executable is allowed to open a capture device — enforcing                  would deny the audio server itself and stop ALL microphone                  access. Import the audio-backstop preset."
+                    .to_string(),
+            );
+        }
+        // The server specifically. A list of only, say, VirtualBox would pass
+        // the emptiness check above and still take out every desktop app.
+        let has_server = self
+            .kernel_audio_allowlist()
+            .iter()
+            .any(|(path, _)| {
+                let name = short_name(path);
+                name == "pipewire" || name == "wireplumber" || name == "pipewire-pulse"
+            });
+        if !has_server {
+            return Some(
+                "the audio server (pipewire/wireplumber) is not in the capture                  allowlist — enforcing would deny every application's microphone,                  because the server is what opens /dev/snd on their behalf"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
     pub fn global_camera_gap(&self) -> Option<&'static str> {
         (self.policy.default_action == Permission::Allow).then_some(
             "default_action = allow: apps with no camera rule are allowed by the \
@@ -1443,6 +1519,110 @@ microphone = "ask_each"
 
     /// The refusal is specific to the camera. Microphone and monitor go through
     /// PipeWire, where a vanishing link IS the release signal.
+    #[test]
+    /// A `while_in_use` MICROPHONE rule keeps working at layer 1, but must not
+    /// put the binary in the kernel allowlist.
+    ///
+    /// A kernel audio session could only end on the open COUNT reaching zero,
+    /// and that is a transient rather than a release — the exact defect that
+    /// ended camera sessions 111 ms in, mid-call, on Firefox's probe close. The
+    /// safe reading of "while in use" at layer 2 is therefore "not granted":
+    /// the app is gated by PipeWire, where the session genuinely works, and it
+    /// cannot bypass PipeWire to reach ALSA directly.
+    #[test]
+    fn a_while_in_use_microphone_never_reaches_the_kernel_allowlist() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![
+            AppRule {
+                app_name: "recorder".into(),
+                microphone: Some(Permission::Allow),
+                camera: None,
+                monitor: None,
+                exe_path: Some("/usr/bin/true".into()),
+            },
+            AppRule {
+                app_name: "chatapp".into(),
+                microphone: Some(Permission::WhileInUse),
+                camera: None,
+                monitor: None,
+                exe_path: Some("/usr/bin/false".into()),
+            },
+        ];
+
+        let allowed: Vec<String> = cfg
+            .kernel_audio_allowlist()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+
+        assert!(
+            allowed.contains(&"/usr/bin/true".to_string()),
+            "an explicit allow must reach the kernel: {allowed:?}"
+        );
+        assert!(
+            !allowed.contains(&"/usr/bin/false".to_string()),
+            "while_in_use must NOT reach the kernel audio allowlist — there is \
+             no way to end such a session correctly: {allowed:?}"
+        );
+    }
+
+    /// A microphone rule with no binary cannot be enforced by the kernel, which
+    /// matches by inode. Same rule as the camera: no exe_path, no grant.
+    /// The interlock, against the config the shipped preset actually produces.
+    ///
+    /// `desktop-baseline` sets `microphone = "deny"` for pipewire and
+    /// wireplumber, and an import never modifies an existing rule — so this IS
+    /// the default state, not a contrived one. Enforcing here would deny the
+    /// audio server and stop every microphone on the machine.
+    #[test]
+    fn the_backstop_refuses_to_enforce_without_the_audio_server() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![AppRule {
+            app_name: "pipewire".into(),
+            microphone: Some(Permission::Deny),
+            camera: Some(Permission::Allow),
+            monitor: Some(Permission::Deny),
+            exe_path: Some("/usr/bin/pipewire".into()),
+        }];
+        let why = cfg
+            .audio_backstop_blocker()
+            .expect("a config with no capture grant must block the backstop");
+        assert!(why.contains("audio server") || why.contains("capture device"), "{why}");
+
+        // A list that grants SOMETHING but not the server is just as fatal.
+        cfg.rules.push(AppRule {
+            app_name: "virtualbox".into(),
+            microphone: Some(Permission::Allow),
+            camera: None,
+            monitor: None,
+            exe_path: Some("/usr/lib/virtualbox/VirtualBoxVM".into()),
+        });
+        assert!(
+            cfg.audio_backstop_blocker().is_some(),
+            "granting a non-server binary must not unlock enforcement"
+        );
+
+        // With the server allowed, the interlock opens.
+        cfg.rules[0].microphone = Some(Permission::Allow);
+        assert!(
+            cfg.audio_backstop_blocker().is_none(),
+            "the server is allowed; enforcement must be permitted"
+        );
+    }
+
+    #[test]
+    fn an_audio_rule_without_an_exe_path_grants_nothing() {
+        let mut cfg = Config::default();
+        cfg.rules = vec![AppRule {
+            app_name: "nameonly".into(),
+            microphone: Some(Permission::Allow),
+            camera: None,
+            monitor: None,
+            exe_path: None,
+        }];
+        assert!(cfg.kernel_audio_allowlist().is_empty());
+    }
+
     #[test]
     fn the_microphone_and_monitor_accept_while_in_use() {
         let mut c = Config::default();

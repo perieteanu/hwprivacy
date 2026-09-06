@@ -22,8 +22,40 @@ use std::path::{Path, PathBuf};
 
 /// Permission bits. Must match the `PERM_*` defines in devices.bpf.c.
 pub const PERM_CAMERA: u32 = 1 << 0;
-#[allow(dead_code)] // reserved: audio is not enforced in Phase 2
 pub const PERM_AUDIO: u32 = 1 << 1;
+
+/// Render permission bits as the cache's leading word. Order is fixed so the
+/// file is stable across writes and a diff means a real change.
+pub fn perms_word(perms: u32) -> String {
+    let mut parts = Vec::new();
+    if perms & PERM_CAMERA != 0 {
+        parts.push("camera");
+    }
+    if perms & PERM_AUDIO != 0 {
+        parts.push("audio");
+    }
+    if parts.is_empty() {
+        // An entry granting nothing is still written, so the path survives a
+        // reboot and the state is visible rather than vanishing.
+        parts.push("none");
+    }
+    parts.join(",")
+}
+
+/// Inverse of [`perms_word`]. `None` means the word was not understood.
+pub fn parse_perms(word: &str) -> Option<u32> {
+    let mut bits = 0;
+    for part in word.split(',') {
+        match part.trim() {
+            "camera" => bits |= PERM_CAMERA,
+            "audio" => bits |= PERM_AUDIO,
+            "none" => {}
+            "" => return None,
+            _ => return None,
+        }
+    }
+    Some(bits)
+}
 
 /// The policy map key, byte-identical to `struct policy_key` in the eBPF
 /// program: `{ u64 exe_ino; u32 exe_dev; u32 _pad; }`.
@@ -84,9 +116,24 @@ pub struct Policy {
 impl Policy {
     /// Parse an allowlist file.
     ///
-    /// Format is deliberately trivial — one executable path per line, `#`
-    /// comments, blank lines ignored. Phase 3 replaces this with the daemon's
-    /// `config.toml`, so investing in a richer format now would be wasted.
+    /// Two line shapes, both supported deliberately:
+    ///
+    /// ```text
+    /// /usr/bin/pipewire                 # legacy: camera only
+    /// camera,audio /usr/bin/pipewire    # explicit permissions
+    /// ```
+    ///
+    /// A bare path still means camera, so a cache written by an older helper
+    /// keeps working across an upgrade. Without the prefix form the audio
+    /// grants would silently degrade to camera-only at the next boot — and
+    /// with the backstop enforcing, that denies the AUDIO SERVER the
+    /// microphone during the window before the user session pushes
+    /// `config.toml`. That is the worst failure available in this phase, so
+    /// the format has to carry perms.
+    ///
+    /// An unknown permission word is an error rather than a silent skip: under
+    /// default-deny, quietly dropping a grant is indistinguishable from a
+    /// typo'd path, and both cost an app its device.
     pub fn parse(text: &str) -> Self {
         let mut p = Policy::default();
         for raw in text.lines() {
@@ -94,18 +141,31 @@ impl Policy {
             if line.is_empty() {
                 continue;
             }
-            let path = PathBuf::from(line);
+
+            let (perms, path_str) = match line.split_once(' ') {
+                Some((head, rest)) if !head.starts_with('/') => {
+                    match parse_perms(head) {
+                        Some(bits) => (bits, rest.trim()),
+                        None => {
+                            p.unresolved.push((
+                                PathBuf::from(rest.trim()),
+                                format!("unknown permissions {head:?}"),
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                _ => (PERM_CAMERA, line),
+            };
+
+            let path = PathBuf::from(path_str);
             if !path.is_absolute() {
                 p.unresolved
                     .push((path, "not an absolute path".to_string()));
                 continue;
             }
             match PolicyKey::from_path(&path) {
-                Ok(key) => p.entries.push(Entry {
-                    path,
-                    key,
-                    perms: PERM_CAMERA,
-                }),
+                Ok(key) => p.entries.push(Entry { path, key, perms }),
                 Err(e) => p.unresolved.push((path, format!("{e:#}"))),
             }
         }
@@ -150,16 +210,20 @@ impl Policy {
 /// binary — a cache of inodes would silently stop matching Firefox after the
 /// next update, which is the hardest possible failure to notice. Paths are
 /// re-resolved at every load.
-pub fn render_cache(paths: &[String]) -> String {
+pub fn render_cache(entries: &[(String, u32)]) -> String {
     let mut s = String::from(
         "# hwprivacy kernel allowlist cache — WRITTEN BY hwprivacy-lsm, DO NOT EDIT.\n\
          # Rewritten in full every time the daemon pushes a policy.\n\
          # Exists so enforcement survives a reboot: without it the helper starts\n\
          # with an empty allowlist and denies the camera to everything until the\n\
          # user session comes up and pushes config.toml.\n\
-         # Enforcement on/off is NOT stored here — that comes from --enforce.\n",
+         # Enforcement on/off is NOT stored here — that comes from --enforce.\n\
+         # Format: '<permissions> <path>'. A bare path means camera, so a cache\n\
+         # written by an older helper still loads.\n",
     );
-    for p in paths {
+    for (p, perms) in entries {
+        s.push_str(&perms_word(*perms));
+        s.push(' ');
         s.push_str(p);
         s.push('\n');
     }
@@ -173,13 +237,13 @@ pub fn render_cache(paths: &[String]) -> String {
 /// `--enforce` denies the camera to everything that was dropped, while looking
 /// exactly like working enforcement. A rename is atomic on the same
 /// filesystem, so a reader sees either the old list or the new one.
-pub fn write_cache(path: &Path, paths: &[String]) -> Result<()> {
+pub fn write_cache(path: &Path, entries: &[(String, u32)]) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("cannot create {}", dir.display()))?;
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, render_cache(paths))
+    std::fs::write(&tmp, render_cache(entries))
         .with_context(|| format!("cannot write {}", tmp.display()))?;
     std::fs::rename(&tmp, path)
         .with_context(|| format!("cannot rename {} to {}", tmp.display(), path.display()))?;
@@ -212,19 +276,60 @@ mod tests {
     /// the next boot silently denies every camera on the machine.
     #[test]
     fn the_cache_round_trips_through_parse() {
-        let paths = vec![
-            "/usr/bin/true".to_string(),
-            "/usr/bin/false".to_string(),
+        let entries = vec![
+            ("/usr/bin/true".to_string(), PERM_CAMERA),
+            ("/usr/bin/false".to_string(), PERM_AUDIO),
         ];
-        let back = Policy::parse(&render_cache(&paths));
+        let back = Policy::parse(&render_cache(&entries));
         assert_eq!(back.entries.len(), 2, "{back:?}");
         assert_eq!(back.unresolved.len(), 0);
         let got: Vec<_> = back
             .entries
             .iter()
-            .map(|e| e.path.to_string_lossy().to_string())
+            .map(|e| (e.path.to_string_lossy().to_string(), e.perms))
             .collect();
-        assert_eq!(got, paths);
+        assert_eq!(
+            got, entries,
+            "permissions must survive the cache — a grant that reloads as the \
+             wrong kind is how the audio server loses the microphone at boot"
+        );
+    }
+
+    /// A cache written by an older helper is bare paths with no permissions
+    /// word. It must keep loading, as camera-only — the grant it actually
+    /// represented — rather than failing or silently becoming nothing.
+    #[test]
+    fn a_legacy_bare_path_cache_still_loads_as_camera() {
+        let p = Policy::parse("# old header\n/usr/bin/true\n");
+        assert_eq!(p.entries.len(), 1, "{p:?}");
+        assert_eq!(p.entries[0].perms, PERM_CAMERA);
+        assert!(p.unresolved.is_empty());
+    }
+
+    /// An unrecognised permissions word must be reported, not skipped. Under
+    /// default-deny a silently dropped line and a typo'd path have the same
+    /// symptom — an app that mysteriously lost its device.
+    #[test]
+    fn an_unknown_permission_word_is_reported() {
+        let p = Policy::parse("bogus /usr/bin/true\n");
+        assert!(p.entries.is_empty());
+        assert_eq!(p.unresolved.len(), 1);
+        assert!(
+            p.unresolved[0].1.contains("unknown permissions"),
+            "{:?}",
+            p.unresolved[0]
+        );
+    }
+
+    /// Both bits on one line, which is what a binary allowed the camera AND the
+    /// microphone must serialise to.
+    #[test]
+    fn combined_permissions_round_trip() {
+        let text = render_cache(&[("/usr/bin/true".to_string(), PERM_CAMERA | PERM_AUDIO)]);
+        assert!(text.contains("camera,audio /usr/bin/true"), "{text}");
+        let back = Policy::parse(&text);
+        assert_eq!(back.entries.len(), 1);
+        assert_eq!(back.entries[0].perms, PERM_CAMERA | PERM_AUDIO);
     }
 
     /// The header is comments, so a cache with no entries must parse to an
@@ -241,12 +346,28 @@ mod tests {
     /// would be silently truncated into a path that resolves to nothing.
     #[test]
     fn a_path_containing_spaces_survives_the_cache() {
-        let text = render_cache(&["/opt/Some App/thing".to_string()]);
+        let text = render_cache(&[("/opt/Some App/thing".to_string(), PERM_CAMERA)]);
         let line = text
             .lines()
             .find(|l| !l.starts_with('#'))
             .expect("an entry line");
-        assert_eq!(line, "/opt/Some App/thing");
+        assert_eq!(line, "camera /opt/Some App/thing");
+
+        // And it must come BACK whole: the parser splits on the FIRST space
+        // only, so everything after the permissions word is the path.
+        let back = Policy::parse(&text);
+        assert_eq!(
+            back.unresolved.len() + back.entries.len(),
+            1,
+            "the path must not be split on its internal spaces: {back:?}"
+        );
+        let seen = back
+            .entries
+            .first()
+            .map(|e| e.path.clone())
+            .or_else(|| back.unresolved.first().map(|u| u.0.clone()))
+            .expect("one entry");
+        assert_eq!(seen, PathBuf::from("/opt/Some App/thing"));
     }
 
     /// A binary can be absent at the moment the daemon pushes (mid-upgrade) and
@@ -256,8 +377,8 @@ mod tests {
     #[test]
     fn an_unresolvable_cached_path_is_reported_not_dropped() {
         let p = Policy::parse(&render_cache(&[
-            "/usr/bin/true".to_string(),
-            "/definitely/not/here".to_string(),
+            ("/usr/bin/true".to_string(), PERM_CAMERA),
+            ("/definitely/not/here".to_string(), PERM_CAMERA),
         ]));
         assert_eq!(p.entries.len(), 1);
         assert_eq!(p.unresolved.len(), 1);

@@ -290,6 +290,13 @@ SENTINELS = [
      "directly. Each firing re-seeds, and a re-seed re-reports every existing "
      "link as new — so a timer here re-enforces the whole graph on a loop. EOF "
      "already covers a dead child. See run_monitor."),
+    ("(e.exe_path.clone(), stat_identity(&e.exe_path))",
+     "PolicyFingerprint is discarding the permission bits again. A binary "
+     "moving between the camera and audio allowlists keeps its path and inode, "
+     "so without perms the fingerprint compares EQUAL and the change is never "
+     "pushed — the kernel keeps enforcing the old grant while every status "
+     "surface reports healthy. Same shape as the 2026-08-20 sixteen-hour "
+     "silent camera loss this struct exists to prevent."),
     ("microphone: Permission::Deny,",
      "set_rule filling every category. Granting one device wrote deny for the "
      "other two, silently downgrading them from default_action. Categories are "

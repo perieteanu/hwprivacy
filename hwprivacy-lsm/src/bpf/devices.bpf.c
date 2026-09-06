@@ -6,7 +6,8 @@
 //
 //   CAMERA (major 81, video4linux)  — enforced when enforce_camera is set.
 //                                     Denied opens return -EPERM.
-//   AUDIO  (major 116, alsa)        — OBSERVE ONLY. Never denied in Phase 2.
+//   AUDIO  (major 116, alsa)        — capture nodes enforced when enforce_audio
+//                                     is set; playback/control never touched.
 //                                     Audio is a separate feature; the kernel
 //                                     cannot see which app is behind
 //                                     /usr/bin/pipewire anyway.
@@ -54,7 +55,7 @@ char LICENSE[] SEC("license") = "GPL";
 
 // Permission bits in the policy map value.
 #define PERM_CAMERA (1U << 0)
-#define PERM_AUDIO (1U << 1) // reserved; audio is not enforced in Phase 2
+#define PERM_AUDIO (1U << 1) // may open an ALSA CAPTURE node
 
 // ---------------------------------------------------------------------------
 // Policy key: the executable behind the calling task.
@@ -98,7 +99,11 @@ struct coalesce_val {
 // program — so enforcement can be switched off instantly in an emergency.
 struct config {
 	__u32 enforce_camera;
-	__u32 _pad;
+	/* ALSA capture enforcement. Occupies what used to be `_pad`, so the
+	 * struct is still 16 bytes and the map needs no redefinition. There is
+	 * no #[repr(C)] mirror on the Rust side — config_bytes() in main.rs is
+	 * the single writer, and a test pins these offsets. */
+	__u32 enforce_audio;
 	__u64 coalesce_ns;
 };
 
@@ -143,6 +148,29 @@ struct {
 	__type(key, __u32);
 	__type(value, struct config);
 } config_map SEC(".maps");
+
+// ---------------------------------------------------------------------------
+// ALSA capture minors, populated by userspace from DeviceIndex.
+//
+// WHY A MINOR SET AND NOT THE MAJOR
+//
+// Denying major 116 outright would deny /usr/bin/pipewire, which opens the
+// microphone on behalf of EVERY application — i.e. it would take out all audio
+// on the machine. Only capture nodes (`/dev/snd/pcmC*D*c`) are gated; playback,
+// control, seq and timer nodes are never touched. On this machine that is one
+// minor (pcmC0D0c) against five playback nodes.
+//
+// A minor ABSENT from this map is not enforced. That direction is deliberate:
+// a stale map (a mic hotplugged after the last rescan) under-blocks, and never
+// locks the user out of their own audio. Same reasoning as the fail-open on a
+// missing config below.
+// ---------------------------------------------------------------------------
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 64);
+	__type(key, __u32);  // device minor
+	__type(value, __u8); // presence only
+} capture_minors SEC(".maps");
 
 // ---------------------------------------------------------------------------
 // Release tracking: which executable holds which camera file, and how many
@@ -233,8 +261,23 @@ int BPF_PROG(hwp_file_open, struct file *file, int ret)
 			verdict = -EPERM;
 			denied = 1;
 		}
+	} else if (major == ALSA_MAJOR && cfg->enforce_audio) {
+		// The BACKSTOP. Not per-application microphone policy: /dev/snd is
+		// opened by the audio server on everyone's behalf, so the kernel sees
+		// pipewire, not the app behind it. What this enforces is "only the
+		// audio stack may open a capture device", which closes the direct-ALSA
+		// bypass (ffmpeg -f alsa recorded freely until now) without claiming an
+		// attribution the kernel cannot make. Per-app mic identity stays in
+		// layer 1, where it genuinely exists.
+		__u32 minor = DEV_MINOR(rdev);
+		if (bpf_map_lookup_elem(&capture_minors, &minor)) {
+			__u32 *perm = bpf_map_lookup_elem(&policy, &pk);
+			if (!perm || !(*perm & PERM_AUDIO)) {
+				verdict = -EPERM;
+				denied = 1;
+			}
+		}
 	}
-	// ALSA is never denied here. Phase 2 is camera only.
 
 	// -------------------------- release tracking ---------------------------
 	// Only cameras, and only opens that SUCCEEDED. A denied open never got the

@@ -90,6 +90,16 @@ struct Cli {
     #[arg(long)]
     enforce: bool,
 
+    /// ENFORCE the audio backstop: deny ALSA CAPTURE nodes
+    /// (`/dev/snd/pcmC*D*c`) to any executable without PERM_AUDIO. Playback,
+    /// control, seq and timer nodes are never touched.
+    ///
+    /// This is not per-application microphone policy and cannot be: /dev/snd is
+    /// opened by the audio server for everyone. It restricts capture to the
+    /// audio stack, closing the direct-ALSA bypass.
+    #[arg(long)]
+    enforce_audio: bool,
+
     /// Allow an executable to use the camera. Repeatable. Must be the REAL
     /// binary, not a wrapper script — `/usr/lib/firefox-esr/firefox-esr`, not
     /// `/usr/bin/firefox`.
@@ -350,10 +360,11 @@ fn main() -> Result<()> {
             .context("failed to write a policy map entry")?;
     }
 
-    // struct config { u32 enforce_camera; u32 _pad; u64 coalesce_ns; }
-    let mut cfg = [0u8; 16];
-    cfg[0..4].copy_from_slice(&(cli.enforce as u32).to_ne_bytes());
-    cfg[8..16].copy_from_slice(&(cli.coalesce_ms * 1_000_000).to_ne_bytes());
+    let cfg = config_bytes(
+        cli.enforce,
+        cli.enforce_audio,
+        cli.coalesce_ms * 1_000_000,
+    );
     skel.maps
         .config_map
         .update(&0u32.to_ne_bytes(), &cfg, MapFlags::ANY)
@@ -420,6 +431,13 @@ fn main() -> Result<()> {
 
     let reported = Arc::new(AtomicU64::new(0));
     let index = Arc::new(Mutex::new(DeviceIndex::new()));
+
+    // Seed the capture-minor set now, not on the first SetPolicy. A helper
+    // started with --enforce-audio and no daemon (the boot window, or a
+    // standalone run) must gate from the start; an empty map gates nothing and
+    // would look exactly like a working backstop.
+    push_capture_minors(&skel.maps.capture_minors, &index)
+        .context("failed to seed the ALSA capture minors")?;
     // (exe_dev, exe_ino) -> path, so a burst summary can name the binary even
     // after the process has exited.
     let seen_exe: Arc<Mutex<HashMap<(u32, u64), String>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -549,6 +567,7 @@ fn main() -> Result<()> {
     let coalesce_ns = cli.coalesce_ms * 1_000_000;
     let accounted = Arc::new(AtomicU64::new(0));
     let mut enforcing = cli.enforce;
+    let mut enforcing_audio = cli.enforce_audio;
 
     while running.load(Ordering::SeqCst) {
         // Errors here are almost always EINTR from our own signal handler.
@@ -574,8 +593,11 @@ fn main() -> Result<()> {
                 let rep = handle_request(
                     &skel.maps.policy,
                     &skel.maps.config_map,
+                    &skel.maps.capture_minors,
+                    &index,
                     req,
                     &mut enforcing,
+                    &mut enforcing_audio,
                     coalesce_ns,
                     cli.policy_cache.as_deref(),
                 );
@@ -644,11 +666,15 @@ fn main() -> Result<()> {
 ///
 /// Runs on the main thread, which is the only thing that touches the BPF maps —
 /// all kernel mutation is serialised here by construction rather than by lock.
+#[allow(clippy::too_many_arguments)]
 fn handle_request(
     policy_map: &libbpf_rs::Map,
     config_map: &libbpf_rs::Map,
+    minors_map: &libbpf_rs::Map,
+    index: &std::sync::Arc<std::sync::Mutex<DeviceIndex>>,
     req: Request,
     enforcing: &mut bool,
+    enforcing_audio: &mut bool,
     coalesce_ns: u64,
     policy_cache: Option<&Path>,
 ) -> Reply {
@@ -656,6 +682,7 @@ fn handle_request(
         Request::Hello { .. } => Reply::Hello {
             version: PROTO_VERSION,
             enforcing_camera: *enforcing,
+            enforcing_audio: *enforcing_audio,
         },
 
         Request::Ping => Reply::Pong,
@@ -663,20 +690,40 @@ fn handle_request(
         Request::SetPolicy {
             entries,
             enforce_camera,
+            enforce_audio,
         } => match replace_policy(policy_map, &entries) {
             Ok((applied, unresolved)) => {
-                if let Err(e) = write_config(config_map, enforce_camera, coalesce_ns) {
+                // Re-scan /dev/snd and re-push the capture minors on every
+                // policy push. DeviceIndex otherwise only rescans on a lookup
+                // MISS, which is too late: the kernel has already decided. A
+                // microphone hotplugged since the last scan would sit silently
+                // unenforced. A readdir is cheap; this is the same reasoning
+                // that rejected inotify for the exe recheck.
+                if let Err(e) = push_capture_minors(minors_map, index) {
+                    return Reply::Error {
+                        message: format!("policy written but capture minors failed: {e:#}"),
+                    };
+                }
+                if let Err(e) =
+                    write_config(config_map, enforce_camera, enforce_audio, coalesce_ns)
+                {
                     return Reply::Error {
                         message: format!("policy written but enforcement flag failed: {e:#}"),
                     };
                 }
                 *enforcing = enforce_camera;
+                *enforcing_audio = enforce_audio;
                 eprintln!(
                     "hwprivacy-lsm: policy set by daemon — {} allowed, {} unusable, \
                      enforcement {}",
                     applied,
                     unresolved.len(),
                     if enforce_camera { "ON" } else { "OFF" }
+                );
+                eprintln!(
+                    "hwprivacy-lsm: audio backstop {} — capture nodes restricted to \
+                     allowlisted executables",
+                    if enforce_audio { "ON" } else { "OFF" }
                 );
 
                 // Persist so the next boot enforces this same list rather than
@@ -689,9 +736,15 @@ fn handle_request(
                 // already correctly programmed, and refusing here would trade a
                 // working policy for a persistence problem.
                 if let Some(cache) = policy_cache {
-                    let paths: Vec<String> =
-                        entries.iter().map(|e| e.exe_path.clone()).collect();
-                    if let Err(e) = policy::write_cache(cache, &paths) {
+                    // Perms travel with the path. Writing bare paths would make
+                    // every audio grant reload as camera-only, which under the
+                    // backstop denies the AUDIO SERVER the microphone for the
+                    // whole boot window.
+                    let cached: Vec<(String, u32)> = entries
+                        .iter()
+                        .map(|e| (e.exe_path.clone(), e.perms))
+                        .collect();
+                    if let Err(e) = policy::write_cache(cache, &cached) {
                         eprintln!(
                             "hwprivacy-lsm: WARNING policy applied but the cache at {} \
                              could not be written: {e:#}. Enforcement is correct now, \
@@ -800,11 +853,79 @@ fn read_policy(map: &libbpf_rs::Map) -> Result<Vec<PolicyEntry>> {
     Ok(out)
 }
 
-/// `struct config { u32 enforce_camera; u32 _pad; u64 coalesce_ns; }`
-fn write_config(map: &libbpf_rs::Map, enforce_camera: bool, coalesce_ns: u64) -> Result<()> {
+/// Replace the kernel's `capture_minors` set from a fresh `/dev/snd` scan.
+///
+/// Rescans first — the whole point is to notice a microphone that appeared
+/// since the last push. Deletes minors that are gone before adding the current
+/// ones, so an unplugged device stops being enforced rather than lingering.
+///
+/// An empty result is not an error: a machine with no capture hardware simply
+/// enforces nothing, which is the correct fail-open direction. It IS worth a
+/// log line, because "the backstop is on and nothing is gated" is otherwise
+/// indistinguishable from working.
+fn push_capture_minors(
+    map: &libbpf_rs::Map,
+    index: &std::sync::Arc<std::sync::Mutex<DeviceIndex>>,
+) -> Result<()> {
+    let wanted = {
+        let mut idx = index.lock().unwrap();
+        idx.rescan();
+        idx.capture_minors()
+    };
+
+    let existing: Vec<[u8; 4]> = map.keys().filter_map(|k| k.try_into().ok()).collect();
+    for key in existing {
+        let minor = u32::from_ne_bytes(key);
+        if !wanted.contains(&minor) {
+            let _ = map.delete(&key);
+        }
+    }
+
+    for minor in &wanted {
+        map.update(&minor.to_ne_bytes(), &[1u8], MapFlags::ANY)
+            .with_context(|| format!("failed to add capture minor {minor}"))?;
+    }
+
+    if wanted.is_empty() {
+        eprintln!(
+            "hwprivacy-lsm: WARNING — no ALSA capture device found; the audio \
+             backstop will gate nothing"
+        );
+    } else {
+        let list: Vec<String> = wanted.iter().map(|m| m.to_string()).collect();
+        eprintln!(
+            "hwprivacy-lsm: audio capture minors: {} ({})",
+            wanted.len(),
+            list.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The 16 bytes of `struct config` in devices.bpf.c:
+/// `{ u32 enforce_camera; u32 enforce_audio; u64 coalesce_ns; }`.
+///
+/// There is deliberately ONE writer. The layout used to be open-coded as
+/// `[0u8; 16]` in two separate places with a comment as the only spec, and
+/// nothing asserting it — unlike `DevEvent`, which has `EVENT_SIZE` and a
+/// runtime drift check. Claiming the old `_pad` slot for `enforce_audio` is
+/// safe only because the size is unchanged, so `config_layout_is_stable`
+/// pins both the size and the offsets.
+fn config_bytes(enforce_camera: bool, enforce_audio: bool, coalesce_ns: u64) -> [u8; 16] {
     let mut cfg = [0u8; 16];
     cfg[0..4].copy_from_slice(&(enforce_camera as u32).to_ne_bytes());
+    cfg[4..8].copy_from_slice(&(enforce_audio as u32).to_ne_bytes());
     cfg[8..16].copy_from_slice(&coalesce_ns.to_ne_bytes());
+    cfg
+}
+
+fn write_config(
+    map: &libbpf_rs::Map,
+    enforce_camera: bool,
+    enforce_audio: bool,
+    coalesce_ns: u64,
+) -> Result<()> {
+    let cfg = config_bytes(enforce_camera, enforce_audio, coalesce_ns);
     map.update(&0u32.to_ne_bytes(), &cfg, MapFlags::ANY)
         .context("failed to write the config map")
 }
@@ -1107,6 +1228,7 @@ mod tests {
             max_events,
             duration,
             enforce: false,
+            enforce_audio: false,
             allow: Vec::new(),
             policy_file: None,
             coalesce_ms: 2000,
@@ -1224,6 +1346,49 @@ mod tests {
             StopReason::EventLimit,
         ] {
             assert!(!r.describe().is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod config_layout_tests {
+    use super::*;
+
+    /// `struct config` is written to the kernel as raw bytes with NO
+    /// `#[repr(C)]` mirror on the Rust side — the layout lives only in
+    /// `config_bytes()` and in the C declaration, and nothing but this test
+    /// connects the two.
+    ///
+    /// `enforce_audio` occupies what was `_pad` until 2026-09-06. That is safe
+    /// ONLY while the struct stays 16 bytes with `coalesce_ns` at offset 8. If
+    /// someone widens a field, the C side reads `coalesce_ns` out of the wrong
+    /// place and the burst window becomes garbage — silently, because a wrong
+    /// coalesce window still "works".
+    #[test]
+    fn config_layout_is_stable() {
+        let cfg = config_bytes(true, false, 0);
+        assert_eq!(cfg.len(), 16, "struct config must stay 16 bytes");
+        assert_eq!(&cfg[0..4], &1u32.to_ne_bytes(), "enforce_camera at 0");
+        assert_eq!(&cfg[4..8], &0u32.to_ne_bytes(), "enforce_audio at 4");
+
+        let cfg = config_bytes(false, true, 0);
+        assert_eq!(&cfg[0..4], &0u32.to_ne_bytes());
+        assert_eq!(
+            &cfg[4..8],
+            &1u32.to_ne_bytes(),
+            "enforce_audio must be its own field, not aliased onto the camera one"
+        );
+
+        // coalesce_ns must still land at offset 8, which is what claiming the
+        // padding slot could have broken.
+        let cfg = config_bytes(false, false, 0x0123_4567_89ab_cdef);
+        assert_eq!(&cfg[8..16], &0x0123_4567_89ab_cdefu64.to_ne_bytes());
+
+        // The two flags are independent in every combination.
+        for (cam, aud) in [(false, false), (true, false), (false, true), (true, true)] {
+            let c = config_bytes(cam, aud, 0);
+            assert_eq!(u32::from_ne_bytes(c[0..4].try_into().unwrap()), cam as u32);
+            assert_eq!(u32::from_ne_bytes(c[4..8].try_into().unwrap()), aud as u32);
         }
     }
 }

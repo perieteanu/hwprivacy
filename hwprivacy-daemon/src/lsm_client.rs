@@ -23,9 +23,10 @@ use hwprivacy_common::short_name;
 use hwprivacy_common::stream::AccessAction;
 use hwprivacy_common::{Config, DeviceCategory, Permission};
 use hwprivacy_proto::{
-    encode_line, AccessEvent, PolicyEntry, Reply, Request, DEFAULT_SOCKET, PERM_CAMERA,
-    PROTO_VERSION,
+    encode_line, AccessEvent, PolicyEntry, Reply, Request, DEFAULT_SOCKET, PERM_AUDIO,
+    PERM_CAMERA, PROTO_VERSION,
 };
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -36,6 +37,9 @@ use tracing::{debug, error, info, warn};
 pub struct KernelLayerState {
     pub connected: bool,
     pub enforcing_camera: bool,
+    /// The ALSA capture backstop. Separate from `enforcing_camera` because the
+    /// two follow different device guards and can differ.
+    pub enforcing_audio: bool,
     /// Executables the kernel currently allows to use the camera.
     pub allowed_exes: u32,
     /// Allowlist entries the helper could not resolve — under default-deny
@@ -68,6 +72,7 @@ pub async fn run(state: SharedState, socket_path: Option<String>) {
                     let mut s = state.write().await;
                     s.kernel.connected = false;
                     s.kernel.enforcing_camera = false;
+                    s.kernel.enforcing_audio = false;
                 }
                 info!("Kernel layer: disconnected, will retry");
             }
@@ -114,24 +119,31 @@ pub async fn run(state: SharedState, socket_path: Option<String>) {
 /// conversion is the trap that has already bitten this project twice.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct PolicyFingerprint {
-    /// `(exe_path, dev, ino)`, sorted. `None` for a path that does not resolve
-    /// — a file that is missing is itself a state worth re-pushing on.
-    files: Vec<(String, Option<(u64, u64)>)>,
+    /// `(exe_path, perms, dev, ino)`, sorted. `None` for a path that does not
+    /// resolve — a file that is missing is itself a state worth re-pushing on.
+    ///
+    /// `perms` is in here deliberately. It was omitted until 2026-09-06, which
+    /// meant a binary moving between the camera and audio lists — same path,
+    /// same inode, different grant — compared EQUAL and was never re-pushed.
+    /// That is the silent divergence this whole struct exists to prevent.
+    files: Vec<(String, u32, Option<(u64, u64)>)>,
     enforce_camera: bool,
+    enforce_audio: bool,
 }
 
 impl PolicyFingerprint {
     /// Sorted, so a reordering of `config.toml` is not mistaken for a change.
-    fn take(entries: &[PolicyEntry], enforce_camera: bool) -> Self {
-        let mut files: Vec<(String, Option<(u64, u64)>)> = entries
+    fn take(entries: &[PolicyEntry], enforce_camera: bool, enforce_audio: bool) -> Self {
+        let mut files: Vec<(String, u32, Option<(u64, u64)>)> = entries
             .iter()
-            .map(|e| (e.exe_path.clone(), stat_identity(&e.exe_path)))
+            .map(|e| (e.exe_path.clone(), e.perms, stat_identity(&e.exe_path)))
             .collect();
         files.sort();
         files.dedup();
         PolicyFingerprint {
             files,
             enforce_camera,
+            enforce_audio,
         }
     }
 
@@ -146,10 +158,21 @@ impl PolicyFingerprint {
                 prev.enforce_camera, self.enforce_camera
             ));
         }
-        for (path, now) in &self.files {
-            match prev.files.iter().find(|(p, _)| p == path) {
+        if self.enforce_audio != prev.enforce_audio {
+            notes.push(format!(
+                "audio backstop {} → {}",
+                prev.enforce_audio, self.enforce_audio
+            ));
+        }
+        for (path, perms, now) in &self.files {
+            match prev.files.iter().find(|(p, _, _)| p == path) {
                 None => notes.push(format!("added {path}")),
-                Some((_, before)) if before != now => notes.push(match (before, now) {
+                Some((_, was, before)) if was != perms => notes.push(format!(
+                    "{path} permissions {} → {}",
+                    perms_word(*was),
+                    perms_word(*perms)
+                )),
+                Some((_, _, before)) if before != now => notes.push(match (before, now) {
                     (Some((_, old)), Some((_, new))) => {
                         format!("{path} ino {old} → {new} (binary replaced)")
                     }
@@ -160,8 +183,8 @@ impl PolicyFingerprint {
                 Some(_) => {}
             }
         }
-        for (path, _) in &prev.files {
-            if !self.files.iter().any(|(p, _)| p == path) {
+        for (path, _, _) in &prev.files {
+            if !self.files.iter().any(|(p, _, _)| p == path) {
                 notes.push(format!("removed {path}"));
             }
         }
@@ -179,25 +202,69 @@ fn stat_identity(path: &str) -> Option<(u64, u64)> {
     std::fs::metadata(path).ok().map(|md| (md.dev(), md.ino()))
 }
 
+/// Render permission bits for a log line. The daemon has its own copy rather
+/// than depending on the helper crate — this is for humans reading the journal,
+/// not for the wire.
+fn perms_word(perms: u32) -> String {
+    let mut parts = Vec::new();
+    if perms & PERM_CAMERA != 0 {
+        parts.push("camera");
+    }
+    if perms & PERM_AUDIO != 0 {
+        parts.push("audio");
+    }
+    if parts.is_empty() {
+        parts.push("none");
+    }
+    parts.join(",")
+}
+
 /// The allowlist the config currently intends, plus the enforcement flag and
 /// any rules that cannot reach the kernel layer.
-async fn intended_policy(state: &SharedState) -> (Vec<PolicyEntry>, bool, Vec<(String, &'static str)>) {
+async fn intended_policy(
+    state: &SharedState,
+) -> (Vec<PolicyEntry>, bool, bool, Vec<(String, &'static str)>) {
     let s = state.read().await;
     let settle = Duration::from_secs(s.config.policy.while_in_use_settle_secs);
-    let entries: Vec<PolicyEntry> = s
-        .config
-        .kernel_camera_allowlist_with_sessions(|app| {
-            s.tracker.session_live(app, DeviceCategory::Camera, settle)
-        })
+
+    // One entry per binary, with the permission BITS OR'd together — a binary
+    // allowed both the camera and the microphone must arrive as a single entry
+    // carrying both, not as two entries where the last one written wins.
+    let mut by_path: BTreeMap<String, u32> = BTreeMap::new();
+    for (exe_path, _) in s.config.kernel_camera_allowlist_with_sessions(|app| {
+        s.tracker.session_live(app, DeviceCategory::Camera, settle)
+    }) {
+        *by_path.entry(exe_path).or_insert(0) |= PERM_CAMERA;
+    }
+    for (exe_path, _) in s.config.kernel_audio_allowlist() {
+        *by_path.entry(exe_path).or_insert(0) |= PERM_AUDIO;
+    }
+
+    let entries: Vec<PolicyEntry> = by_path
         .into_iter()
-        .map(|(exe_path, _)| PolicyEntry {
-            exe_path,
-            perms: PERM_CAMERA,
-        })
+        .map(|(exe_path, perms)| PolicyEntry { exe_path, perms })
         .collect();
-    // The kernel layer enforces only when the guard for cameras is on.
+
+    // Each layer-2 guard follows its own device guard in config.toml.
     let enforce = s.config.devices.is_guarded(&DeviceCategory::Camera);
-    (entries, enforce, s.config.kernel_camera_gaps())
+    // The interlock. `devices.microphone` is the user's INTENT; the blocker is
+    // whether acting on it right now would take out all audio on the machine.
+    // Refusing to enforce is recoverable; enforcing wrongly is not.
+    let enforce_audio = match s.config.audio_backstop_blocker() {
+        None => s.config.devices.is_guarded(&DeviceCategory::Microphone),
+        Some(why) => {
+            if s.config.devices.is_guarded(&DeviceCategory::Microphone) {
+                warn!("Audio backstop NOT enforced: {}", why);
+            }
+            false
+        }
+    };
+    (
+        entries,
+        enforce,
+        enforce_audio,
+        s.config.kernel_camera_gaps(),
+    )
 }
 
 /// What changed between two gap reports: newly opened, and newly closed.
@@ -239,7 +306,7 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
 
     // Push the allowlist immediately. Until this lands the helper is enforcing
     // whatever it was started with, which may be nothing.
-    let (entries, mut enforce, gaps) = intended_policy(state).await;
+    let (entries, mut enforce, mut enforce_audio, gaps) = intended_policy(state).await;
 
     for (app, why) in &gaps {
         warn!("Kernel layer gap: rule '{}' — {}", app, why);
@@ -249,11 +316,12 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
     }
     let mut last_gaps = gaps;
 
-    let mut fingerprint = PolicyFingerprint::take(&entries, enforce);
+    let mut fingerprint = PolicyFingerprint::take(&entries, enforce, enforce_audio);
     tx.write_all(
         encode_line(&Request::SetPolicy {
             entries: entries.clone(),
             enforce_camera: enforce,
+            enforce_audio,
         })?
         .as_bytes(),
     )
@@ -280,8 +348,8 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
                 // now rather than at the next 30 s tick is the difference
                 // between "click Allow and it works" and "click Allow and wait
                 // half a minute while the app is still denied".
-                let (entries, want_enforce, _) = intended_policy(state).await;
-                let next = PolicyFingerprint::take(&entries, want_enforce);
+                let (entries, want_enforce, want_audio, _) = intended_policy(state).await;
+                let next = PolicyFingerprint::take(&entries, want_enforce, want_audio);
                 if next != fingerprint {
                     info!(
                         "Kernel layer: policy changed ({}); pushing {} entr(ies)",
@@ -292,6 +360,7 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
                         encode_line(&Request::SetPolicy {
                             entries,
                             enforce_camera: want_enforce,
+                            enforce_audio: want_audio,
                         })?
                         .as_bytes(),
                     )
@@ -302,7 +371,7 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
                 continue;
             }
             _ = recheck_tick.tick(), if recheck > 0 => {
-                let (entries, want_enforce, gaps) = intended_policy(state).await;
+                let (entries, want_enforce, want_audio, gaps) = intended_policy(state).await;
 
                 // Report gaps here as well as at connect time. The connect-time
                 // pass alone could never catch the case that actually bit: a
@@ -323,7 +392,7 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
                 }
                 last_gaps = gaps;
 
-                let next = PolicyFingerprint::take(&entries, want_enforce);
+                let next = PolicyFingerprint::take(&entries, want_enforce, want_audio);
                 if next != fingerprint {
                     info!(
                         "Kernel layer: policy changed under us ({}); re-pushing {} entr(ies)",
@@ -334,6 +403,7 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
                         encode_line(&Request::SetPolicy {
                             entries,
                             enforce_camera: want_enforce,
+                            enforce_audio: want_audio,
                         })?
                         .as_bytes(),
                     )
@@ -360,6 +430,7 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
             Reply::Hello {
                 version,
                 enforcing_camera,
+                enforcing_audio,
             } => {
                 if version != PROTO_VERSION {
                     anyhow::bail!(
@@ -369,6 +440,7 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
                 let mut s = state.write().await;
                 s.kernel.connected = true;
                 s.kernel.enforcing_camera = enforcing_camera;
+                s.kernel.enforcing_audio = enforcing_audio;
                 s.kernel.last_error = None;
             }
 
@@ -391,6 +463,7 @@ async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> 
                 let mut s = state.write().await;
                 s.kernel.allowed_exes = applied as u32;
                 s.kernel.enforcing_camera = enforce;
+                s.kernel.enforcing_audio = enforce_audio;
                 s.kernel.unresolved = unresolved
                     .iter()
                     .map(|u| format!("{}: {}", u.exe_path, u.reason))
@@ -962,7 +1035,7 @@ mod tests {
         let name = path.to_string_lossy().to_string();
         let entries = vec![entry(&name)];
 
-        let before = PolicyFingerprint::take(&entries, true);
+        let before = PolicyFingerprint::take(&entries, true, false);
 
         // What dpkg does: a new file, moved over the old path. Same name,
         // new inode. `write()` alone would reuse the inode and prove nothing.
@@ -970,7 +1043,7 @@ mod tests {
         std::fs::write(&tmp, "upgraded").unwrap();
         std::fs::rename(&tmp, &path).unwrap();
 
-        let after = PolicyFingerprint::take(&entries, true);
+        let after = PolicyFingerprint::take(&entries, true, false);
         assert_ne!(before, after, "an in-place replacement must be visible");
         let why = after.describe_change(&before);
         assert!(why.contains("binary replaced"), "{why}");
@@ -985,8 +1058,8 @@ mod tests {
         let path = scratch("stable");
         let entries = vec![entry(&path.to_string_lossy())];
         assert_eq!(
-            PolicyFingerprint::take(&entries, true),
-            PolicyFingerprint::take(&entries, true)
+            PolicyFingerprint::take(&entries, true, false),
+            PolicyFingerprint::take(&entries, true, false)
         );
         let _ = std::fs::remove_file(&path);
     }
@@ -999,8 +1072,8 @@ mod tests {
         let b = scratch("order-b");
         let (a, b) = (a.to_string_lossy().to_string(), b.to_string_lossy().to_string());
         assert_eq!(
-            PolicyFingerprint::take(&[entry(&a), entry(&b)], true),
-            PolicyFingerprint::take(&[entry(&b), entry(&a)], true)
+            PolicyFingerprint::take(&[entry(&a), entry(&b)], true, false),
+            PolicyFingerprint::take(&[entry(&b), entry(&a)], true, false)
         );
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&b);
@@ -1014,8 +1087,8 @@ mod tests {
     fn adding_or_removing_a_rule_is_a_change() {
         let path = scratch("rules");
         let name = path.to_string_lossy().to_string();
-        let none = PolicyFingerprint::take(&[], true);
-        let one = PolicyFingerprint::take(&[entry(&name)], true);
+        let none = PolicyFingerprint::take(&[], true, false);
+        let one = PolicyFingerprint::take(&[entry(&name)], true, false);
         assert_ne!(none, one);
         assert!(one.describe_change(&none).contains("added"));
         assert!(none.describe_change(&one).contains("removed"));
@@ -1024,9 +1097,75 @@ mod tests {
 
     /// Turning the camera guard off is a policy change with no file behind it.
     #[test]
+    /// The failure this whole struct exists to prevent, in a new place.
+    ///
+    /// `take()` ignored `perms` until 2026-09-06. A binary moving between the
+    /// camera and audio lists has the SAME path and the SAME inode, so the
+    /// fingerprint compared equal, no re-push happened, and the kernel kept
+    /// enforcing the old grant while config.toml said otherwise — silently,
+    /// with every status surface reporting healthy. That is the 2026-08-20
+    /// sixteen-hour failure wearing a different hat.
+    #[test]
+    fn changing_only_the_permission_bits_is_a_change() {
+        let cam = vec![PolicyEntry {
+            exe_path: "/usr/bin/true".into(),
+            perms: PERM_CAMERA,
+        }];
+        let aud = vec![PolicyEntry {
+            exe_path: "/usr/bin/true".into(),
+            perms: PERM_AUDIO,
+        }];
+
+        let before = PolicyFingerprint::take(&cam, true, true);
+        let after = PolicyFingerprint::take(&aud, true, true);
+
+        assert_ne!(
+            before, after,
+            "same path, same inode, different grant — this MUST re-push"
+        );
+        assert!(
+            after.describe_change(&before).contains("permissions"),
+            "the journal must say what moved: {}",
+            after.describe_change(&before)
+        );
+    }
+
+    /// Gaining a permission is a change too — a binary that had the camera and
+    /// now also has audio must reach the kernel with both bits.
+    #[test]
+    fn adding_a_permission_to_an_existing_binary_is_a_change() {
+        let one = vec![PolicyEntry {
+            exe_path: "/usr/bin/true".into(),
+            perms: PERM_CAMERA,
+        }];
+        let both = vec![PolicyEntry {
+            exe_path: "/usr/bin/true".into(),
+            perms: PERM_CAMERA | PERM_AUDIO,
+        }];
+        assert_ne!(
+            PolicyFingerprint::take(&one, true, true),
+            PolicyFingerprint::take(&both, true, true)
+        );
+    }
+
+    /// The audio backstop flipping must re-push on its own, exactly as the
+    /// camera flag does.
+    #[test]
+    fn toggling_the_audio_backstop_is_a_change() {
+        let on = PolicyFingerprint::take(&[], true, true);
+        let off = PolicyFingerprint::take(&[], true, false);
+        assert_ne!(on, off);
+        assert!(
+            off.describe_change(&on).contains("audio backstop"),
+            "{}",
+            off.describe_change(&on)
+        );
+    }
+
+    #[test]
     fn toggling_enforcement_is_a_change() {
-        let on = PolicyFingerprint::take(&[], true);
-        let off = PolicyFingerprint::take(&[], false);
+        let on = PolicyFingerprint::take(&[], true, false);
+        let off = PolicyFingerprint::take(&[], false, false);
         assert_ne!(on, off);
         assert!(off.describe_change(&on).contains("enforcement"));
     }
@@ -1039,9 +1178,9 @@ mod tests {
         let path = scratch("vanish");
         let name = path.to_string_lossy().to_string();
         let entries = vec![entry(&name)];
-        let present = PolicyFingerprint::take(&entries, true);
+        let present = PolicyFingerprint::take(&entries, true, false);
         std::fs::remove_file(&path).unwrap();
-        let gone = PolicyFingerprint::take(&entries, true);
+        let gone = PolicyFingerprint::take(&entries, true, false);
         assert_ne!(present, gone);
         assert!(gone.describe_change(&present).contains("disappeared"));
     }

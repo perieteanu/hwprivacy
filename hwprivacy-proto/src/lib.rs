@@ -74,6 +74,12 @@ pub enum Request {
     SetPolicy {
         entries: Vec<PolicyEntry>,
         enforce_camera: bool,
+        /// The ALSA capture backstop. `#[serde(default)]` so a helper and a
+        /// daemon of different vintages still talk: an older daemon that omits
+        /// the field means "off", which is the safe direction — the same
+        /// compatibility trick as `AccessEvent.released`. No PROTO_VERSION bump.
+        #[serde(default)]
+        enforce_audio: bool,
     },
     /// Ask what the kernel currently holds, for diagnostics.
     GetPolicy,
@@ -87,6 +93,8 @@ pub enum Reply {
     Hello {
         version: u32,
         enforcing_camera: bool,
+        #[serde(default)]
+        enforcing_audio: bool,
     },
     PolicyApplied {
         applied: usize,
@@ -168,6 +176,7 @@ mod tests {
                     perms: PERM_CAMERA,
                 }],
                 enforce_camera: true,
+                enforce_audio: true,
             },
             Request::GetPolicy,
             Request::Ping,
@@ -187,6 +196,7 @@ mod tests {
             Reply::Hello {
                 version: PROTO_VERSION,
                 enforcing_camera: false,
+                enforcing_audio: false,
             },
             Reply::PolicyApplied {
                 applied: 2,

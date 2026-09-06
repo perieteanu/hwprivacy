@@ -12,7 +12,7 @@ current_state:
     unpredictable.
 
   verified_working:
-    - "Cargo workspace, 7 crates, 13651 LOC, 201 tests, builds clean (trivial warnings, 0 errors) — verified 2026-09-01"
+    - "Cargo workspace, 7 crates, 15432 LOC, 240 tests, builds clean (trivial warnings, 0 errors) — verified 2026-09-06"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"

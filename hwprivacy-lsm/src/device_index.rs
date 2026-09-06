@@ -141,6 +141,27 @@ impl DeviceIndex {
 
     /// Look up a device by the `(major, minor)` reported by the eBPF program.
     /// Rescans once on a miss, to pick up hotplugged hardware without polling.
+    /// Every ALSA CAPTURE minor currently known, for the kernel's
+    /// `capture_minors` map.
+    ///
+    /// This is the whole reason the backstop can exist without denying major
+    /// 116 outright — which would deny `/usr/bin/pipewire` and take out every
+    /// application's microphone. `classify()` already separates `pcmC*D*c`
+    /// from playback and control nodes; this only exposes the result, since
+    /// `map` is private and `lookup()` is a point query.
+    ///
+    /// Call it again after `rescan()`: a microphone plugged in after the last
+    /// scan is absent here, and an absent minor is NOT enforced.
+    pub fn capture_minors(&self) -> std::collections::BTreeSet<u32> {
+        self.map
+            .iter()
+            .filter(|((major, _), node)| {
+                *major == ALSA_MAJOR && node.role == DeviceRole::AudioCapture
+            })
+            .map(|((_, minor), _)| *minor)
+            .collect()
+    }
+
     pub fn lookup(&mut self, major: u32, minor: u32) -> Option<DeviceNode> {
         if let Some(d) = self.map.get(&(major, minor)) {
             return Some(d.clone());
@@ -310,6 +331,65 @@ mod tests {
     fn any_v4l2_node_is_a_camera_regardless_of_name() {
         assert_eq!(classify(V4L2_MAJOR, "video0"), DeviceRole::Camera);
         assert_eq!(classify(V4L2_MAJOR, "video1"), DeviceRole::Camera);
+    }
+
+    /// The whole safety argument for the audio backstop rests on this: it
+    /// gates CAPTURE minors, never the major. Denying major 116 would deny
+    /// /usr/bin/pipewire, which opens the microphone for every application —
+    /// i.e. it would take out all audio on the machine.
+    ///
+    /// A playback minor leaking into this set would do exactly that, and the
+    /// symptom would be "sound stopped working" with no denial naming a device.
+    #[test]
+    fn capture_minors_never_include_a_playback_node() {
+        let mut idx = DeviceIndex {
+            map: std::collections::HashMap::new(),
+        };
+        idx.map.insert(
+            (ALSA_MAJOR, 9),
+            DeviceNode {
+                path: PathBuf::from("/dev/snd/pcmC0D0c"),
+                role: DeviceRole::AudioCapture,
+            },
+        );
+        idx.map.insert(
+            (ALSA_MAJOR, 8),
+            DeviceNode {
+                path: PathBuf::from("/dev/snd/pcmC0D0p"),
+                role: DeviceRole::AudioPlayback,
+            },
+        );
+        idx.map.insert(
+            (ALSA_MAJOR, 11),
+            DeviceNode {
+                path: PathBuf::from("/dev/snd/controlC0"),
+                role: DeviceRole::AudioControl,
+            },
+        );
+        // A camera shares no numbering space with ALSA and must not appear.
+        idx.map.insert(
+            (V4L2_MAJOR, 0),
+            DeviceNode {
+                path: PathBuf::from("/dev/video0"),
+                role: DeviceRole::Camera,
+            },
+        );
+
+        let minors = idx.capture_minors();
+        assert!(minors.contains(&9), "the capture node must be gated");
+        assert!(!minors.contains(&8), "playback must NEVER be gated");
+        assert!(!minors.contains(&11), "control must NEVER be gated");
+        assert_eq!(minors.len(), 1, "exactly the capture node: {minors:?}");
+    }
+
+    /// No capture hardware is not an error — it gates nothing, which is the
+    /// correct fail-open direction.
+    #[test]
+    fn capture_minors_is_empty_without_capture_hardware() {
+        let idx = DeviceIndex {
+            map: std::collections::HashMap::new(),
+        };
+        assert!(idx.capture_minors().is_empty());
     }
 
     #[test]
