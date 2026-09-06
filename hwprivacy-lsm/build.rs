@@ -6,15 +6,19 @@ const SRC: &str = "src/bpf/devices.bpf.c";
 const VMLINUX: &str = "src/bpf/vmlinux.h";
 
 fn main() {
-    // vmlinux.h is generated from the running kernel's BTF by
-    // ~/projects/claude-run/hwprivacy-ebpf-toolchain-20260804.sh.
-    // It is machine-specific and deliberately not committed.
+    // vmlinux.h is generated from the RUNNING kernel's BTF, so it is specific
+    // to the machine that built it and is deliberately not committed.
     if !PathBuf::from(VMLINUX).exists() {
         panic!(
-            "\n\n{VMLINUX} is missing.\n\
+            "\n\n{VMLINUX} is missing.\n\n\
+             It is generated from your kernel's own BTF and is not committed,\n\
+             because it describes the kernel you are building against.\n\n\
              Generate it with:\n    \
-             bpftool btf dump file /sys/kernel/btf/vmlinux format c > {VMLINUX}\n\
-             or just run ~/projects/claude-run/hwprivacy-ebpf-toolchain-20260804.sh\n"
+             bpftool btf dump file /sys/kernel/btf/vmlinux format c > {VMLINUX}\n\n\
+             Requires: bpftool, clang, libbpf-dev, and a kernel built with\n\
+             CONFIG_DEBUG_INFO_BTF=y (Debian 13 ships this).\n\n\
+             On Debian/Ubuntu:\n    \
+             sudo apt install -y clang libbpf-dev bpftool\n"
         );
     }
 

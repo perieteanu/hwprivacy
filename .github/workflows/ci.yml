@@ -1,0 +1,65 @@
+name: CI
+
+# Runs the same gate as `make check`: the doc-check contradiction detector,
+# then the test suite. Split into two jobs on purpose — see below.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # doc-check reads FILES only: no kernel, no toolchain, no display. It is the
+  # cheapest signal in the repo and catches the failure this project actually
+  # has — documentation drifting away from the code — so it runs on its own and
+  # is never masked by a build problem elsewhere.
+  doc-check:
+    name: docs match the code
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: make doc-check
+        run: make doc-check
+
+  test:
+    name: build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # GTK4 for the GUI crate; clang/libbpf/bpftool for the eBPF skeleton.
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libdbus-1-dev pkg-config \
+            clang libbpf-dev linux-tools-common linux-tools-generic
+
+      # vmlinux.h is generated from the RUNNING kernel's BTF and is not
+      # committed, because it describes the kernel it was built against. The
+      # runner's kernel is not Debian 13's, which is exactly why this is
+      # generated here rather than shipped.
+      - name: generate vmlinux.h from the runner's kernel BTF
+        run: |
+          BPFTOOL=$(command -v bpftool || echo /usr/lib/linux-tools/$(uname -r)/bpftool)
+          "$BPFTOOL" btf dump file /sys/kernel/btf/vmlinux format c \
+            > hwprivacy-lsm/src/bpf/vmlinux.h
+          wc -l hwprivacy-lsm/src/bpf/vmlinux.h
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo build
+        run: cargo build --workspace --locked
+
+      # The suite is pure unit tests — no daemon, no D-Bus, no hardware. What
+      # it does NOT cover is stated plainly rather than implied: enforcement is
+      # verified against a live kernel by tools/acceptance/, which cannot run
+      # on a hosted runner because it needs root and a real capture device.
+      - name: cargo test
+        run: cargo test --workspace --locked
