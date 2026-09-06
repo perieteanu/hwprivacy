@@ -50,20 +50,30 @@ explicit_non_goals:
 
 threat_model:
   scope_correction_2026_08_04: >
-    MEASURED, not assumed. hwprivacy observes the PipeWire graph, so it can
-    only see applications that use PipeWire. Direct device-node access —
-    V4L2 on /dev/video*, ALSA on /dev/snd/* — is completely invisible to it.
+    MEASURED, not assumed. hwprivacy began as a PipeWire-graph observer, so it
+    could only see applications that use PipeWire. Direct device-node access —
+    V4L2 on /dev/video*, ALSA on /dev/snd/* — was completely invisible to it.
     Both were demonstrated on the live system; see
     ROADMAP.yaml > security_gaps > g5_camera_bypass and g6_alsa_bypass.
+  scope_correction_superseded_2026_09_06: >
+    Both bypasses are now closed IN THE KERNEL, and the sentence above is kept
+    because it is the measurement that motivated the whole second layer. The
+    camera has been enforced by executable inode since 2026-08-05; direct ALSA
+    capture has been denied since 2026-09-06 (a non-allowlisted open() of
+    /dev/snd/pcmC*D*c returns EPERM, verified live). What the kernel still
+    CANNOT do is attribute a microphone open to an application — /dev/snd is
+    held by the audio server on everyone\'s behalf — so per-application mic
+    policy remains layer 1\'s job and inherits layer 1\'s weaknesses.
   defends_against:
     - "Silent monitor taps (recording your playback). Real and unique — PipeWire is genuinely the right layer for this."
     - "Careless PipeWire-routed microphone access, which is how most desktop apps take the mic."
+    - "Direct ALSA microphone capture by a non-allowlisted binary — denied in the kernel since 2026-09-06. This was the project's largest hole for a month."
     - "Not knowing. The event log and notifications make PipeWire-path access visible."
   does_not_defend_against:
     - "A process running as your user: it can `systemctl --user stop hwprivacy`, and root can stop the kernel helper. The BPF program is never pinned, so stopping the helper restores normal access."
-    - "Direct ALSA microphone capture. Trivially available to any process — the kernel layer covers the camera only. Phase 5 would close it and has not started."
+    - "Per-APPLICATION microphone policy against a determined process. The kernel now denies direct ALSA capture to any binary not on the allowlist (2026-09-06), but it cannot tell WHICH application is behind the audio server, so anything routed through PipeWire is gated by layer 1 and by name."
     - "An app that re-creates a PipeWire link faster than enforcement notices (~500 ms window)."
-    - "Name spoofing at layer 1: `application.name` is what the app declares about itself. Layer 2 is not spoofable — it matches the executable's inode — but it only covers the camera."
+    - "Name spoofing at layer 1: `application.name` is what the app declares about itself. Layer 2 is not spoofable — it matches the executable's inode — but it speaks in binaries, not applications: for the microphone it can only say WHICH BINARY may bypass PipeWire, never which app is asking."
     - "An already-open fd. The LSM hook is on open(), not read: a camera opened before a deny took effect keeps working."
     - "Which WEBSITE asked. The executable is the principal, so allowing firefox allows every site that has a grant inside it."
   fixed_2026_08:

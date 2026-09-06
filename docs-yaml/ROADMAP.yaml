@@ -333,10 +333,12 @@ security_gaps:
   g6_alsa_bypass:
     severity: "high — microphone protection covers the common path, not the threat"
     status_2026_09_06: >
-      A kernel backstop is BUILT and gated OFF (see kernel_layer >
-      phase_5_audio_backstop). g6 is not closed until the live acceptance test
-      shows ffmpeg denied AND the audio stack still working. Until then this
-      gap stands exactly as written below."
+      CLOSED at the kernel. Verified live: a non-allowlisted open() of
+      /dev/snd/pcmC0D0c returns EPERM, an allowlisted one succeeds, and the
+      audio stack is unaffected. The helper runs with --enforce-audio from
+      boot. What the backstop cannot do is name the APPLICATION — /dev/snd is
+      held by the audio server — so per-app microphone policy remains layer 1's
+      job. The evidence below is the measurement that opened this gap."
     discovered: "2026-08-04, same method"
     what: "Opening the mic directly via ALSA (hw:0,0 -> /dev/snd/pcmC0D0c) is equally invisible."
     evidence: |
@@ -850,10 +852,26 @@ kernel_layer:
       like an audio server is the fuzzy matching that made normalize_app_name a
       hazard. Widen audio_backstop_blocker() when a real one appears.
       Documented in README limitation 2, the preset header, and the code.
+    accepted_live_2026_09_06: |
+      [1] unenforced                 -> open() SUCCEEDED fd=3
+      [2] enforced, not allowlisted  -> open() FAILED errno=1 (EPERM)
+      [3] enforced, allowlisted      -> open() SUCCEEDED fd=3
+      kernel record: {"role":"MIC","device":"/dev/snd/pcmC0D0c",
+                      "exe":".../openprobe","denied":true}
+      PipeWire responds, 3 sources visible, NRestarts 0.
+      Step 3 is what makes it a POLICY rather than a blanket denial — without
+      it, "denies everything" and "enforces an allowlist" look identical.
+    the_sensor_had_to_be_replaced_first: >
+      ffmpeg could not answer the question. It exited 124 (killed by timeout,
+      having hung 15s) on one run and reported "Input/output error" on another,
+      where the kernel had returned EPERM both times — libasound retries and
+      remaps, so the errno is gone by the time ffmpeg speaks.
+      tools/acceptance/openprobe.c does one open() and prints the errno by
+      name, validated against known controls before being trusted. Same defect
+      class as the pipeline-exit-status and pactl bugs: asserting through a
+      component with its own reasons to fail.
     still_to_do:
-      - "Run ~/projects/claude-run/hwprivacy-audio-backstop-test-20260906.sh — must show ffmpeg denied AND the audio stack alive."
-      - "Then apply the audio-backstop preset and turn devices.microphone on for real."
-      - "Reboot verification: the boot window is where the cache trap would bite."
+      - "Reboot verification: the boot window is where the cache trap would bite, and alsactl restores mixer state before any session exists."
     original_note: "AGREED IN PRINCIPLE 2026-08-05, not started. Comes after Phase 3."
     question_asked: "Should exe_path also gate the microphone at the kernel layer?"
     answer: >

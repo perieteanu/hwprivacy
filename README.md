@@ -57,10 +57,11 @@ which knows *which application* is asking, and an **eBPF LSM in the kernel**,
 which sees an `open()` of a device node whatever the application talks to.
 
 **Read the coverage honestly before relying on it.** The camera is enforced in
-the kernel and holds against a browser using V4L2 directly. The **microphone is
-not**: an application that opens ALSA directly bypasses hwprivacy entirely
-(limitation 1 below, measured). The playback monitor is guarded at the PipeWire
-layer, which is the correct layer for it.
+the kernel and holds against a browser using V4L2 directly. The microphone is
+enforced at both layers — per application in PipeWire, and as a coarse
+binary-level backstop in the kernel that closes the direct-ALSA bypass
+(limitation 1 explains what that backstop can and cannot express). The playback
+monitor is guarded at the PipeWire layer, which is the correct layer for it.
 
 ---
 
@@ -781,30 +782,25 @@ packaging; "Phase 5" there is the ALSA backstop, which has **not** started.
 
 ## Known Limitations
 
-1. **The microphone can be bypassed entirely.** An application that opens ALSA
-   directly (`/dev/snd/pcmC0D0c`) never touches PipeWire, so layer 1 never sees
-   it — and the kernel layer does not gate audio, because `/dev/snd` is opened
-   by `/usr/bin/pipewire` on every application's behalf, so a denial there
-   would deny everyone's microphone. Measured 2026-08-04:
-   `ffmpeg -f alsa -i hw:0,0 -t 3` captured three seconds of real audio with
-   **zero** events logged.
+1. **The microphone backstop is coarse: it gates binaries, not applications.**
+   Direct ALSA capture used to bypass hwprivacy completely — measured
+   2026-08-04, `ffmpeg -f alsa -i hw:0,0 -t 3` captured three seconds of real
+   audio with zero events logged. Since 2026-09-06 the kernel denies it:
+   a non-allowlisted `open()` of `/dev/snd/pcmC*D*c` returns **EPERM**,
+   verified live.
 
-   A kernel backstop that restricts ALSA **capture** nodes to an allowlist of
-   executables is now built (`--enforce-audio`), but **it ships switched off
-   and has not yet been accepted against live hardware**. Until that test
-   passes, treat the microphone as guarded on the PipeWire path only — which
-   covers ordinary desktop applications, not an adversary. The camera does not
-   have this gap: it is enforced in the kernel by executable inode.
+   What remains limited is *what it can express*. `/dev/snd` is opened by the
+   audio server on every application's behalf, so the kernel sees
+   `/usr/bin/pipewire`, never the app behind it. The backstop therefore answers
+   only "may this binary take the microphone without going through PipeWire" —
+   in practice, the audio stack and anything that genuinely bypasses it.
+   **Per-application microphone policy exists only in layer 1**, and an
+   application that routes through PipeWire is gated there, by name, exactly as
+   before.
 
-   The backstop gates on the capture **minor**, never on ALSA's major number:
-   denying major 116 would deny `/usr/bin/pipewire` and stop every
-   application's microphone. Playback, control, sequencer and timer nodes are
-   never touched.
-
-   It is a backstop, **not per-application microphone policy**, and it cannot
-   be — `/dev/snd` is opened by the audio server on every application's behalf,
-   so the kernel sees the server, not the app behind it. Per-application
-   microphone identity exists only in layer 1.
+   It gates on the capture **minor**, never on ALSA's major number: denying
+   major 116 would deny `/usr/bin/pipewire` and stop every application's
+   microphone. Playback, control, sequencer and timer nodes are never touched.
 
    **Enabling it requires allowlisting your audio server**, or the first thing
    denied is the server itself:
@@ -1028,6 +1024,8 @@ PipeWire 1.4.2, ALC257 codec (2 internal mics as stereo), Integrated Camera.
 | Config persistence to TOML | Survives daemon restart |
 | Firefox video playback (normal) | Not intercepted, plays normally |
 | Monitor tap via `parecord` | **Blocked**: 0 bytes audio captured (44-byte empty WAV) |
+| Direct ALSA capture, non-allowlisted binary | **Blocked**: `open()` returns EPERM; kernel logs the binary and device |
+| Direct ALSA capture, allowlisted binary | Allowed — it is a policy, not a blanket denial |
 | Firefox playback during monitor block | Unaffected, kept playing |
 | Instant BLOCKED notification | Appears immediately on access attempt |
 | Action notification with buttons | Shows Always Allow / While in Use / Always Deny |
@@ -1079,7 +1077,7 @@ history, which is why this is a rule and not an aspiration.
 | 2 — camera enforcement | **5/5**, denied live against Firefox and WhatsApp, access restored on detach |
 | 3 — daemon integration | **13/13**. C5 (burst counting) and D1 both closed 2026-08-19 |
 | 4 — systemd unit for the helper | installed, enabled, boot-verified |
-| 5 — ALSA audio backstop | built, ships OFF; **live acceptance not yet run** — see limitation 1 |
+| 5 — ALSA audio backstop | **PASSED** 2026-09-06 — non-allowlisted `open()` gets EPERM, allowlisted succeeds, audio stack unaffected |
 | 5 — audio backstop | not started |
 
 ---
