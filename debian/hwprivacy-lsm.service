@@ -22,7 +22,16 @@ ExecStart=/usr/bin/hwprivacy-lsm \
     --socket-group hwprivacy \
     --policy-cache /var/lib/hwprivacy/policy \
     --enforce \
+    --enforce-audio \
     --json
+
+# --enforce-audio is the ALSA capture backstop: only executables allowlisted
+# for audio may open /dev/snd/pcmC*D*c. It gates on the capture MINOR, never on
+# ALSA's major, because denying major 116 would deny /usr/bin/pipewire and stop
+# every application's microphone. The daemon additionally refuses to request it
+# unless an audio server is actually in the allowlist — see
+# audio_backstop_blocker(). Verified live 2026-09-06: a non-allowlisted open()
+# returns EPERM, an allowlisted one succeeds.
 
 # --json puts one NDJSON object per event on stdout, which systemd captures.
 # The journal IS the audit store: real timestamps, rotation and retention are
