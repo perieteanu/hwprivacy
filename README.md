@@ -78,7 +78,10 @@ PipeWire represents everything as a directed graph:
 - **Application nodes**: Firefox audio streams, Telegram voice calls, etc.
 - **Links**: connections between nodes (e.g., microphone → Firefox capture)
 
-HWPrivacy monitors this graph by polling `pw-dump` every 500ms. When a new link
+HWPrivacy monitors this graph with `pw-dump --monitor`: one long-lived process
+that streams changes, rather than a spawn twice a second. A new link is seen in
+**~11 ms**, and layer 1 costs **0.033% of a core at idle** (both measured
+2026-09-01; the previous polling design cost 2.70-2.82%). When a new link
 appears connecting an application to a protected device, the daemon:
 
 1. **Identifies** the application (name, PID, stream properties) and device category
@@ -145,20 +148,23 @@ is not merely legacy.
                     PipeWire Graph
                     (nodes + links)
                          |
-                         | pw-dump (JSON polling every 500ms)
+                         | pw-dump --monitor (one long-lived process,
+                         | streaming changes; a new link is seen in ~11ms)
                          v
     +--------------------------------------------+
     |          hwprivacy-daemon (Rust)            |
     |                                            |
     |  Device Discovery   Policy Engine          |
-    |  (mic, cam, monitor) (rules + per-stream)  |
+    |  (mic, cam, monitor) (rules per category)  |
     |                                            |
     |  Link Manager        Stream Tracker        |
     |  (pw-link destroy)   (active, cooldowns)   |
     |                                            |
     |  Notification Manager (2-stage)            |
     |  1. Instant BLOCKED alert (5s auto-dismiss)|
-    |  2. Action prompt (Allow/Deny/AskEach/Use) |
+    |  2. Action prompt, stays until answered:   |
+    |     Always Allow / While in Use / Deny     |
+    |     (no While in Use on the camera)        |
     |                                            |
     |  D-Bus Service (org.hwprivacy.Daemon)      |
     +--------------------------------------------+
@@ -273,7 +279,7 @@ trying to tap the monitor source (record what you hear) are intercepted.
 The core service. Runs as a systemd user unit or via D-Bus activation.
 
 - Discovers protected devices from PipeWire graph
-- Polls graph every 500ms for new links
+- Watches the graph via `pw-dump --monitor` (streamed, ~11 ms to see a new link)
 - Enforces policy (allow/deny/ask)
 - Manages 2-stage desktop notifications
 - Exposes D-Bus API for all other components
@@ -490,13 +496,20 @@ Config file: `~/.config/hwprivacy/config.toml`
 ```toml
 [policy]
 default_action = "deny"          # unknown apps: "deny" (default) or "ask"
-poll_interval_ms = 500           # how often to read the PipeWire graph
+                                 # (poll_interval_ms was retired on 2026-09-02:
+                                 #  the graph is streamed, not polled. An old
+                                 #  config still loads; the key is ignored and
+                                 #  dropped on the next rule write.)
 dismiss_cooldown_secs = 60       # after a dismissed prompt, before asking again
 while_in_use_settle_secs = 10    # a released device stays granted this long,
                                  # covering the gap while an app reconnects
 exe_recheck_secs = 30            # re-resolve allowlisted binaries (catches a
                                  # package upgrade changing an inode)
+awaiting_open_secs = 60          # a granted session that is never opened
+                                 # expires after this
 notify_on_allow = true           # announce ALLOWED access, not only denials
+notify_allow_grace_secs = 60     # stay quiet for this long after startup
+notify_allow_cooldown_secs = 300 # per (app, device), between allow notices
 
 [devices]
 microphone = true                # guard microphones
@@ -542,13 +555,17 @@ and hand-formatting are lost — stop the daemon before editing by hand.
 
 ## What Has Been Implemented
 
+These five phases are **layer 1** (the PipeWire graph). The kernel layer has
+its own phase numbering, described under *Layer 2* above — "Phase 5" here is
+packaging; "Phase 5" there is the ALSA backstop, which has **not** started.
+
 ### Phase 1: Foundation (complete)
 
 - [x] Cargo workspace with 7 crates (common, proto, daemon, lsm, ctl, tui, gui)
 - [x] Config system (TOML, user/system paths, load/save)
 - [x] Device auto-discovery from PipeWire graph via `pw-dump`
 - [x] PipeWire graph monitoring with link diff detection
-- [x] Policy engine with 5 permission levels + per-stream gating
+- [x] Policy engine, rules per category (microphone / camera / monitor)
 - [x] Link manager (destroy unauthorized links via `pw-link`/`pw-cli`)
 - [x] Stream tracker (active connections, events, cooldowns)
 - [x] D-Bus service with full API (methods + signals)
@@ -559,9 +576,13 @@ and hand-formatting are lost — stop the daemon before editing by hand.
 ### Phase 2: Notifications (complete)
 
 - [x] 2-stage notification system (instant BLOCKED + action prompt)
-- [x] Notification actions: Always Allow, Ask Each Time, While in Use, Always Deny
-- [x] Per-stream actions: Allow Stream, Deny Stream
-- [x] Dismiss = no rule saved + 60s cooldown (prevents notification spam)
+- [x] Notification actions: Always Allow, While in Use, Always Deny.
+      `Ask Each Time` was removed on 2026-08-23 — the per-stream grant behind
+      it could never take effect. The camera offers no *While in Use*.
+- [x] Dismiss = no rule saved + a cooldown (`policy.dismiss_cooldown_secs`).
+      The prompt itself **stays until answered** — a permission question is a
+      to-do item, not a nag.
+- [x] An allowed access notifies too, not only a blocked one (`notify_allow`)
 - [x] **Tested live**: notifications appear immediately when access is blocked
 
 ### Phase 3: TUI (complete)
@@ -592,6 +613,9 @@ and hand-formatting are lost — stop the daemon before editing by hand.
       .desktop, .install files)
 - [x] Makefile with build/install/clean/deb targets
 - [x] `--help` and `--version` on all binaries
+- [ ] **Never exercised**: `make install` has never been run and no `.deb` has
+      ever been built. The `debian/` tree is complete but untested, and its
+      control descriptions are boilerplate that never mention PipeWire.
 
 ---
 
@@ -620,11 +644,14 @@ and hand-formatting are lost — stop the daemon before editing by hand.
 
 - [ ] **WirePlumber Lua policy hook** (v2): Zero-latency link interception by
       hooking into WirePlumber's linking policy. Blocks links BEFORE they are
-      created, eliminating the ~500ms race window. Architecture already supports
-      this — the policy engine is decoupled from the monitoring approach.
-- [ ] **pipewire-rs native bindings** (v2): Replace `pw-dump`/`pw-link` subprocess
-      calls with direct PipeWire library integration for better performance and
-      event-driven (not polling) monitoring.
+      created, closing the remaining race window entirely. Architecture already
+      supports this — the policy engine is decoupled from the monitoring
+      approach.
+- [ ] **pipewire-rs native bindings** (v2): replace the `pw-dump`/`pw-link`
+      subprocesses with the library. Note this is **no longer about CPU or
+      polling** — `pw-dump --monitor` already removed both. What remains is
+      registry enumeration on connect, which would also close limitation 6
+      (links that already exist at daemon start).
 - [ ] **Process path identity**: Match apps by executable path (`/usr/bin/firefox`)
       in addition to PipeWire client name, for stronger identification.
 - [ ] **XDG Portal integration**: Coordinate with the Flatpak/portal permission
@@ -651,10 +678,11 @@ and hand-formatting are lost — stop the daemon before editing by hand.
 
 ## Known Limitations
 
-1. **~500ms race window**: Between a link being created and the daemon destroying it,
-   there is a brief window where audio could flow. In practice this means a few
-   hundred milliseconds of audio might be captured before being cut. This is
-   acceptable for v1. The v2 WirePlumber hook approach eliminates this entirely.
+1. **~11 ms race window**: between a link being created and the daemon
+   destroying it, there is a brief window where audio could flow. Measured at
+   ~11 ms since the graph became a stream (2026-09-01); it was 0-500 ms under
+   the old polling design. It is not zero, and only the v2 WirePlumber hook —
+   which blocks links before they are created — eliminates it entirely.
 
 2. **Two identities, and only one is spoof-proof.** At the PipeWire layer an
    app is its self-declared `application.name`, which any app can lie about. At
@@ -789,19 +817,29 @@ Path: `/org/hwprivacy/Daemon`
 
 ### Methods
 
+Verified against `hwprivacy-daemon/src/dbus_service.rs` on 2026-09-06.
+
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `GetDevices()` | `Array<(String, String, String, Bool)>` | (category, node_name, description, guarded) |
-| `GetRules()` | `Array<(String, String, String)>` | (app_name, device, permission) |
-| `SetRule(app, device, permission)` | `Bool` | Set/update a rule |
-| `RemoveRule(app)` | `Bool` | Remove all rules for an app |
-| `GetActiveStreams()` | `Array<(String, u32, String, String, String, String, Bool)>` | (app, pid, device, node, media, perm, active) |
-| `GetStatus()` | `(Bool, u32, u32, u32, u32)` | (running, devices, rules, blocked, streams) |
-| `GetEvents(last_n)` | `Array<(String, String, String, String)>` | (timestamp, app, device, action) |
-| `BlockAll()` | `Bool` | Emergency deny-all |
-| `UnblockAll()` | `Bool` | Restore saved rules |
-| `AllowStream(serial)` | `Bool` | One-shot allow pending stream |
-| `DenyStream(serial)` | `Bool` | One-shot deny pending stream |
+| `GetDevices()` | `Array<(s, s, s, b)>` | (category, node_name, description, guarded) |
+| `GetRules()` | `Array<(s, s, s, s, s, s)>` | (app_name, microphone, camera, monitor, exe_path, gap) — one row per app, not per rule. An unset category is the empty string, which is **not** the same as `deny`: it falls through to `default_action`. |
+| `SetRule(app, device, permission)` | `b` | Set one category. Returns `false` if the name cannot become a key. |
+| `SetRuleExe(app, exe_path)` | `(b, s)` | Set the executable the kernel matches by inode. Returns (ok, message). |
+| `AllowCamera(app, exe_path)` | `(b, s)` | Atomic camera grant: writes the rule and the exe together, rolls back on a bad path. |
+| `RemoveRule(app)` | `b` | Remove all categories for an app |
+| `GetActiveStreams()` | `Array<(s, u32, s, s, s, s, b)>` | (app, pid, device, node, media, perm, active) |
+| `GetStatus()` | `(b, u32, u32, u32, u32)` | (running, devices, rules, blocked, streams) |
+| `GetKernelStatus()` | `(b, b, u32, u32, s)` | (connected, enforcing_camera, allowed_exes, unresolved, last_error) |
+| `GetSessions()` | `Array<(s, s, u32)>` | Live `while_in_use` sessions: (app, device, age_secs) |
+| `GetEvents(last_n)` | `Array<(s, s, s, s)>` | (timestamp, app, device, action) — a 500-entry in-memory ring, lost on restart |
+| `GetHistory()` | `Array<(s, s, s, u32, u32, s, s)>` | (identity, device, source, denied, allowed, first_seen, last_seen) — **survives restarts**, unlike `GetEvents` |
+| `GetPresets()` | `Array<(s, s, u32, s)>` | (name, description, entry_count, source_path) |
+| `ImportPreset(name, apply)` | `Array<(s, s, b)>` | (entry, outcome, changed). `apply = false` previews and writes nothing — a preset is a grant, so the safe outcome is the one you get by forgetting the flag. |
+| `BlockAll()` | `b` | Emergency deny-all. **Gates new access only** — see Known Limitations. |
+| `UnblockAll()` | `b` | Restore saved rules |
+
+`AllowStream` / `DenyStream` were removed on 2026-08-23 with the per-stream
+`ask_each` concept. Any older document listing them is out of date.
 
 ### Signals
 
