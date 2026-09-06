@@ -18,3 +18,4 @@ hwprivacy-lsm/src/bpf/vmlinux.h
 # python bytecode from tools/
 __pycache__/
 *.pyc
+target/openprobe
