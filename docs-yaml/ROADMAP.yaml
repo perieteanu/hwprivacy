@@ -870,8 +870,25 @@ kernel_layer:
       name, validated against known controls before being trusted. Same defect
       class as the pipeline-exit-status and pactl bugs: asserting through a
       component with its own reasons to fail.
-    still_to_do:
-      - "Reboot verification: the boot window is where the cache trap would bite, and alsactl restores mixer state before any session exists."
+    reboot_verified_2026_09_06: |
+      Boot at 20:59:05. The cache reloaded WITH permissions intact:
+        camera,audio /usr/bin/pipewire
+        camera,audio /usr/bin/wireplumber
+        audio        pipewire-pulse, amixer, alsactl, VirtualBoxVM
+        camera       /usr/lib/firefox-esr/firefox-esr
+      7 entries, minors seeded {9}, all before the daemon connected at
+      20:59:10. Denials in that 5-second window: ZERO — alsactl opened the
+      capture device 21 times, wireplumber 796, pipewire 141, none denied.
+      After boot: audio healthy (3 sources, PipeWire 1.4.2) and a
+      non-allowlisted open() still returns EPERM. NRestarts 0.
+    why_that_window_was_the_risk: >
+      Under the old bare-path cache format every entry would have reloaded as
+      camera-only, so the audio server would have been denied the microphone
+      from boot until the user session pushed config.toml — and alsactl, which
+      restores mixer state before any session exists, would have been denied
+      outright. The perms-carrying format is what makes the boot path safe, and
+      only a reboot could prove it.
+    still_to_do: []
     original_note: "AGREED IN PRINCIPLE 2026-08-05, not started. Comes after Phase 3."
     question_asked: "Should exe_path also gate the microphone at the kernel layer?"
     answer: >
