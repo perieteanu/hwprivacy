@@ -22,3 +22,17 @@ target/openprobe
 
 # Stray ImageMagick dump, committed by accident 2026-09-01 (187 MB).
 sys
+
+# Internal working files — kept locally, not published.
+#
+# These are the working surface between Costin and Claude, not product docs:
+# CLAUDE.md and HANDOFF.md are session state, claude-memory.md is an
+# auto-generated mirror of what Claude remembers, LOG.md is an append-only
+# record of when work happened, and the .code-workspace carries local paths.
+# Excluded on publication 2026-09-06. The docs-yaml/ ADRs stay published —
+# they are engineering documentation and stand on their own.
+CLAUDE.md
+HANDOFF.md
+LOG.md
+hwprivacy.code-workspace
+docs-yaml/claude-memory.md
