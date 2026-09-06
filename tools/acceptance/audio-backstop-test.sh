@@ -144,14 +144,19 @@ fi
 echo
 
 echo "[3] NON-INTERFERENCE — is the audio stack still alive?"
-if sudo -u perieteanu pactl info >/dev/null 2>&1; then
+# pactl talks to the user's session bus, so it needs XDG_RUNTIME_DIR. Without
+# it `sudo -u` finds no socket and reports failure even though audio is
+# perfectly healthy — a FALSE FAIL that made the 2026-09-06 20:37 run look like
+# the backstop had broken sound. The instrument was wrong, not the product.
+PA="sudo -u perieteanu XDG_RUNTIME_DIR=/run/user/1000"
+if $PA pactl info >/dev/null 2>&1; then
   echo "      PipeWire/pulse responds: PASS"
   VERDICT_AUDIO="PASS"
 else
   echo "      *** PipeWire/pulse does NOT respond — audio may be broken: FAIL ***"
   VERDICT_AUDIO="FAIL"
 fi
-sudo -u perieteanu pactl list short sources 2>/dev/null | sed 's/^/      /' | head -4
+$PA pactl list short sources 2>/dev/null | sed 's/^/      /' | head -4
 echo
 
 kill $HELPER 2>/dev/null || true

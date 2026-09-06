@@ -374,6 +374,15 @@ fn main() -> Result<()> {
         dump_policy_map(&skel.maps.policy, &pol)?;
     }
 
+    // Seed the capture-minor set BEFORE attaching, exactly as the policy and
+    // config maps are. An empty minors map gates nothing, so seeding after
+    // attach leaves a window in which the backstop is live and blind — and a
+    // blind backstop is indistinguishable from a working one, which is the
+    // failure mode this project keeps paying for.
+    let index = Arc::new(Mutex::new(DeviceIndex::new()));
+    push_capture_minors(&skel.maps.capture_minors, &index)
+        .context("failed to seed the ALSA capture minors")?;
+
     skel.attach()
         .context("failed to attach the LSM programs (file_open, file_release)")?;
 
@@ -430,14 +439,7 @@ fn main() -> Result<()> {
     }
 
     let reported = Arc::new(AtomicU64::new(0));
-    let index = Arc::new(Mutex::new(DeviceIndex::new()));
 
-    // Seed the capture-minor set now, not on the first SetPolicy. A helper
-    // started with --enforce-audio and no daemon (the boot window, or a
-    // standalone run) must gate from the start; an empty map gates nothing and
-    // would look exactly like a working backstop.
-    push_capture_minors(&skel.maps.capture_minors, &index)
-        .context("failed to seed the ALSA capture minors")?;
     // (exe_dev, exe_ino) -> path, so a burst summary can name the binary even
     // after the process has exited.
     let seen_exe: Arc<Mutex<HashMap<(u32, u64), String>>> = Arc::new(Mutex::new(HashMap::new()));
