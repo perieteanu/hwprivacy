@@ -797,12 +797,32 @@ impl Config {
     pub fn audio_backstop_blocker(&self) -> Option<String> {
         if self.kernel_audio_allowlist().is_empty() {
             return Some(
-                "no executable is allowed to open a capture device — enforcing                  would deny the audio server itself and stop ALL microphone                  access. Import the audio-backstop preset."
+                "no executable is allowed to open a capture device — \
+                 enforcing would deny the audio server itself and stop ALL \
+                 microphone access. Import the audio-backstop preset: \
+                 hwprivacy-ctl preset import audio-backstop --apply"
                     .to_string(),
             );
         }
         // The server specifically. A list of only, say, VirtualBox would pass
         // the emptiness check above and still take out every desktop app.
+        //
+        // KNOWN LIMITATION — this list is PipeWire-shaped.
+        //
+        // These three names are what a Debian 13 desktop runs, and they are the
+        // only stacks this has been measured against. A machine whose audio
+        // server is something else — bare ALSA with no server at all, JACK,
+        // PulseAudio on an older distribution, or a sandboxed server at a path
+        // that does not end in one of these names — will be told the backstop
+        // cannot be enforced even after its server IS correctly allowlisted.
+        //
+        // The failure is safe (enforcement stays off and the journal says why)
+        // but it is wrong, and the fix is to widen this list rather than to
+        // work around it. Deliberately not generalised on 2026-09-06: guessing
+        // at "is this process an audio server" from a path is exactly the kind
+        // of fuzzy matching that made `normalize_app_name` a hazard, and no
+        // second stack has been available to test against. Widen it when a real
+        // one appears, with that machine's measurement in hand.
         let has_server = self
             .kernel_audio_allowlist()
             .iter()
@@ -812,7 +832,13 @@ impl Config {
             });
         if !has_server {
             return Some(
-                "the audio server (pipewire/wireplumber) is not in the capture                  allowlist — enforcing would deny every application's microphone,                  because the server is what opens /dev/snd on their behalf"
+                "the audio server (pipewire / wireplumber / pipewire-pulse) is \
+                 not in the capture allowlist — enforcing would deny EVERY \
+                 application's microphone, because the server is what opens \
+                 /dev/snd on their behalf. If this machine runs a different \
+                 audio server (JACK, PulseAudio, bare ALSA), hwprivacy does \
+                 not recognise it yet — see audio_backstop_blocker() in \
+                 hwprivacy-common/src/config.rs"
                     .to_string(),
             );
         }

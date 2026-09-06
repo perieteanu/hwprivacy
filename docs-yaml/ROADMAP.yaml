@@ -332,6 +332,11 @@ security_gaps:
 
   g6_alsa_bypass:
     severity: "high — microphone protection covers the common path, not the threat"
+    status_2026_09_06: >
+      A kernel backstop is BUILT and gated OFF (see kernel_layer >
+      phase_5_audio_backstop). g6 is not closed until the live acceptance test
+      shows ffmpeg denied AND the audio stack still working. Until then this
+      gap stands exactly as written below."
     discovered: "2026-08-04, same method"
     what: "Opening the mic directly via ALSA (hw:0,0 -> /dev/snd/pcmC0D0c) is equally invisible."
     evidence: |
@@ -788,7 +793,68 @@ kernel_layer:
       - "Do not invent a log format before checking what journalctl -o json already gives."
 
   phase_5_audio_backstop:
-    status: "AGREED IN PRINCIPLE 2026-08-05, not started. Comes after Phase 3."
+    status: >
+      BUILT 2026-09-06, enforcement OFF pending live acceptance. The
+      observe-only pass required here ran first and shaped the design.
+    observe_only_census_2026_09_06:
+      method: >
+        30 days of the helper's own journal. Every AUDIO record is already
+        filtered to role.is_capture(), so everything logged IS a capture open —
+        but they are all burst_summary records, which carry no device field, so
+        the census is authoritative for WHICH EXECUTABLES and cannot break down
+        by minor.
+      consumers: |
+        27064  /usr/bin/wireplumber
+        10549  /usr/bin/pipewire
+         7032  /usr/lib/virtualbox/VirtualBoxVM   <- a real direct-ALSA app
+          692  /usr/sbin/alsactl
+            9  /usr/bin/amixer
+      what_it_changed: >
+        VirtualBoxVM is exactly the "direct-ALSA application" this entry's own
+        risk note warned about, found live rather than hypothesised. It is
+        allowlisted in the shipped preset; denying it would be a self-inflicted
+        regression discovered mid-VM-call.
+      hardware_here: "one capture node (pcmC0D0c, minor 9) against five playback nodes"
+    what_was_built:
+      - "capture_minors BPF map + an ALSA arm in the verdict, gating on (capture minor) AND (exe not allowlisted). Never on the major."
+      - "struct config's _pad slot became enforce_audio; config_bytes() is now the single writer and a test pins the 16-byte layout."
+      - "Config::kernel_audio_allowlist() — Allow only. while_in_use deliberately does NOT reach the kernel."
+      - "PolicyEntry already carried per-entry perms, so the allowlist needed no protocol change; only the enforce flag did, with serde(default)."
+      - "hwprivacy-lsm --enforce-audio, defaulting off."
+    three_traps_found:
+      cache_format: >
+        The policy cache was bare paths with perms hardcoded to PERM_CAMERA on
+        reload, so every audio grant would silently degrade to camera-only at
+        the next boot — and with the backstop on, that denies the AUDIO SERVER
+        the microphone for the whole boot window. The format now carries perms;
+        a bare path still parses as camera so an existing cache keeps working.
+      fingerprint_discarded_perms: >
+        PolicyFingerprint mapped each entry to (path, stat_identity) only. A
+        binary moving between the camera and audio lists keeps its path and
+        inode, so the fingerprint compared EQUAL and the change was never
+        pushed — the 2026-08-20 sixteen-hour silent failure in a new hat. A
+        doc-check sentinel now refuses the old expression.
+      the_preset_makes_the_default_dangerous: >
+        NOT predicted by the plan. desktop-baseline sets microphone = "deny" for
+        pipewire and wireplumber (correct for layer 1), and an import never
+        modifies an existing rule — so the default path into this feature is a
+        config where enforcing kills all audio. audio_backstop_blocker() is a
+        hard interlock: enforcement stays off unless the audio server is
+        actually allowlisted, and the journal says why.
+    known_limitation_the_interlock_is_pipewire_shaped: >
+      The interlock recognises exactly pipewire / wireplumber / pipewire-pulse.
+      A machine running JACK, PulseAudio, or bare ALSA will be refused
+      enforcement even after its own server is allowlisted. Safe (it fails to
+      OFF and logs) but wrong. Deliberately not generalised 2026-09-06: no
+      second stack was available to measure, and guessing which binaries look
+      like an audio server is the fuzzy matching that made normalize_app_name a
+      hazard. Widen audio_backstop_blocker() when a real one appears.
+      Documented in README limitation 2, the preset header, and the code.
+    still_to_do:
+      - "Run ~/projects/claude-run/hwprivacy-audio-backstop-test-20260906.sh — must show ffmpeg denied AND the audio stack alive."
+      - "Then apply the audio-backstop preset and turn devices.microphone on for real."
+      - "Reboot verification: the boot window is where the cache trap would bite."
+    original_note: "AGREED IN PRINCIPLE 2026-08-05, not started. Comes after Phase 3."
     question_asked: "Should exe_path also gate the microphone at the kernel layer?"
     answer: >
       Yes, but NOT as per-app mic policy — that is impossible here and saying

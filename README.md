@@ -96,8 +96,8 @@ that streams changes, rather than a spawn twice a second. A new link is seen in
 appears connecting an application to a protected device, the daemon:
 
 1. **Identifies** the application (name, PID, stream properties) and device category
-3. **Checks** the rules database for a matching policy
-4. **Enforces** the decision: allow the link, destroy it, or prompt the user
+4. **Checks** the rules database for a matching policy
+5. **Enforces** the decision: allow the link, destroy it, or prompt the user
 
 For **playback monitor protection**, the daemon detects a specific PipeWire pattern:
 when an `Audio/Sink` node appears as the **output** side of a link to a
@@ -789,58 +789,95 @@ packaging; "Phase 5" there is the ALSA backstop, which has **not** started.
    `ffmpeg -f alsa -i hw:0,0 -t 3` captured three seconds of real audio with
    **zero** events logged.
 
-   This is the project's largest open hole. The fix is a kernel backstop that
-   restricts capture devices to the audio server (planned; not started), and
-   until it lands **the microphone is guarded on the PipeWire path only** —
-   which covers ordinary desktop applications, not an adversary. The camera
-   does not have this gap: it is enforced in the kernel by executable inode.
+   A kernel backstop that restricts ALSA **capture** nodes to an allowlist of
+   executables is now built (`--enforce-audio`), but **it ships switched off
+   and has not yet been accepted against live hardware**. Until that test
+   passes, treat the microphone as guarded on the PipeWire path only — which
+   covers ordinary desktop applications, not an adversary. The camera does not
+   have this gap: it is enforced in the kernel by executable inode.
 
-2. **~11 ms race window**: between a link being created and the daemon
+   The backstop gates on the capture **minor**, never on ALSA's major number:
+   denying major 116 would deny `/usr/bin/pipewire` and stop every
+   application's microphone. Playback, control, sequencer and timer nodes are
+   never touched.
+
+   It is a backstop, **not per-application microphone policy**, and it cannot
+   be — `/dev/snd` is opened by the audio server on every application's behalf,
+   so the kernel sees the server, not the app behind it. Per-application
+   microphone identity exists only in layer 1.
+
+   **Enabling it requires allowlisting your audio server**, or the first thing
+   denied is the server itself:
+
+   ```bash
+   hwprivacy-ctl preset import audio-backstop --apply
+   ```
+
+   hwprivacy refuses to enforce until it sees a recognised audio server in that
+   allowlist, and logs the reason — see limitation 2.
+
+2. **The audio backstop only recognises a PipeWire stack.** Before enforcing,
+   hwprivacy checks that an audio server is actually in the capture allowlist —
+   a safety interlock, because enforcing without one denies every microphone on
+   the machine at once. That check recognises exactly three names: `pipewire`,
+   `wireplumber` and `pipewire-pulse`.
+
+   On a machine running JACK, PulseAudio, or bare ALSA with no server, adding
+   your own server to the allowlist is **not** enough: the interlock still
+   refuses and the backstop stays off. The failure is safe and it is logged,
+   but it is a real limitation, not a misconfiguration. Widening it is a
+   one-line change in `audio_backstop_blocker()`
+   (`hwprivacy-common/src/config.rs`), deliberately left undone until it can be
+   measured against a real non-PipeWire stack — guessing which binaries look
+   like an audio server is the kind of fuzzy matching this project has already
+   been bitten by.
+
+3. **~11 ms race window**: between a link being created and the daemon
    destroying it, there is a brief window where audio could flow. Measured at
    ~11 ms since the graph became a stream (2026-09-01); it was 0-500 ms under
    the old polling design. It is not zero, and only the v2 WirePlumber hook —
    which blocks links before they are created — eliminates it entirely.
 
-3. **Two identities, and only one is spoof-proof.** At the PipeWire layer an
+4. **Two identities, and only one is spoof-proof.** At the PipeWire layer an
    app is its self-declared `application.name`, which any app can lie about. At
    the kernel layer it is the executable's inode, which it cannot. A rule
    carries both: `app_name` for layer 1, `exe_path` for layer 2. A camera rule
    with no `exe_path` grants nothing to a V4L2 application, whatever name you
    typed.
 
-4. **The executable is the principal.** Allowing `firefox` allows every website
+5. **The executable is the principal.** Allowing `firefox` allows every website
    that has ever obtained a grant inside Firefox. hwprivacy cannot see which
    site asked, and does not gate per tab — per-stream grants were removed in
    2026-08 because the deny path destroys a link the allow path cannot recreate
    (`d-no-per-stream-grants`).
 
-5. **Debian Rust 1.85 constraints**: Several crate versions are pinned to older
+6. **Debian Rust 1.85 constraints**: Several crate versions are pinned to older
    releases for MSRV compatibility. This will resolve as Debian ships newer Rust.
 
-6. **GTK4 on KDE**: GTK4 apps work on KDE but use GTK theming, not native Qt/KDE
+7. **GTK4 on KDE**: GTK4 apps work on KDE but use GTK theming, not native Qt/KDE
    look. For a fully native KDE experience, a Qt frontend would be needed.
 
-7. **Kernel enforcement cannot revoke an already-open fd.** The LSM hook fires
+8. **Kernel enforcement cannot revoke an already-open fd.** The LSM hook fires
    on `open()`, not on `read()`. An application that opened the camera *before*
    a deny rule took effect keeps its descriptor and keeps receiving video. This
    was observed live. Closing it would mean hooking `security_file_permission`
    (intercepting every read) or revoking on policy change — a design step, not
    a patch.
 
-8. **Links that already exist when the daemon starts are never evaluated.**
+9. **Links that already exist when the daemon starts are never evaluated.**
    They are seeded into `known_link_ids` and grandfathered in. Starting the
    daemon does not stop an in-progress capture.
 
-9. **`BlockAll()` does not stop anything already recording.** It blocks *new*
+10. **`BlockAll()` does not stop anything already recording.** It blocks *new*
    links. An active stream survives it.
 
-10. **The BPF program is never pinned.** `hwprivacy-lsm` *is* a boot-time
+11. **The BPF program is never pinned.** `hwprivacy-lsm` *is* a boot-time
    systemd service (`hwprivacy-lsm.service`, enabled, started before the user
    daemon, enforcing from `/var/lib/hwprivacy/policy`), so the kernel layer is
    active at rest. But the program is not pinned to `/sys/fs/bpf`, so stopping
    the service detaches it and restores normal access.
 
-11. **A process running as your user can just stop the daemon.** `systemctl
+12. **A process running as your user can just stop the daemon.** `systemctl
     --user stop hwprivacy` needs no privileges you do not already have. The
     honest framing is "prevents accidental capture and gives visibility", not
     "enforces permissions against an adversary".
@@ -1042,7 +1079,7 @@ history, which is why this is a rule and not an aspiration.
 | 2 — camera enforcement | **5/5**, denied live against Firefox and WhatsApp, access restored on detach |
 | 3 — daemon integration | **13/13**. C5 (burst counting) and D1 both closed 2026-08-19 |
 | 4 — systemd unit for the helper | installed, enabled, boot-verified |
-| 5 — ALSA audio backstop | **not started** — see limitation 1 |
+| 5 — ALSA audio backstop | built, ships OFF; **live acceptance not yet run** — see limitation 1 |
 | 5 — audio backstop | not started |
 
 ---

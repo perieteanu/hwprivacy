@@ -32,6 +32,23 @@
 # VirtualBox is here because it genuinely opens capture devices directly. Left
 # out, a VM loses its microphone and the failure surfaces mid-call. If you do
 # not run VirtualBox, remove that entry — every line here is a grant.
+#
+# IF YOUR MACHINE DOES NOT RUN PIPEWIRE
+#
+# hwprivacy refuses to enforce the backstop unless it can see an audio server in
+# the allowlist, and it currently recognises exactly three names: `pipewire`,
+# `wireplumber` and `pipewire-pulse`. That check is a safety interlock — with no
+# server allowed, the first thing denied is the server, and every microphone on
+# the machine stops at once.
+#
+# On a machine running JACK, PulseAudio, or bare ALSA with no server, adding your
+# server here is NOT enough: the interlock will still refuse, the journal will
+# say so, and enforcement stays off. That is a recognised limitation rather than
+# a misconfiguration on your part. Widening it is a one-line change in
+# `audio_backstop_blocker()` in hwprivacy-common/src/config.rs, deliberately left
+# undone until someone can measure it against a real non-PipeWire stack — the
+# alternative, guessing which binaries "look like" an audio server, is the kind
+# of fuzzy matching this project has already been bitten by.
 
 name = "audio-backstop"
 description = "Binaries allowed to open an ALSA capture device directly — the audio stack, plus measured direct-ALSA applications"
