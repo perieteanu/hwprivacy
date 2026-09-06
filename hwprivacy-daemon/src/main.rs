@@ -389,16 +389,19 @@ async fn monitoring_loop(state: SharedState) {
         }
     });
 
-    // Backoff and watchdog are deliberately not config knobs. They govern
-    // recovery from a broken monitor, not policy, and a user who tunes them
-    // wrong makes the daemon blind rather than merely slow.
+    // Backoff is deliberately not a config knob. It governs recovery from a
+    // broken monitor, not policy, and a user who tunes it wrong makes the
+    // daemon blind rather than merely slow.
+    //
+    // There is no watchdog. One existed until 2026-09-06 and fired 308 times
+    // in 8 hours on a healthy system, because silence from `pw-dump --monitor`
+    // is the normal idle state, not a wedge. See `run_monitor`.
     let backoff = std::time::Duration::from_secs(2);
-    let watchdog = std::time::Duration::from_secs(90);
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<pipewire_monitor::GraphUpdate>();
 
     tokio::spawn(async move {
-        pipewire_monitor::run_monitor(backoff, watchdog, move |update| {
+        pipewire_monitor::run_monitor(backoff, move |update| {
             // A closed receiver means the daemon is going away; nothing to do.
             let _ = tx.send(update);
         })

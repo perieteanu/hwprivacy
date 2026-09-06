@@ -703,14 +703,18 @@ pub struct GraphUpdate {
 ///   the life of the daemon, so it terminating is always worth a log line.
 /// * **Respawn re-seeds, never merges.** `GraphState::clear()` first — see its
 ///   doc comment for why a merged graph is blocker b2 waiting to happen.
-/// * **Silence is not health.** If no block arrives within `watchdog`, the
-///   child is killed and respawned even though it is alive. A wedged reader and
-///   a quiet system look identical from here.
-pub async fn run_monitor<F>(
-    backoff: std::time::Duration,
-    watchdog: std::time::Duration,
-    mut on_update: F,
-) where
+/// * **Silence IS health.** There is deliberately no read timeout. A watchdog
+///   here fired 308 times in 8 hours on a working system (2026-09-06): on an
+///   idle desktop `pw-dump --monitor` emits its seed burst and then says
+///   nothing at all — an 83.7 s gap was measured directly, and a quieter
+///   machine exceeds any bound worth setting. Killing a healthy child on a
+///   timer is not free: a respawn re-seeds, and a re-seed re-reports every
+///   existing link as new (see `apply_block`), so a periodic watchdog turns
+///   every live mic or monitor link into a fresh access on a timer. EOF and a
+///   read error already cover the failure this supervisor exists for — a dead
+///   child cannot stay silent, it closes the pipe.
+pub async fn run_monitor<F>(backoff: std::time::Duration, mut on_update: F)
+where
     F: FnMut(GraphUpdate),
 {
     use tokio::io::{AsyncBufReadExt, BufReader};
@@ -749,21 +753,10 @@ pub async fn run_monitor<F>(
 
         loop {
             line.clear();
-            let read = tokio::time::timeout(watchdog, reader.read_line(&mut line)).await;
+            let read = reader.read_line(&mut line).await;
 
             match read {
-                // Watchdog. The child may be perfectly alive and simply not
-                // talking, which is exactly the case a liveness check misses.
-                Err(_elapsed) => {
-                    warn!(
-                        "No PipeWire graph update for {:?} — restarting the monitor. \
-                         Silence and health are not distinguishable here.",
-                        watchdog
-                    );
-                    let _ = child.kill().await;
-                    break;
-                }
-                Ok(Ok(0)) => {
+                Ok(0) => {
                     // EOF. THE case this supervisor exists for.
                     let status = child.wait().await;
                     warn!(
@@ -774,12 +767,12 @@ pub async fn run_monitor<F>(
                     );
                     break;
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     warn!("Error reading from `pw-dump --monitor`: {e}. Re-seeding.");
                     let _ = child.kill().await;
                     break;
                 }
-                Ok(Ok(_)) => {}
+                Ok(_) => {}
             }
 
             for objects in splitter.feed(&line) {
@@ -892,5 +885,67 @@ mod splitter_tests {
         let out = s.feed(r#"[{"id":1,"permissions":["r","x","m"],"info":{"c":[1,2]}}]"#);
         assert_eq!(out.len(), 1, "inner arrays are not block boundaries");
         assert_eq!(out[0][0]["id"], 1);
+    }
+}
+
+#[cfg(test)]
+mod respawn_tests {
+    use super::*;
+
+    /// Why this test exists, and why it is not a test of a timeout.
+    ///
+    /// A watchdog on the read killed a HEALTHY `pw-dump --monitor` every 90 s
+    /// (308 times in 8 hours, 2026-09-06) because silence from that stream is
+    /// the normal idle state. The log noise was the symptom; THIS is the harm,
+    /// and it is what must never come back.
+    ///
+    /// A respawn starts a fresh `GraphState` — deliberately, because merging
+    /// across a PipeWire restart is blocker b2 waiting to happen. The cost of
+    /// that correct choice is that every link present after a re-seed is
+    /// reported as new, and `main.rs` feeds exactly those to
+    /// `classify_link()`. So a re-seed is a re-enforcement of the entire
+    /// graph. That is tolerable when it happens on a real PipeWire restart;
+    /// on a 90-second timer it turned every live mic or monitor link into a
+    /// fresh access, forever.
+    ///
+    /// This pins the multiplier. If a future change makes a re-seed cheap to
+    /// trigger again, the blast radius is measured here rather than
+    /// rediscovered in a journal.
+    #[test]
+    fn a_reseed_reports_every_existing_link_as_new() {
+        let block = serde_json::json!([
+            {"id": 10, "type": "PipeWire:Interface:Link",
+             "info": {"output-node-id": 1, "output-port-id": 2,
+                      "input-node-id": 3, "input-port-id": 4}},
+            {"id": 11, "type": "PipeWire:Interface:Link",
+             "info": {"output-node-id": 5, "output-port-id": 6,
+                      "input-node-id": 7, "input-port-id": 8}},
+        ]);
+        let objects = block.as_array().unwrap().clone();
+
+        let mut graph = GraphState::new();
+        let first = graph.apply_block(&objects);
+        assert_eq!(first.len(), 2, "the seed reports both links as new");
+
+        // Same block again on the SAME state: a link already known is an
+        // update, never a new access. This is what stops a chatty stream from
+        // re-prompting.
+        let repeat = graph.apply_block(&objects);
+        assert!(
+            repeat.is_empty(),
+            "a known link must not be re-reported as new: {repeat:?}"
+        );
+
+        // A respawn. `run_monitor` builds a fresh GraphState per child, so
+        // this is exactly what a restart does to link identity.
+        let mut after_respawn = GraphState::new();
+        let reseeded = after_respawn.apply_block(&objects);
+        assert_eq!(
+            reseeded.len(),
+            2,
+            "a re-seed re-reports EVERY existing link as new — so a re-seed \
+             must never be triggered on a timer, only by the stream actually \
+             ending. See run_monitor: there is no read timeout."
+        );
     }
 }
