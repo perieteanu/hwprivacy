@@ -33,6 +33,10 @@ Built for Debian 13 (Trixie) with PipeWire/WirePlumber. Works on KDE Plasma and 
 - [What Has Been Implemented](#what-has-been-implemented)
 - [What Remains To Be Done](#what-remains-to-be-done)
 - [Known Limitations](#known-limitations)
+- [Project Structure](#project-structure)
+- [D-Bus API Reference](#d-bus-api-reference)
+- [Testing Summary](#testing-summary)
+- [Credits](#credits)
 - [License](#license)
 
 ---
@@ -48,8 +52,15 @@ or even record what you're listening to — all without your knowledge or consen
 Flatpak/Snap apps have sandboxed permissions via XDG Portals, but native .deb-installed
 applications (Firefox, Telegram, Chromium, etc.) bypass all of this.
 
-HWPrivacy fills this gap by operating at the **PipeWire graph level**, intercepting
-and enforcing access policies for all applications regardless of packaging format.
+HWPrivacy fills this gap with two enforcement layers: the **PipeWire graph**,
+which knows *which application* is asking, and an **eBPF LSM in the kernel**,
+which sees an `open()` of a device node whatever the application talks to.
+
+**Read the coverage honestly before relying on it.** The camera is enforced in
+the kernel and holds against a browser using V4L2 directly. The **microphone is
+not**: an application that opens ALSA directly bypasses hwprivacy entirely
+(limitation 1 below, measured). The playback monitor is guarded at the PipeWire
+layer, which is the correct layer for it.
 
 ---
 
@@ -85,8 +96,8 @@ that streams changes, rather than a spawn twice a second. A new link is seen in
 appears connecting an application to a protected device, the daemon:
 
 1. **Identifies** the application (name, PID, stream properties) and device category
-2. **Checks** the rules database for a matching policy
-3. **Enforces** the decision: allow the link, destroy it, or prompt the user
+3. **Checks** the rules database for a matching policy
+4. **Enforces** the decision: allow the link, destroy it, or prompt the user
 
 For **playback monitor protection**, the daemon detects a specific PipeWire pattern:
 when an `Audio/Sink` node appears as the **output** side of a link to a
@@ -295,6 +306,31 @@ hwprivacy-daemon uninstall    # remove service files
 hwprivacy-daemon service-status  # show systemd status
 ```
 
+### hwprivacy-lsm
+
+The kernel layer. **Runs as root**, as the system service
+`hwprivacy-lsm.service` (enabled, started at boot, before the user daemon).
+
+- Attaches two eBPF programs: `lsm/file_open` (the verdict) and
+  `lsm/file_release` (observes a device being released)
+- Matches the **executable's inode**, which an application cannot spoof
+- Denies a non-allowlisted camera `open()` with `EPERM`
+- Enforces from `/var/lib/hwprivacy/policy` before any user logs in, and takes
+  live policy from the daemon over `/run/hwprivacy/lsm.sock` (0660,
+  group `hwprivacy`)
+- Audio is **observe-only** — see limitation 1
+
+```
+hwprivacy-lsm --summarize            # observe only, per-consumer table
+hwprivacy-lsm --enforce              # deny non-allowlisted camera opens
+hwprivacy-lsm --dump-policy          # read the policy map back OUT of the
+                                     # kernel, beside what userspace intended
+hwprivacy-lsm --json                 # NDJSON, one object per event
+```
+
+Measured cost: **+13.75 ns per `open()`** (95% CI `[+7.3, +20.2]`, 1.88% of a
+733 ns `open()`) and **0% at idle** — the hook bills per syscall, not per second.
+
 ### hwprivacy-ctl
 
 Command-line interface for all operations.
@@ -304,10 +340,16 @@ hwprivacy-ctl status                          # daemon status summary
 hwprivacy-ctl devices                         # list discovered devices
 hwprivacy-ctl rules list                      # show all rules
 hwprivacy-ctl rules set firefox mic while_in_use   # set a rule
+hwprivacy-ctl rules allow-camera <path> --as <rule>  # camera needs the BINARY
+hwprivacy-ctl rules denied-cameras            # what the kernel has denied,
+                                              # with the path to allow
 hwprivacy-ctl rules remove firefox            # remove all rules for app
 hwprivacy-ctl streams                         # show active streams
 hwprivacy-ctl streams --app firefox           # filter by app
-hwprivacy-ctl log --last 20                   # recent events
+hwprivacy-ctl log --last 20                   # recent events (in-memory ring)
+hwprivacy-ctl history                         # survives restarts
+hwprivacy-ctl preset list                     # importable rule sets
+hwprivacy-ctl preset import <name> --apply    # preview is the default
 hwprivacy-ctl block-all                       # emergency: deny everything
 hwprivacy-ctl unblock-all                     # restore saved rules
 ```
@@ -345,7 +387,8 @@ GTK4 graphical interface with system tray integration.
 | Choice | What | Why |
 |--------|------|-----|
 | **Rust** | All components | Memory-safe, async (tokio), no GC pauses, close to hardware, single-binary deployment |
-| **PipeWire CLI tools** (`pw-dump`, `pw-link`) | Graph monitoring and link management | Works with Debian's Rust 1.85 (avoids pipewire-rs C binding issues). Upgrade path to native pipewire-rs in v2 |
+| **PipeWire CLI tools** (`pw-dump --monitor`, `pw-link`) | Graph monitoring and link management | `--monitor` streams changes from one long-lived process. Its wire format is already the shape the daemon wants — block 0 is a full snapshot, later blocks carry only changes, a removal is the object with `"info": null` — so the existing parsers are reused unchanged. **Not** an MSRV workaround: `librust-pipewire-dev 0.8.0-7` *is* in Debian 13, and that objection (recorded for months) was obsolete |
+| **eBPF LSM** (`libbpf-rs` 0.27, C programs via clang) | Kernel enforcement | The only layer that sees an application taking the camera through V4L2 directly, which is how Firefox and Chrome do it. Costs +13.75 ns per `open()` and nothing at idle |
 | **zbus v4** | D-Bus IPC | Standard Linux IPC, enables D-Bus activation. v4 chosen over v5 for Rust 1.85 MSRV compatibility |
 | **TOML** | Config/rules storage | Human-readable, easy to hand-edit, standard in Rust ecosystem |
 | **notify-rust v4.11** | Desktop notifications | Freedesktop notifications with action buttons. Pinned to 4.11 (last version using zbus v4) |
@@ -371,24 +414,41 @@ Debian 13 ships Rust 1.85.0. Several crates require newer Rust:
 ### Prerequisites
 
 ```bash
+# userspace
 sudo apt install -y rustc cargo libgtk-4-dev pkg-config libdbus-1-dev
+
+# the kernel layer additionally needs the eBPF toolchain
+sudo apt install -y clang libbpf-dev bpftool
 ```
+
+`hwprivacy-lsm` is a workspace member, so **`cargo build --workspace` fails
+without the eBPF toolchain** — including for the daemon. It also needs a
+generated `src/bpf/vmlinux.h`; `build.rs` says so explicitly if it is missing.
+
+Runtime requirements for the kernel layer: a kernel with BPF LSM enabled
+(`CONFIG_BPF_LSM=y` and `bpf` present in `/sys/kernel/security/lsm`) and root
+to attach. Developed against Debian 13's 6.12 kernel.
 
 ### Build
 
 ```bash
-cd ~/hwprivacy
-cargo build --release --workspace
+cd hwprivacy
+cargo build --release --workspace     # or: make build
 ```
 
 ### Binaries
 
+Five, sizes as built on Debian 13 (2026-09-06):
+
 ```
-target/release/hwprivacy-daemon   # 6.9 MB
-target/release/hwprivacy-ctl      # 5.0 MB
-target/release/hwprivacy-tui      # 4.9 MB
-target/release/hwprivacy-gui      # 4.5 MB
+target/release/hwprivacy-daemon   # 8.8 MB   layer 1 enforcer + policy owner
+target/release/hwprivacy-lsm      # 2.3 MB   layer 2, runs as root
+target/release/hwprivacy-ctl      # 5.5 MB   CLI
+target/release/hwprivacy-tui      # 5.6 MB   ratatui TUI
+target/release/hwprivacy-gui      # 6.2 MB   GTK4 + tray
 ```
+
+The three frontends are pure D-Bus viewers with no authority of their own.
 
 ---
 
@@ -414,6 +474,34 @@ This installs:
 
 The daemon starts immediately and will auto-start on every login.
 
+**This installs layer 1 only.** The camera is not protected against a V4L2
+application until the kernel helper is installed too — see below.
+
+### The kernel layer (layer 2)
+
+Deliberately a separate, opt-in step: `hwprivacy-lsm` runs as **root** and
+denies the camera by default, so pulling it in silently would change the
+machine's behaviour in a way nobody asked for. It is also the only component
+with a kernel requirement (`CONFIG_BPF_LSM=y`, `CONFIG_DEBUG_INFO_BTF=y`, and
+`bpf` present in `/sys/kernel/security/lsm`).
+
+```bash
+sudo make install-lsm
+```
+
+Then the steps it cannot do for you:
+
+```bash
+sudo addgroup --system hwprivacy
+sudo adduser $USER hwprivacy          # to push policy to the kernel
+sudo adduser $USER systemd-journal    # to READ the audit trail
+sudo install -d -m 0755 /var/lib/hwprivacy
+sudo systemctl daemon-reload && sudo systemctl enable --now hwprivacy-lsm
+```
+
+Log out and back in for the group changes to take effect. Stopping the service
+restores camera access immediately — the BPF program is never pinned.
+
 ### Uninstall
 
 ```bash
@@ -431,7 +519,12 @@ sudo apt install -y debhelper
 dpkg-buildpackage -us -uc -b
 ```
 
-Produces 4 packages: `hwprivacy-daemon`, `hwprivacy-ctl`, `hwprivacy-tui`, `hwprivacy-gui`.
+Produces 5 packages: `hwprivacy-daemon`, `hwprivacy-lsm`, `hwprivacy-ctl`,
+`hwprivacy-tui`, `hwprivacy-gui`.
+
+**Never exercised.** `dpkg-buildpackage` has never been run against this tree
+and no `.deb` has ever been produced, so treat this as untested. The `control`
+descriptions are also boilerplate that never mention PipeWire.
 
 ---
 
@@ -446,7 +539,8 @@ hwprivacy-ctl status
 ### Set rules for common apps
 
 ```bash
-# Browsers: ask for every new stream (per-tab security)
+# Browsers. Note the executable is the principal: this grants every site
+# that ever obtains a grant inside Firefox, not one tab.
 hwprivacy-ctl rules set firefox mic while_in_use
 # The camera needs the BINARY, because the kernel matches by inode:
 hwprivacy-ctl rules allow-camera /usr/lib/firefox-esr/firefox-esr --as firefox
@@ -455,7 +549,8 @@ hwprivacy-ctl rules denied-cameras
 
 # Messaging: allow while app is running
 hwprivacy-ctl rules set telegram-desktop mic while_in_use
-hwprivacy-ctl rules set telegram-desktop cam while_in_use
+# The camera takes allow or deny only — `cam while_in_use` is REFUSED.
+hwprivacy-ctl rules allow-camera /usr/bin/telegram-desktop --as telegram-desktop
 hwprivacy-ctl rules set signal mic while_in_use
 
 # Trusted recording apps: always allow
@@ -478,6 +573,14 @@ hwprivacy-gui
 
 # Or watch the event log
 hwprivacy-ctl log --last 50
+
+# What has touched a device over DAYS — this one survives restarts,
+# unlike the 500-entry in-memory event ring that `log` reads:
+hwprivacy-ctl history
+
+# Importable rule sets. Preview is the default, because a preset is a grant:
+hwprivacy-ctl preset list
+hwprivacy-ctl preset import desktop-baseline --apply
 ```
 
 ### Emergency
@@ -678,50 +781,66 @@ packaging; "Phase 5" there is the ALSA backstop, which has **not** started.
 
 ## Known Limitations
 
-1. **~11 ms race window**: between a link being created and the daemon
+1. **The microphone can be bypassed entirely.** An application that opens ALSA
+   directly (`/dev/snd/pcmC0D0c`) never touches PipeWire, so layer 1 never sees
+   it — and the kernel layer does not gate audio, because `/dev/snd` is opened
+   by `/usr/bin/pipewire` on every application's behalf, so a denial there
+   would deny everyone's microphone. Measured 2026-08-04:
+   `ffmpeg -f alsa -i hw:0,0 -t 3` captured three seconds of real audio with
+   **zero** events logged.
+
+   This is the project's largest open hole. The fix is a kernel backstop that
+   restricts capture devices to the audio server (planned; not started), and
+   until it lands **the microphone is guarded on the PipeWire path only** —
+   which covers ordinary desktop applications, not an adversary. The camera
+   does not have this gap: it is enforced in the kernel by executable inode.
+
+2. **~11 ms race window**: between a link being created and the daemon
    destroying it, there is a brief window where audio could flow. Measured at
    ~11 ms since the graph became a stream (2026-09-01); it was 0-500 ms under
    the old polling design. It is not zero, and only the v2 WirePlumber hook —
    which blocks links before they are created — eliminates it entirely.
 
-2. **Two identities, and only one is spoof-proof.** At the PipeWire layer an
+3. **Two identities, and only one is spoof-proof.** At the PipeWire layer an
    app is its self-declared `application.name`, which any app can lie about. At
    the kernel layer it is the executable's inode, which it cannot. A rule
    carries both: `app_name` for layer 1, `exe_path` for layer 2. A camera rule
    with no `exe_path` grants nothing to a V4L2 application, whatever name you
    typed.
 
-3. **The executable is the principal.** Allowing `firefox` allows every website
+4. **The executable is the principal.** Allowing `firefox` allows every website
    that has ever obtained a grant inside Firefox. hwprivacy cannot see which
    site asked, and does not gate per tab — per-stream grants were removed in
    2026-08 because the deny path destroys a link the allow path cannot recreate
    (`d-no-per-stream-grants`).
 
-4. **Debian Rust 1.85 constraints**: Several crate versions are pinned to older
+5. **Debian Rust 1.85 constraints**: Several crate versions are pinned to older
    releases for MSRV compatibility. This will resolve as Debian ships newer Rust.
 
-5. **GTK4 on KDE**: GTK4 apps work on KDE but use GTK theming, not native Qt/KDE
+6. **GTK4 on KDE**: GTK4 apps work on KDE but use GTK theming, not native Qt/KDE
    look. For a fully native KDE experience, a Qt frontend would be needed.
 
-6. **Kernel enforcement cannot revoke an already-open fd.** The LSM hook fires
+7. **Kernel enforcement cannot revoke an already-open fd.** The LSM hook fires
    on `open()`, not on `read()`. An application that opened the camera *before*
    a deny rule took effect keeps its descriptor and keeps receiving video. This
    was observed live. Closing it would mean hooking `security_file_permission`
    (intercepting every read) or revoking on policy change — a design step, not
    a patch.
 
-7. **Links that already exist when the daemon starts are never evaluated.**
+8. **Links that already exist when the daemon starts are never evaluated.**
    They are seeded into `known_link_ids` and grandfathered in. Starting the
    daemon does not stop an in-progress capture.
 
-8. **`BlockAll()` does not stop anything already recording.** It blocks *new*
+9. **`BlockAll()` does not stop anything already recording.** It blocks *new*
    links. An active stream survives it.
 
-9. **Nothing is enforced at the kernel layer at rest.** `hwprivacy-lsm` has no
-   systemd unit and the BPF program is never pinned, so killing the helper
-   restores normal access.
+10. **The BPF program is never pinned.** `hwprivacy-lsm` *is* a boot-time
+   systemd service (`hwprivacy-lsm.service`, enabled, started before the user
+   daemon, enforcing from `/var/lib/hwprivacy/policy`), so the kernel layer is
+   active at rest. But the program is not pinned to `/sys/fs/bpf`, so stopping
+   the service detaches it and restores normal access.
 
-10. **A process running as your user can just stop the daemon.** `systemctl
+11. **A process running as your user can just stop the daemon.** `systemctl
     --user stop hwprivacy` needs no privileges you do not already have. The
     honest framing is "prevents accidental capture and gives visibility", not
     "enforces permissions against an adversary".
@@ -745,6 +864,7 @@ hwprivacy/
 │       ├── config.rs                   # Config, AppRule, Permission types + TOML
 │       ├── device.rs                   # DeviceCategory, ProtectedDevice
 │       ├── stream.rs                   # StreamInfo, ActiveConnection, AccessEvent
+│       ├── preset.rs                   # importable rule sets (data, not code)
 │       └── dbus_interface.rs           # D-Bus proxy trait (zbus)
 │
 ├── hwprivacy-proto/                    # wire protocol: root helper <-> user daemon
@@ -773,6 +893,9 @@ hwprivacy/
 │       ├── notification.rs             # freedesktop notifications (2-stage + kernel)
 │       ├── dbus_service.rs             # D-Bus server (zbus interface impl)
 │       ├── lsm_client.rs               # connects to hwprivacy-lsm, pushes policy
+│       ├── pipewire_monitor.rs         # `pw-dump --monitor` supervisor + graph state
+│       ├── notify_allow.rs             # gate for announcing ALLOWED access
+│       ├── history.rs                  # persistent per-identity counters
 │       └── state.rs                    # DaemonState (config + devices + tracker)
 │
 ├── hwprivacy-ctl/                      # CLI tool
@@ -870,8 +993,10 @@ PipeWire 1.4.2, ALC257 codec (2 internal mics as stereo), Integrated Camera.
 | Monitor tap via `parecord` | **Blocked**: 0 bytes audio captured (44-byte empty WAV) |
 | Firefox playback during monitor block | Unaffected, kept playing |
 | Instant BLOCKED notification | Appears immediately on access attempt |
-| Action notification with buttons | Shows Allow/Deny/AskEach/WhileInUse options |
-| Notification dismiss → cooldown | No spam for 60s, then re-prompts |
+| Action notification with buttons | Shows Always Allow / While in Use / Always Deny |
+| Notification dismiss → cooldown | Nothing saved, cooldown, then re-prompts |
+| Kernel camera denial vs Firefox/WhatsApp | **Blocked**: "Camera or microphone not found" |
+| `while_in_use` session lifecycle (microphone) | ask → grant → use → release → SESSION_ENDED |
 | systemd service install | Enabled, running, survives reboot |
 | D-Bus activation | Daemon auto-starts on first CLI/TUI/GUI connection |
 | GUI tray icon | Shows in KDE system tray, left-click toggles window |
@@ -879,20 +1004,31 @@ PipeWire 1.4.2, ALC257 codec (2 internal mics as stereo), Integrated Camera.
 
 ### Automated tests
 
-`cargo test --workspace` → **78 tests, all passing**. Note the distribution:
+`cargo test --workspace` → **226 tests, all passing** (measured 2026-09-06).
+Note the distribution:
 
 | crate | LOC | tests |
 |---|---|---|
-| hwprivacy-lsm | 2872 | 48 |
-| hwprivacy-daemon | 2603 | 15 |
-| hwprivacy-common | 705 | 9 |
-| hwprivacy-proto | 271 | 6 |
-| hwprivacy-ctl / -tui / -gui | 1366 | 0 |
+| hwprivacy-daemon | 6749 | 112 |
+| hwprivacy-common | 2272 | 56 |
+| hwprivacy-lsm | 3146 | 49 |
+| hwprivacy-proto | 283 | 6 |
+| hwprivacy-ctl | 633 | 2 |
+| hwprivacy-gui | 1013 | 1 (widget-level; needs a display) |
+| hwprivacy-tui | 567 | **0** |
 
-Coverage is lopsided **by era, not by risk**. The kernel layer was written
-test-first; the PipeWire layer was not, and `classify_link()` — the pure
-function that makes the entire layer-1 security decision — still has **zero
-tests**.
+`classify_link()` — the pure function that makes the entire layer-1 security
+decision — was covered on 2026-08-21 with 14 tests, including the one that had
+never existed: that ordinary playback into a sink is **not** a monitor tap.
+
+Still uncovered: `parse_node()`/`parse_link()` against real `pw-dump` JSON, and
+the TUI entirely. `tools/tui-screen` can now render the TUI, but nothing
+asserts on what it renders.
+
+**A test is kept only after it has been seen failing.** Every test added since
+2026-08-21 was run against the deliberately reintroduced defect and observed to
+fail first — eleven tests have passed with their bug present in this project's
+history, which is why this is a rule and not an aspiration.
 
 > `cargo test` does **not** refresh `target/debug/hwprivacy-lsm`; it builds a
 > separate `cfg(test)` harness. Passing tests once said nothing about the
@@ -904,8 +1040,9 @@ tests**.
 |---|---|
 | 1 — observe-only LSM | validated live, attached first try |
 | 2 — camera enforcement | **5/5**, denied live against Firefox and WhatsApp, access restored on detach |
-| 3 — daemon integration | **11/13**. Open: C5 (burst counting) and D1 (unresolved) |
-| 4 — systemd unit for the helper | not started |
+| 3 — daemon integration | **13/13**. C5 (burst counting) and D1 both closed 2026-08-19 |
+| 4 — systemd unit for the helper | installed, enabled, boot-verified |
+| 5 — ALSA audio backstop | **not started** — see limitation 1 |
 | 5 — audio backstop | not started |
 
 ---
