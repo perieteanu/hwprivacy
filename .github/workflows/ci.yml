@@ -42,17 +42,26 @@ jobs:
 
       # GTK4 for the GUI crate; clang/libbpf for the eBPF skeleton.
       #
-      # bpftool comes from the STANDALONE `bpftool` package, present in every
-      # Ubuntu from jammy onward — NOT from linux-tools-common, whose
-      # /usr/sbin/bpftool is a stub that dispatches to linux-tools-$(uname -r).
-      # Hosted runners run an Azure kernel that has no such package, so that
-      # route yields no bpftool at all. Measured, 2026-09-06.
+      # bpftool needs care. There is no standalone `bpftool` package on Ubuntu:
+      # the name is VIRTUAL, provided by linux-tools-common, which ships no
+      # binary of its own. What linux-tools-common does ship is /usr/sbin/bpftool,
+      # a wrapper that dispatches on `uname -r` — and hosted runners run an Azure
+      # kernel (6.17.0-*-azure) whose linux-tools package does not exist, so that
+      # wrapper resolves to nothing. That is the stub, and it is why every earlier
+      # attempt here found no bpftool.
+      #
+      # linux-tools-generic is a different thing: it depends on the GENERIC
+      # flavour's tools (linux-tools-6.8.0-*-generic on noble), which is a real
+      # package containing a real binary under /usr/lib/linux-tools/<ver>/. That
+      # binary is called directly below, never through the wrapper. It does not
+      # need to match the running kernel — it reads /sys/kernel/btf/vmlinux as a
+      # data file, it does not load anything.
       - name: install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-4-dev libdbus-1-dev pkg-config \
-            clang libbpf-dev bpftool
+            clang libbpf-dev linux-tools-generic
 
       # vmlinux.h is generated from the RUNNING kernel's BTF and is not
       # committed, because it describes the kernel it was built against. The
@@ -70,7 +79,15 @@ jobs:
         run: |
           set -euo pipefail
           OUT=hwprivacy-lsm/src/bpf/vmlinux.h
-          bpftool btf dump file /sys/kernel/btf/vmlinux format c > "$OUT"
+          BPFTOOL=$(ls -1 /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -V | tail -1)
+          if [ -z "$BPFTOOL" ]; then
+            echo "no bpftool under /usr/lib/linux-tools — linux-tools-generic shipped none"
+            ls -la /usr/lib/linux-tools/ 2>&1 || true
+            exit 1
+          fi
+          echo "using $BPFTOOL"
+          "$BPFTOOL" version
+          "$BPFTOOL" btf dump file /sys/kernel/btf/vmlinux format c > "$OUT"
           wc -l "$OUT"
 
       # Prove the header we just generated is usable, HERE, rather than letting
