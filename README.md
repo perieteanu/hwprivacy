@@ -1,5 +1,7 @@
 # HWPrivacy — Hardware Permission Manager for Linux
 
+[![CI](https://github.com/perieteanu/hwprivacy/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/perieteanu/hwprivacy/actions/workflows/ci.yml)
+
 An Android-style hardware permission manager for the Linux desktop.
 Applications must be granted explicit permission to access microphones, cameras,
 and playback monitor sources.

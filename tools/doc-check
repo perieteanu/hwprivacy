@@ -301,6 +301,13 @@ SENTINELS = [
      "set_rule filling every category. Granting one device wrote deny for the "
      "other two, silently downgrading them from default_action. Categories are "
      "Option<Permission>; use AppRule::empty() — see d-a-rule-has-no-opinion-by-default."),
+    ("is clang installed?",
+     "the skeleton build is guessing at its own cause again. This message "
+     "named clang, and the one time it mattered — CI, 2026-09-07 — the cause "
+     "was a rustup rustfmt shim exiting non-zero while clang was perfectly "
+     "fine, so it sent the reader to a healthy dependency. An error message "
+     "that guesses is an instrument that lies. Print the chained cause and "
+     "offer a checklist, not a diagnosis. See hwprivacy-lsm/build.rs."),
 ]
 _sentinel_hits = 0
 for dirpath, dirnames, filenames in os.walk(ROOT):

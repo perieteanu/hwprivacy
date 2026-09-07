@@ -12,6 +12,18 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Every action is pinned to a COMMIT SHA, not a tag. `@v5` and `@v2` are tags
+# and `@stable` is a branch — all three are mutable, so any of them can start
+# executing different code without a commit here. The trailing comment records
+# which release each SHA is, since a SHA alone is unreadable. This repo has no
+# Actions secrets and its workflow token is read-only, so the exposure was
+# small; it is pinned anyway because a security tool should not ship a CI
+# supply chain looser than the thing it enforces.
+#
+# To bump one: read the upstream release notes, resolve the new tag with
+#   gh api repos/<owner>/<repo>/commits/<tag> --jq .sha
+# and update the SHA and its comment together.
+
 jobs:
   # doc-check reads FILES only: no kernel, no toolchain, no display. It is the
   # cheapest signal in the repo and catches the failure this project actually
@@ -21,7 +33,7 @@ jobs:
     name: docs match the code
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
       - name: make doc-check
         run: make doc-check
 
@@ -38,7 +50,7 @@ jobs:
         # real regression, not dependency drift.
         rust: ["1.85.0", "stable"]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
 
       # GTK4 for the GUI crate; clang/libbpf for the eBPF skeleton.
       #
@@ -102,17 +114,27 @@ jobs:
             -o "$RUNNER_TEMP/devices.bpf.o"
           ls -l "$RUNNER_TEMP/devices.bpf.o"
 
-      # rustfmt is a BUILD dependency here, not a style tool: libbpf-cargo's
-      # SkeletonBuilder shells out to it to format the generated skeleton, so
-      # build.rs fails without it. The `stable` leg only passed because the
-      # runner image ships a preinstalled stable toolchain that already has it;
-      # a pinned version gets a minimal profile and does not.
-      - uses: dtolnay/rust-toolchain@stable
+      # rustfmt, and it is not what it looks like. libbpf-cargo runs rustfmt
+      # over the generated skeleton as a COSMETIC pass, and handles it being
+      # absent — libbpf-cargo/src/gen/mod.rs treats ErrorKind::NotFound as
+      # "skip formatting". That is why a Debian box with no rustfmt at all
+      # builds this fine.
+      #
+      # What it does NOT handle is a rustfmt that exists and FAILS: that path
+      # hits ensure!(output.status.success()) and kills the build. Under rustup
+      # `rustfmt` is always on PATH as a shim, and the shim exits non-zero when
+      # the component is missing. So the broken tool is worse than no tool, and
+      # only the rustup case is affected.
+      #
+      # The `stable` leg masked this — the runner image ships a preinstalled
+      # stable toolchain that already carries the component. A pinned version
+      # gets a minimal profile and does not.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable branch, 2026-09-03
         with:
           toolchain: ${{ matrix.rust }}
           components: rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
 
       - name: cargo build
         run: cargo build --workspace --locked

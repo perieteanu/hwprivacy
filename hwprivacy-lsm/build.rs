@@ -25,10 +25,30 @@ fn main() {
     let mut out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set"));
     out.push("devices.skel.rs");
 
+    // Do NOT name a single culprit here. This message used to read "is clang
+    // installed?" and was wrong the one time it mattered: CI failed on a rustup
+    // rustfmt shim, clang was fine, and the message sent the reader to the
+    // healthy dependency. The chained cause below is the evidence; everything
+    // above it is a checklist, not a diagnosis.
     SkeletonBuilder::new()
         .source(SRC)
         .build_and_generate(&out)
-        .expect("failed to build eBPF skeleton — is clang installed?");
+        .unwrap_or_else(|e| {
+            panic!(
+                "\n\nfailed to build the eBPF skeleton.\n\n\
+                 Read the chained cause at the bottom — do not assume clang.\n\
+                 Causes that have actually occurred here:\n\n  \
+                 - a `rustfmt` on PATH that FAILS. libbpf-cargo skips formatting\n    \
+                   when rustfmt is ABSENT, but propagates a non-zero exit. Under\n    \
+                   rustup the shim is always present and exits non-zero when the\n    \
+                   component is not installed, so a broken rustfmt is worse than\n    \
+                   none.  Fix: rustup component add rustfmt\n\n  \
+                 - clang missing, or the libbpf headers missing\n\n  \
+                 - {VMLINUX} produced by something other than bpftool. pahole\n    \
+                   emits a header that looks right and does not compile.\n\n\
+                 cause: {e:?}\n"
+            )
+        });
 
     println!("cargo:rerun-if-changed={SRC}");
     println!("cargo:rerun-if-changed={VMLINUX}");
