@@ -102,9 +102,15 @@ jobs:
             -o "$RUNNER_TEMP/devices.bpf.o"
           ls -l "$RUNNER_TEMP/devices.bpf.o"
 
+      # rustfmt is a BUILD dependency here, not a style tool: libbpf-cargo's
+      # SkeletonBuilder shells out to it to format the generated skeleton, so
+      # build.rs fails without it. The `stable` leg only passed because the
+      # runner image ships a preinstalled stable toolchain that already has it;
+      # a pinned version gets a minimal profile and does not.
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ matrix.rust }}
+          components: rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
