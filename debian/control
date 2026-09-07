@@ -1,7 +1,7 @@
 Source: hwprivacy
 Section: utils
 Priority: optional
-Maintainer: perieteanu <perieteanu@debian.org>
+Maintainer: Perieteanu Costin <perieteanu@gmail.com>
 Build-Depends: debhelper-compat (= 13),
                cargo,
                rustc,
@@ -34,8 +34,12 @@ Description: Hardware privacy kernel layer (eBPF LSM)
  cannot observe at all — Firefox and Chrome take the camera that way.
  .
  Runs as a system service, as root, because loading an eBPF program requires
- it. Audio is observed but never denied here: denying the ALSA major would
- deny the audio server itself, which is every application's microphone path.
+ it. It also gates direct ALSA capture: opens of capture nodes are denied to
+ executables that are not allowlisted. That is a backstop, not per-application
+ microphone policy — /dev/snd is held by the audio server on everyone's behalf,
+ so the kernel sees the server, never the application behind it. Enforcement
+ keys on the capture minor and never on the ALSA major, because denying the
+ major would deny the audio server itself and with it every microphone.
  .
  Requires a kernel with CONFIG_BPF_LSM=y, CONFIG_DEBUG_INFO_BTF=y and 'bpf'
  present in /sys/kernel/security/lsm.

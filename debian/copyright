@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: hwprivacy
-Upstream-Contact: perieteanu <perieteanu@debian.org>
+Upstream-Contact: Perieteanu Costin <perieteanu@gmail.com>
 
 Files: *
 Copyright: 2026 perieteanu

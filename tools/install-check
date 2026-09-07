@@ -1,38 +1,46 @@
 #!/usr/bin/env python3
 """
-hwprivacy — assert that `make install` actually installs what is declared.
+hwprivacy — assert that what gets installed is what the manifest declares.
 
 WHY THIS EXISTS
 ---------------
-As of 2026-09-07 `make install` had NEVER BEEN RUN. Not on a hosted runner, not
-in a container, not on the developer's own machine — which got its working
-install by accretion over months, binary by binary, rather than by executing the
-target. No `.deb` had ever been built either. So the repo shipped an install
-path that nothing had ever exercised, in a project whose entire documented
+As of 2026-09-07 `make install` had NEVER BEEN RUN, and no .deb had ever been
+built. Not on a hosted runner, not in a container, not on the developer's own
+machine — which got its working install by accretion over months, binary by
+binary, rather than by executing the target. So the repo shipped two install
+paths that nothing had ever exercised, in a project whose entire documented
 pathology is a claim drifting away from the machine.
 
-CI proves the code builds and the tests pass. It said nothing about whether a
-stranger who runs the documented command ends up with the right files in the
-right places. A hosted runner is a clean stranger's machine, and staging an
-install into a DESTDIR costs nothing and needs no root, no reboot and no
-hardware. That is the half this checks.
+Both were broken in ways nobody could have known without running them:
 
-There is a second manifest in this repo, and the two already disagreed: while
-this tool was being written, debian/hwprivacy-daemon.install was found to
-declare usr/share/hwprivacy/presets/*.toml while debian/rules never staged the
-presets at all. Nobody had run dpkg-buildpackage to find out.
+  - debian/hwprivacy-daemon.install DECLARED usr/share/hwprivacy/presets/*.toml
+    and debian/rules staged the presets nowhere, so dh_install would have
+    matched nothing and the package build would have failed.
+  - debian/rules installed straight into debian/<pkg>/ with its own second copy
+    of every path, which both duplicated `make install` and could not coexist
+    with the very manifests sitting beside it.
+
+CI proves the code builds and the tests pass. It said nothing about whether a
+stranger running the documented command ends up with the right files.
 
 THE MANIFEST IS NOT WRITTEN HERE
 --------------------------------
 The expected file list is parsed from debian/*.install, which already declares
 every installed path and is a file a human reads. Writing a third list would
-create exactly the drift this repo keeps getting bitten by — the failure mode
-is never "the check was too weak", it is "two lists that were supposed to agree
-quietly stopped agreeing". If you add a file to `make install`, the manifest
-must gain a line or this fails, which is the point.
+recreate the exact failure being guarded against — the failure mode is never
+"the check was too weak", it is "two lists that were supposed to agree quietly
+stopped agreeing". Both modes below read that same one manifest, which is the
+whole point: the Makefile and the .deb are held to a single source of truth.
 
-Extras are failures, not warnings, for the same reason: an installed file that
-no manifest declares is a file the .deb will not ship.
+Extras are failures, not warnings: a file no manifest declares is a file the
+package will not ship.
+
+TWO MODES
+---------
+    --destdir DIR    a tree staged by `make install DESTDIR=DIR`
+    --deb-dir DIR    the built .deb files; each is checked against ITS OWN
+                     debian/<pkg>.install, so a file landing in the wrong
+                     binary package is caught, not just a missing one
 
 DEFAULT PREFIX ONLY
 -------------------
@@ -44,26 +52,32 @@ the first time a non-default prefix matters.
 
 Usage:
     tools/install-check --destdir DIR          human
+    tools/install-check --deb-dir ..           after dpkg-buildpackage
     tools/install-check --destdir DIR --json   for Claude
 
-Read-only with respect to the repo; it only stats the staged tree.
-Exit 0 clean, 1 on a real failure, 2 when it cannot run at all — an empty or
-missing tree is never reported as a pass.
+Read-only. Exit 0 clean, 1 on a real failure, 2 when it cannot run at all — an
+empty or missing tree is never reported as a pass.
 """
 
 import argparse
+import fnmatch
 import glob as globmod
 import json
 import os
 import stat
+import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# usr/bin holds the executables; everything else this project installs is data.
 EXEC_DIR = "usr/bin"
 EXEC_MODE = 0o755
 DATA_MODE = 0o644
+
+# debhelper puts these in every binary package. They are not declared by any
+# .install file and never should be — dh_installdocs and dh_installchangelogs
+# own them. Anything ELSE undeclared is a real finding.
+DH_OWNED = ("usr/share/doc/",)
 
 failures = []
 passes = []
@@ -78,132 +92,182 @@ def ok(msg):
 
 
 def cannot_run(why):
-    """Exit 2. A tree we could not inspect must never read as a pass."""
+    """Exit 2. A thing we could not inspect must never read as a pass."""
     print(f"hwprivacy install-check — CANNOT RUN\n\n  {why}", file=sys.stderr)
     sys.exit(2)
 
 
+def read_manifest(pkg):
+    """Declared paths for one binary package, from debian/<pkg>.install."""
+    path = os.path.join(ROOT, "debian", f"{pkg}.install")
+    if not os.path.exists(path):
+        return None
+    out = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                out.append(line)
+    return out
+
+
+def compare(label, declared, present, dh_owned_ok):
+    """The four checks, run identically over a staged tree or a .deb.
+
+    declared  list of (manifest name, pattern)
+    present   {relative path: mode int or None}
+    """
+    matched = set()
+    missing = 0
+    for src, pattern in declared:
+        if any(c in pattern for c in "*?["):
+            hits = [rel for rel in present if fnmatch.fnmatch(rel, pattern)]
+            if not hits:
+                missing += 1
+                fail("missing", pattern,
+                     f"[{label}] declared by debian/{src}, matched nothing")
+            matched.update(hits)
+        elif pattern in present:
+            matched.add(pattern)
+        else:
+            missing += 1
+            fail("missing", pattern, f"[{label}] declared by debian/{src}, absent")
+    if not missing:
+        ok(f"{label}: every declared path is present ({len(declared)} entries)")
+
+    extras = sorted(r for r in set(present) - matched
+                    if not (dh_owned_ok and r.startswith(DH_OWNED)))
+    for rel in extras:
+        fail("undeclared", rel,
+             f"[{label}] present but declared by no debian/*.install")
+    if not extras:
+        ok(f"{label}: nothing present that the manifest does not declare "
+           f"({len(present)} files)")
+
+    bad = 0
+    for rel, mode in sorted(present.items()):
+        if mode is None or (dh_owned_ok and rel.startswith(DH_OWNED)):
+            continue
+        want = EXEC_MODE if rel.startswith(EXEC_DIR + "/") else DATA_MODE
+        if mode != want:
+            bad += 1
+            fail("mode", rel, f"[{label}] is {mode:04o}, expected {want:04o}")
+    if not bad:
+        ok(f"{label}: every file carries the mode its kind requires")
+
+
 ap = argparse.ArgumentParser()
-ap.add_argument("--destdir", required=True,
-                help="the staged tree, e.g. the DESTDIR given to make install")
+g = ap.add_mutually_exclusive_group(required=True)
+g.add_argument("--destdir", help="a tree staged by make install DESTDIR=...")
+g.add_argument("--deb-dir", help="directory holding the built .deb files")
 ap.add_argument("--json", action="store_true", help="machine-readable output")
 args = ap.parse_args()
 
-DESTDIR = os.path.abspath(args.destdir)
-
-# ══════════════════════════════════════════════════════════════════
-# 0. Refuse to grade an empty tree.
-#    OCCURRED (elsewhere in this repo): tools/gui-test walked an unmapped
-#    window, found nothing, and every assertion passed vacuously.
-# ══════════════════════════════════════════════════════════════════
-if not os.path.isdir(DESTDIR):
-    cannot_run(f"no such directory: {DESTDIR}\n"
-               f"  stage one first:  make install DESTDIR={DESTDIR}")
-
-staged = {}
-for dirpath, _dirnames, filenames in os.walk(DESTDIR):
-    for f in filenames:
-        full = os.path.join(dirpath, f)
-        staged[os.path.relpath(full, DESTDIR)] = full
-
-if not staged:
-    cannot_run(f"{DESTDIR} exists but contains no files\n"
-               f"  stage one first:  make install DESTDIR={DESTDIR}")
-
-# ══════════════════════════════════════════════════════════════════
-# 1. The declared manifest, read from debian/*.install.
-# ══════════════════════════════════════════════════════════════════
 manifests = sorted(globmod.glob(os.path.join(ROOT, "debian", "*.install")))
 if not manifests:
     cannot_run("no debian/*.install files — there is no manifest to check against")
 
-declared = []          # (source manifest, declared line)
-for m in manifests:
-    with open(m, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if line and not line.startswith("#"):
-                declared.append((os.path.basename(m), line))
+measured = {}
 
 # ══════════════════════════════════════════════════════════════════
-# 2. Everything declared must be staged.  A glob must match at least once —
-#    a pattern matching nothing is how dh_install fails a package build.
+# MODE 1: a staged tree.  One manifest, the union of all of them.
 # ══════════════════════════════════════════════════════════════════
-matched = set()
-for src, pattern in declared:
-    if any(c in pattern for c in "*?["):
-        hits = [rel for rel in staged if globmod.fnmatch.fnmatch(rel, pattern)]
-        if not hits:
-            fail("missing", pattern,
-                 f"declared by debian/{src}, matched nothing in the staged tree")
-        matched.update(hits)
-    else:
-        if pattern in staged:
-            matched.add(pattern)
-        else:
-            fail("missing", pattern, f"declared by debian/{src}, not staged")
+if args.destdir:
+    DESTDIR = os.path.abspath(args.destdir)
+    if not os.path.isdir(DESTDIR):
+        cannot_run(f"no such directory: {DESTDIR}\n"
+                   f"  stage one first:  make install DESTDIR={DESTDIR}")
 
-if not [f for f in failures if f["check"] == "missing"]:
-    ok(f"every path declared by debian/*.install is staged ({len(declared)} entries)")
+    present = {}
+    for dirpath, _d, filenames in os.walk(DESTDIR):
+        for f in filenames:
+            full = os.path.join(dirpath, f)
+            present[os.path.relpath(full, DESTDIR)] = stat.S_IMODE(os.stat(full).st_mode)
+    if not present:
+        cannot_run(f"{DESTDIR} exists but contains no files\n"
+                   f"  stage one first:  make install DESTDIR={DESTDIR}")
 
-# ══════════════════════════════════════════════════════════════════
-# 3. Nothing staged may be undeclared.  An installed file no manifest
-#    declares is a file the .deb will silently not ship.
-# ══════════════════════════════════════════════════════════════════
-extras = sorted(set(staged) - matched)
-for rel in extras:
-    fail("undeclared", rel,
-         "staged by make install but declared by no debian/*.install — "
-         "the package would not ship it")
-if not extras:
-    ok(f"nothing is staged that the manifest does not declare ({len(staged)} files)")
+    declared = []
+    for m in manifests:
+        for line in read_manifest(os.path.basename(m)[:-len(".install")]) or []:
+            declared.append((os.path.basename(m), line))
 
-# ══════════════════════════════════════════════════════════════════
-# 4. Modes.  A binary installed 0644 is not executable, and nothing
-#    downstream notices until a user tries to run it.
-# ══════════════════════════════════════════════════════════════════
-bad_modes = 0
-for rel, full in sorted(staged.items()):
-    want = EXEC_MODE if rel.startswith(EXEC_DIR + "/") else DATA_MODE
-    got = stat.S_IMODE(os.stat(full).st_mode)
-    if got != want:
-        bad_modes += 1
-        fail("mode", rel, f"is {got:04o}, expected {want:04o}")
-if not bad_modes:
-    ok("every staged file carries the mode its kind requires")
+    compare("staged tree", declared, present, dh_owned_ok=False)
+
+    bins = sorted(r for r in present if r.startswith(EXEC_DIR + "/"))
+    bad = 0
+    for rel in bins:
+        full = os.path.join(DESTDIR, rel)
+        if os.path.getsize(full) == 0:
+            bad += 1
+            fail("binary", rel, "is zero bytes")
+            continue
+        with open(full, "rb") as fh:
+            if fh.read(4) != b"\x7fELF":
+                bad += 1
+                fail("binary", rel, "is not an ELF executable")
+    if bins and not bad:
+        ok(f"all {len(bins)} installed binaries are non-empty ELF")
+
+    measured = {"mode": "destdir", "destdir": DESTDIR,
+                "present": len(present), "declared": len(declared)}
+    headline = (f"{len(present)} files staged, {len(declared)} declared "
+                f"across {len(manifests)} manifests")
 
 # ══════════════════════════════════════════════════════════════════
-# 5. The executables are real ELF binaries and not empty.
-#    Assert on the file's own bytes, not on a name.
+# MODE 2: the built .deb files.  Each package against ITS OWN manifest,
+#         so a file landing in the WRONG package is caught too.
 # ══════════════════════════════════════════════════════════════════
-bins = sorted(r for r in staged if r.startswith(EXEC_DIR + "/"))
-bad_bins = 0
-for rel in bins:
-    full = staged[rel]
-    size = os.path.getsize(full)
-    if size == 0:
-        bad_bins += 1
-        fail("binary", rel, "is zero bytes")
-        continue
-    with open(full, "rb") as fh:
-        if fh.read(4) != b"\x7fELF":
-            bad_bins += 1
-            fail("binary", rel, "is not an ELF executable")
-if bins and not bad_bins:
-    ok(f"all {len(bins)} installed binaries are non-empty ELF")
+else:
+    DEBDIR = os.path.abspath(args.deb_dir)
+    debs = sorted(globmod.glob(os.path.join(DEBDIR, "*.deb")))
+    debs = [d for d in debs if "-dbgsym_" not in os.path.basename(d)]
+    if not debs:
+        cannot_run(f"no .deb files in {DEBDIR}\n"
+                   f"  build them first:  dpkg-buildpackage -us -uc -b")
+
+    total = 0
+    for deb in debs:
+        pkg = os.path.basename(deb).split("_")[0]
+        lines = read_manifest(pkg)
+        if lines is None:
+            fail("package", os.path.basename(deb),
+                 f"built a package with no debian/{pkg}.install to check it against")
+            continue
+
+        # dpkg-deb -c needs no root and reads the archive directly.
+        out = subprocess.run(["dpkg-deb", "-c", deb],
+                             capture_output=True, text=True, check=True).stdout
+        present = {}
+        for line in out.splitlines():
+            parts = line.split(None, 5)
+            if len(parts) < 6 or parts[0].startswith("d"):
+                continue                      # directories carry no manifest entry
+            perms, name = parts[0], parts[5]
+            name = name.split(" -> ")[0].lstrip("./")
+            if not name:
+                continue
+            mode = 0
+            for i, ch in enumerate(perms[1:10]):
+                if ch != "-":
+                    mode |= 1 << (8 - i)
+            present[name] = mode
+        total += len(present)
+        compare(pkg, [(f"{pkg}.install", l) for l in lines], present,
+                dh_owned_ok=True)
+
+    measured = {"mode": "deb", "deb_dir": DEBDIR, "packages": len(debs),
+                "files": total}
+    headline = f"{len(debs)} packages, {total} files, checked against their own manifests"
 
 # ══════════════════════════════════════════════════════════════════
 # Report.
 # ══════════════════════════════════════════════════════════════════
 if args.json:
-    print(json.dumps({"ok": not failures, "failures": failures, "passes": passes,
-                      "measured": {"destdir": DESTDIR, "staged": len(staged),
-                                   "declared": len(declared),
-                                   "manifests": [os.path.basename(m) for m in manifests]}},
-                     indent=2))
+    print(json.dumps({"ok": not failures, "failures": failures,
+                      "passes": passes, "measured": measured}, indent=2))
 else:
-    print(f"hwprivacy install-check — measured: {len(staged)} files staged, "
-          f"{len(declared)} declared across {len(manifests)} manifests")
+    print(f"hwprivacy install-check — measured: {headline}")
     print()
     for p in passes:
         print(f"  ok    {p}")
@@ -212,8 +276,8 @@ else:
         for f in failures:
             print(f"  FAIL  [{f['check']}] {f['file']}")
             print(f"        {f['problem']}")
-        print(f"\n{len(failures)} problem(s) between the staged tree and the manifest.")
+        print(f"\n{len(failures)} problem(s) between what is installed and what is declared.")
     else:
-        print("\nThe staged tree matches the manifest.")
+        print("\nWhat is installed matches what the manifest declares.")
 
 sys.exit(1 if failures else 0)

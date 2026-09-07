@@ -3,26 +3,86 @@
 %:
 	dh $@
 
+# vmlinux.h is generated from the BUILDING machine's kernel BTF and is
+# deliberately not committed, because it describes the kernel it was built
+# against. Without it hwprivacy-lsm's build.rs panics — which is why this
+# package had never built once. Fail with a readable message rather than a
+# Rust panic if the kernel was not built with CONFIG_DEBUG_INFO_BTF=y.
+#
+# bpftool is looked up rather than assumed: Debian ships it in /usr/sbin,
+# which is not on a normal user's PATH on trixie, and dpkg-buildpackage
+# runs as the user. Measured — the first build attempt died on exactly
+# this, with `bpftool: not found`, despite Build-Depends being satisfied.
 override_dh_auto_build:
+	@test -r /sys/kernel/btf/vmlinux || { \
+	  echo "no /sys/kernel/btf/vmlinux — this kernel has no BTF (needs CONFIG_DEBUG_INFO_BTF=y)."; \
+	  echo "hwprivacy-lsm cannot be built here."; exit 1; }
+	@B=$$(command -v bpftool || true); \
+	  [ -n "$$B" ] || B=/usr/sbin/bpftool; \
+	  [ -x "$$B" ] || { echo "bpftool not executable (Build-Depends: bpftool);"; \
+	    echo "looked on PATH and at /usr/sbin/bpftool."; exit 1; }; \
+	  echo "using $$B"; \
+	  "$$B" btf dump file /sys/kernel/btf/vmlinux format c > hwprivacy-lsm/src/bpf/vmlinux.h
 	cargo build --release --workspace
 
+# The generated header is regenerable and machine-specific; it must never end
+# up in a source package.
+override_dh_clean:
+	rm -f hwprivacy-lsm/src/bpf/vmlinux.h
+	dh_clean
+
+# ONE install implementation, not two.
+#
+# This used to install straight into debian/<pkg>/ with its own copy of every
+# path — a second implementation of `make install` that could drift from it,
+# and did: the presets were declared by debian/*.install and staged by neither.
+# It also could not work alongside those manifests, because dh_install looks in
+# debian/tmp and would have found nothing there.
+#
+# So: stage with the Makefile, into debian/tmp, and let the debian/*.install
+# manifests distribute. The Makefile is now the only thing that knows how to
+# install this project, and tools/install-check validates that same pairing.
 override_dh_auto_install:
-	install -D -m 0755 target/release/hwprivacy-daemon debian/hwprivacy-daemon/usr/bin/hwprivacy-daemon
-	install -D -m 0755 target/release/hwprivacy-ctl debian/hwprivacy-ctl/usr/bin/hwprivacy-ctl
-	install -D -m 0755 target/release/hwprivacy-tui debian/hwprivacy-tui/usr/bin/hwprivacy-tui
-	install -D -m 0755 target/release/hwprivacy-gui debian/hwprivacy-gui/usr/bin/hwprivacy-gui
-	install -D -m 0644 debian/hwprivacy-daemon.service debian/hwprivacy-daemon/usr/lib/systemd/user/hwprivacy-daemon.service
-	install -D -m 0644 dbus/org.hwprivacy.Daemon.service debian/hwprivacy-daemon/usr/share/dbus-1/services/org.hwprivacy.Daemon.service
-	install -D -m 0644 debian/hwprivacy-gui.desktop debian/hwprivacy-gui/usr/share/applications/hwprivacy-gui.desktop
-	# hwprivacy-daemon.install has always DECLARED the presets; nothing ever
-	# staged them, so dh_install had nothing to match and the package build
-	# would fail. Found 2026-09-07, by reading the two manifests against each
-	# other — no .deb had ever been built to find out.
-	install -d debian/hwprivacy-daemon/usr/share/hwprivacy/presets
-	install -m 0644 presets/*.toml debian/hwprivacy-daemon/usr/share/hwprivacy/presets/
-	# The kernel layer. A SYSTEM unit, not a user one — it must be up before
-	# anyone logs in, and it serves every session from one place.
-	install -D -m 0755 target/release/hwprivacy-lsm debian/hwprivacy-lsm/usr/bin/hwprivacy-lsm
-	install -D -m 0644 debian/hwprivacy-lsm.service debian/hwprivacy-lsm/usr/lib/systemd/system/hwprivacy-lsm.service
+	$(MAKE) install DESTDIR=$(CURDIR)/debian/tmp
+	$(MAKE) install-lsm DESTDIR=$(CURDIR)/debian/tmp
+
+# Anything staged that no debian/*.install claims is a packaging bug, not a
+# thing to shrug at — it is the same check tools/install-check calls
+# "undeclared", enforced by debhelper.
+override_dh_missing:
+	dh_missing --fail-missing
+
+# debhelper must not install or activate ANY unit here. Both of these were
+# measured on the FIRST .deb this project ever built, 2026-09-07:
+#
+#   - dh_installsystemd took debian/hwprivacy-daemon.service and installed it
+#     as a SYSTEM unit, so the package shipped the same file twice — once at
+#     usr/lib/systemd/system/ where it does not belong, and once at
+#     usr/lib/systemd/user/ where it does. It is a USER unit.
+#
+#   - dh_installsystemd and dh_installsystemduser generated postinst snippets
+#     that ENABLE AND START the services. For hwprivacy-lsm that means
+#     `apt install` attaches an eBPF LSM as root and begins denying the camera
+#     with no user action — the precise behaviour install-lsm and
+#     debian/hwprivacy-lsm.postinst deliberately refuse, for the reason stated
+#     there: it runs as root and denies the camera by default, so pulling it in
+#     silently changes the machine in a way nobody asked for.
+#
+# The Makefile installs the units, debian/*.install distributes them, and
+# debian/hwprivacy-lsm.postinst TELLS the admin what to run. Nothing here
+# starts anything. Both overrides are empty on purpose.
+override_dh_installsystemd:
+
+override_dh_installsystemduser:
+
+# No automatic -dbgsym packages. cargo's release profile emits no debug info,
+# so dh_strip produced five dbgsym packages whose .debug files contain no
+# symbols — lintian says so, five times: debug-file-with-no-debug-symbols.
+# Shipping five empty packages is worse than shipping none.
+#
+# If real debug packages are ever wanted, the fix is upstream of here — set
+# [profile.release] debug = true in Cargo.toml — not removing this line.
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
 
 override_dh_auto_test:

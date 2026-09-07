@@ -36,3 +36,19 @@ HANDOFF.md
 LOG.md
 hwprivacy.code-workspace
 docs-yaml/claude-memory.md
+
+# debhelper build artifacts. `dpkg-buildpackage` stages the whole install tree
+# under debian/, including the compiled binaries — 48 MB of it went into the
+# repo on 2026-09-07 because there was nothing here to stop it.
+debian/tmp/
+debian/files
+debian/debhelper-build-stamp
+debian/.debhelper/
+debian/*.substvars
+debian/*.debhelper.log
+debian/*.debhelper
+debian/hwprivacy-daemon/
+debian/hwprivacy-lsm/
+debian/hwprivacy-ctl/
+debian/hwprivacy-tui/
+debian/hwprivacy-gui/
