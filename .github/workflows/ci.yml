@@ -21,52 +21,73 @@ jobs:
     name: docs match the code
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: make doc-check
         run: make doc-check
 
   test:
-    name: build and test
+    name: build and test (rust ${{ matrix.rust }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 1.85.0 is the contract: it is what Debian 13 ships, it is the reason
+        # notify-rust is pinned to =4.11.3, and it is the only compiler this
+        # project is claimed to build on. `stable` is early warning — with
+        # --locked freezing the dependency graph, a stable-only failure is a
+        # real regression, not dependency drift.
+        rust: ["1.85.0", "stable"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      # GTK4 for the GUI crate; clang/libbpf/bpftool for the eBPF skeleton.
+      # GTK4 for the GUI crate; clang/libbpf for the eBPF skeleton.
+      #
+      # bpftool comes from the STANDALONE `bpftool` package, present in every
+      # Ubuntu from jammy onward — NOT from linux-tools-common, whose
+      # /usr/sbin/bpftool is a stub that dispatches to linux-tools-$(uname -r).
+      # Hosted runners run an Azure kernel that has no such package, so that
+      # route yields no bpftool at all. Measured, 2026-09-06.
       - name: install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-4-dev libdbus-1-dev pkg-config \
-            clang libbpf-dev dwarves linux-tools-common
+            clang libbpf-dev bpftool
 
       # vmlinux.h is generated from the RUNNING kernel's BTF and is not
       # committed, because it describes the kernel it was built against. The
       # runner's kernel is not Debian 13's, which is exactly why this is
       # generated here rather than shipped.
-      # `linux-tools-generic` is a STUB that dispatches to a per-kernel package
-      # (linux-tools-6.17.0-1022-azure) which the hosted runner does not carry —
-      # measured, it fails with "bpftool not found for kernel". Find a usable
-      # bpftool wherever it lives, and fall back to pahole (dwarves), which can
-      # emit the same C header from the kernel's BTF.
+      #
+      # There is no fallback, deliberately. pahole (dwarves) was tried and
+      # measured: `pahole --compile /sys/kernel/btf/vmlinux` exits 0 and emits
+      # 156k plausible lines that do NOT compile — it drops the anonymous enums
+      # bpf_helpers.h needs (BPF_ANY, BPF_NOEXIST) and redefines va_list against
+      # clang's own. A fallback that silently produces a broken header turns a
+      # missing-tool failure into a Rust build panic two minutes downstream,
+      # which is how this workflow stayed red.
       - name: generate vmlinux.h from the runner's kernel BTF
         run: |
           set -euo pipefail
           OUT=hwprivacy-lsm/src/bpf/vmlinux.h
-          BPFTOOL=""
-          for c in /usr/lib/linux-tools/*/bpftool /usr/sbin/bpftool /usr/bin/bpftool; do
-            [ -x "$c" ] && BPFTOOL="$c" && break
-          done
-          if [ -n "$BPFTOOL" ] && "$BPFTOOL" btf dump file /sys/kernel/btf/vmlinux format c > "$OUT" 2>/dev/null; then
-            echo "generated with $BPFTOOL"
-          else
-            echo "no usable bpftool; falling back to pahole"
-            pahole --btf_encode_detached=/dev/null 2>/dev/null || true
-            pahole -F btf --header /sys/kernel/btf/vmlinux > "$OUT" 2>/dev/null \
-              || { echo "could not generate vmlinux.h on this runner"; exit 1; }
-          fi
+          bpftool btf dump file /sys/kernel/btf/vmlinux format c > "$OUT"
           wc -l "$OUT"
 
+      # Prove the header we just generated is usable, HERE, rather than letting
+      # cargo discover it inside build.rs where the error reads as a Rust
+      # problem. One second, and it fails in the step that caused it.
+      - name: the generated header must actually compile
+        run: |
+          set -euo pipefail
+          clang -g -O2 -target bpf -D__TARGET_ARCH_x86 \
+            -I hwprivacy-lsm/src/bpf \
+            -c hwprivacy-lsm/src/bpf/devices.bpf.c \
+            -o "$RUNNER_TEMP/devices.bpf.o"
+          ls -l "$RUNNER_TEMP/devices.bpf.o"
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
 
       - uses: Swatinem/rust-cache@v2
 
