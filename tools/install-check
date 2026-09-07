@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+hwprivacy — assert that `make install` actually installs what is declared.
+
+WHY THIS EXISTS
+---------------
+As of 2026-09-07 `make install` had NEVER BEEN RUN. Not on a hosted runner, not
+in a container, not on the developer's own machine — which got its working
+install by accretion over months, binary by binary, rather than by executing the
+target. No `.deb` had ever been built either. So the repo shipped an install
+path that nothing had ever exercised, in a project whose entire documented
+pathology is a claim drifting away from the machine.
+
+CI proves the code builds and the tests pass. It said nothing about whether a
+stranger who runs the documented command ends up with the right files in the
+right places. A hosted runner is a clean stranger's machine, and staging an
+install into a DESTDIR costs nothing and needs no root, no reboot and no
+hardware. That is the half this checks.
+
+There is a second manifest in this repo, and the two already disagreed: while
+this tool was being written, debian/hwprivacy-daemon.install was found to
+declare usr/share/hwprivacy/presets/*.toml while debian/rules never staged the
+presets at all. Nobody had run dpkg-buildpackage to find out.
+
+THE MANIFEST IS NOT WRITTEN HERE
+--------------------------------
+The expected file list is parsed from debian/*.install, which already declares
+every installed path and is a file a human reads. Writing a third list would
+create exactly the drift this repo keeps getting bitten by — the failure mode
+is never "the check was too weak", it is "two lists that were supposed to agree
+quietly stopped agreeing". If you add a file to `make install`, the manifest
+must gain a line or this fails, which is the point.
+
+Extras are failures, not warnings, for the same reason: an installed file that
+no manifest declares is a file the .deb will not ship.
+
+DEFAULT PREFIX ONLY
+-------------------
+The debian manifests are /usr-relative and `install-lsm` hardcodes
+/usr/lib/systemd/system for the system unit, so this checks a default-prefix
+install and takes no --prefix. Per the house rule that a check is added only
+after something has actually gone wrong, a PREFIX-aware version can be written
+the first time a non-default prefix matters.
+
+Usage:
+    tools/install-check --destdir DIR          human
+    tools/install-check --destdir DIR --json   for Claude
+
+Read-only with respect to the repo; it only stats the staged tree.
+Exit 0 clean, 1 on a real failure, 2 when it cannot run at all — an empty or
+missing tree is never reported as a pass.
+"""
+
+import argparse
+import glob as globmod
+import json
+import os
+import stat
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# usr/bin holds the executables; everything else this project installs is data.
+EXEC_DIR = "usr/bin"
+EXEC_MODE = 0o755
+DATA_MODE = 0o644
+
+failures = []
+passes = []
+
+
+def fail(check, path, problem):
+    failures.append({"check": check, "file": path, "problem": problem})
+
+
+def ok(msg):
+    passes.append(msg)
+
+
+def cannot_run(why):
+    """Exit 2. A tree we could not inspect must never read as a pass."""
+    print(f"hwprivacy install-check — CANNOT RUN\n\n  {why}", file=sys.stderr)
+    sys.exit(2)
+
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--destdir", required=True,
+                help="the staged tree, e.g. the DESTDIR given to make install")
+ap.add_argument("--json", action="store_true", help="machine-readable output")
+args = ap.parse_args()
+
+DESTDIR = os.path.abspath(args.destdir)
+
+# ══════════════════════════════════════════════════════════════════
+# 0. Refuse to grade an empty tree.
+#    OCCURRED (elsewhere in this repo): tools/gui-test walked an unmapped
+#    window, found nothing, and every assertion passed vacuously.
+# ══════════════════════════════════════════════════════════════════
+if not os.path.isdir(DESTDIR):
+    cannot_run(f"no such directory: {DESTDIR}\n"
+               f"  stage one first:  make install DESTDIR={DESTDIR}")
+
+staged = {}
+for dirpath, _dirnames, filenames in os.walk(DESTDIR):
+    for f in filenames:
+        full = os.path.join(dirpath, f)
+        staged[os.path.relpath(full, DESTDIR)] = full
+
+if not staged:
+    cannot_run(f"{DESTDIR} exists but contains no files\n"
+               f"  stage one first:  make install DESTDIR={DESTDIR}")
+
+# ══════════════════════════════════════════════════════════════════
+# 1. The declared manifest, read from debian/*.install.
+# ══════════════════════════════════════════════════════════════════
+manifests = sorted(globmod.glob(os.path.join(ROOT, "debian", "*.install")))
+if not manifests:
+    cannot_run("no debian/*.install files — there is no manifest to check against")
+
+declared = []          # (source manifest, declared line)
+for m in manifests:
+    with open(m, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                declared.append((os.path.basename(m), line))
+
+# ══════════════════════════════════════════════════════════════════
+# 2. Everything declared must be staged.  A glob must match at least once —
+#    a pattern matching nothing is how dh_install fails a package build.
+# ══════════════════════════════════════════════════════════════════
+matched = set()
+for src, pattern in declared:
+    if any(c in pattern for c in "*?["):
+        hits = [rel for rel in staged if globmod.fnmatch.fnmatch(rel, pattern)]
+        if not hits:
+            fail("missing", pattern,
+                 f"declared by debian/{src}, matched nothing in the staged tree")
+        matched.update(hits)
+    else:
+        if pattern in staged:
+            matched.add(pattern)
+        else:
+            fail("missing", pattern, f"declared by debian/{src}, not staged")
+
+if not [f for f in failures if f["check"] == "missing"]:
+    ok(f"every path declared by debian/*.install is staged ({len(declared)} entries)")
+
+# ══════════════════════════════════════════════════════════════════
+# 3. Nothing staged may be undeclared.  An installed file no manifest
+#    declares is a file the .deb will silently not ship.
+# ══════════════════════════════════════════════════════════════════
+extras = sorted(set(staged) - matched)
+for rel in extras:
+    fail("undeclared", rel,
+         "staged by make install but declared by no debian/*.install — "
+         "the package would not ship it")
+if not extras:
+    ok(f"nothing is staged that the manifest does not declare ({len(staged)} files)")
+
+# ══════════════════════════════════════════════════════════════════
+# 4. Modes.  A binary installed 0644 is not executable, and nothing
+#    downstream notices until a user tries to run it.
+# ══════════════════════════════════════════════════════════════════
+bad_modes = 0
+for rel, full in sorted(staged.items()):
+    want = EXEC_MODE if rel.startswith(EXEC_DIR + "/") else DATA_MODE
+    got = stat.S_IMODE(os.stat(full).st_mode)
+    if got != want:
+        bad_modes += 1
+        fail("mode", rel, f"is {got:04o}, expected {want:04o}")
+if not bad_modes:
+    ok("every staged file carries the mode its kind requires")
+
+# ══════════════════════════════════════════════════════════════════
+# 5. The executables are real ELF binaries and not empty.
+#    Assert on the file's own bytes, not on a name.
+# ══════════════════════════════════════════════════════════════════
+bins = sorted(r for r in staged if r.startswith(EXEC_DIR + "/"))
+bad_bins = 0
+for rel in bins:
+    full = staged[rel]
+    size = os.path.getsize(full)
+    if size == 0:
+        bad_bins += 1
+        fail("binary", rel, "is zero bytes")
+        continue
+    with open(full, "rb") as fh:
+        if fh.read(4) != b"\x7fELF":
+            bad_bins += 1
+            fail("binary", rel, "is not an ELF executable")
+if bins and not bad_bins:
+    ok(f"all {len(bins)} installed binaries are non-empty ELF")
+
+# ══════════════════════════════════════════════════════════════════
+# Report.
+# ══════════════════════════════════════════════════════════════════
+if args.json:
+    print(json.dumps({"ok": not failures, "failures": failures, "passes": passes,
+                      "measured": {"destdir": DESTDIR, "staged": len(staged),
+                                   "declared": len(declared),
+                                   "manifests": [os.path.basename(m) for m in manifests]}},
+                     indent=2))
+else:
+    print(f"hwprivacy install-check — measured: {len(staged)} files staged, "
+          f"{len(declared)} declared across {len(manifests)} manifests")
+    print()
+    for p in passes:
+        print(f"  ok    {p}")
+    if failures:
+        print()
+        for f in failures:
+            print(f"  FAIL  [{f['check']}] {f['file']}")
+            print(f"        {f['problem']}")
+        print(f"\n{len(failures)} problem(s) between the staged tree and the manifest.")
+    else:
+        print("\nThe staged tree matches the manifest.")
+
+sys.exit(1 if failures else 0)

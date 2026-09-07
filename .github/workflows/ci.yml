@@ -52,67 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
 
-      # GTK4 for the GUI crate; clang/libbpf for the eBPF skeleton.
-      #
-      # bpftool needs care. There is no standalone `bpftool` package on Ubuntu:
-      # the name is VIRTUAL, provided by linux-tools-common, which ships no
-      # binary of its own. What linux-tools-common does ship is /usr/sbin/bpftool,
-      # a wrapper that dispatches on `uname -r` — and hosted runners run an Azure
-      # kernel (6.17.0-*-azure) whose linux-tools package does not exist, so that
-      # wrapper resolves to nothing. That is the stub, and it is why every earlier
-      # attempt here found no bpftool.
-      #
-      # linux-tools-generic is a different thing: it depends on the GENERIC
-      # flavour's tools (linux-tools-6.8.0-*-generic on noble), which is a real
-      # package containing a real binary under /usr/lib/linux-tools/<ver>/. That
-      # binary is called directly below, never through the wrapper. It does not
-      # need to match the running kernel — it reads /sys/kernel/btf/vmlinux as a
-      # data file, it does not load anything.
-      - name: install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libgtk-4-dev libdbus-1-dev pkg-config \
-            clang libbpf-dev linux-tools-generic
-
-      # vmlinux.h is generated from the RUNNING kernel's BTF and is not
-      # committed, because it describes the kernel it was built against. The
-      # runner's kernel is not Debian 13's, which is exactly why this is
-      # generated here rather than shipped.
-      #
-      # There is no fallback, deliberately. pahole (dwarves) was tried and
-      # measured: `pahole --compile /sys/kernel/btf/vmlinux` exits 0 and emits
-      # 156k plausible lines that do NOT compile — it drops the anonymous enums
-      # bpf_helpers.h needs (BPF_ANY, BPF_NOEXIST) and redefines va_list against
-      # clang's own. A fallback that silently produces a broken header turns a
-      # missing-tool failure into a Rust build panic two minutes downstream,
-      # which is how this workflow stayed red.
-      - name: generate vmlinux.h from the runner's kernel BTF
-        run: |
-          set -euo pipefail
-          OUT=hwprivacy-lsm/src/bpf/vmlinux.h
-          BPFTOOL=$(ls -1 /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -V | tail -1)
-          if [ -z "$BPFTOOL" ]; then
-            echo "no bpftool under /usr/lib/linux-tools — linux-tools-generic shipped none"
-            ls -la /usr/lib/linux-tools/ 2>&1 || true
-            exit 1
-          fi
-          echo "using $BPFTOOL"
-          "$BPFTOOL" version
-          "$BPFTOOL" btf dump file /sys/kernel/btf/vmlinux format c > "$OUT"
-          wc -l "$OUT"
-
-      # Prove the header we just generated is usable, HERE, rather than letting
-      # cargo discover it inside build.rs where the error reads as a Rust
-      # problem. One second, and it fails in the step that caused it.
-      - name: the generated header must actually compile
-        run: |
-          set -euo pipefail
-          clang -g -O2 -target bpf -D__TARGET_ARCH_x86 \
-            -I hwprivacy-lsm/src/bpf \
-            -c hwprivacy-lsm/src/bpf/devices.bpf.c \
-            -o "$RUNNER_TEMP/devices.bpf.o"
-          ls -l "$RUNNER_TEMP/devices.bpf.o"
+      - uses: ./.github/actions/bpf-toolchain
 
       # rustfmt, and it is not what it looks like. libbpf-cargo runs rustfmt
       # over the generated skeleton as a COSMETIC pass, and handles it being
@@ -145,3 +85,49 @@ jobs:
       # on a hosted runner because it needs root and a real capture device.
       - name: cargo test
         run: cargo test --workspace --locked
+
+  # Prove `make install` actually installs. It had NEVER BEEN RUN — not here,
+  # not in a container, not on the developer's machine, which got its working
+  # install by accretion over months rather than by executing the target. A
+  # hosted runner is a clean stranger's machine, and staging into a DESTDIR
+  # needs no root, no reboot and no hardware.
+  #
+  # What this does NOT cover, stated rather than implied: enabling `bpf` in the
+  # kernel's LSM list, a reboot, the service attaching, or a real camera. Those
+  # need a machine you can reboot, and no hosted runner is one.
+  install:
+    name: make install installs what it declares
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
+
+      - uses: ./.github/actions/bpf-toolchain
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87  # stable branch, 2026-09-03
+        with:
+          toolchain: "1.85.0"
+          components: rustfmt
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+
+      # The install targets copy out of target/release/, so this cannot ride
+      # along on the debug build the test matrix does.
+      - name: cargo build --release
+        run: cargo build --release --workspace --locked
+
+      # install-lsm is deliberately separate from install — it runs as root and
+      # denies the camera by default, so it is never pulled in silently. Both
+      # are staged here because both are what a packager would call.
+      - name: stage the install
+        run: |
+          set -euo pipefail
+          make install DESTDIR="$RUNNER_TEMP/stage"
+          make install-lsm DESTDIR="$RUNNER_TEMP/stage"
+
+      - name: the staged tree must match debian/*.install
+        run: tools/install-check --destdir "$RUNNER_TEMP/stage"
+
+      # Print it so a human can eyeball what a user would actually get.
+      - name: what was installed
+        run: find "$RUNNER_TEMP/stage" -type f | sed "s|$RUNNER_TEMP/stage||" | sort
+

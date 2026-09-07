@@ -1,7 +1,7 @@
 PREFIX ?= /usr
 DESTDIR ?=
 
-.PHONY: build install install-lsm clean deb doc-check gui-test tui-screen check
+.PHONY: build install install-lsm install-check clean deb doc-check gui-test tui-screen check
 
 build:
 	cargo build --release --workspace
@@ -29,6 +29,22 @@ tui-screen:
 
 check: doc-check
 	cargo test --workspace
+
+# Prove `make install` puts the declared files in the declared places.
+#
+# Stages into a throwaway DESTDIR and compares the result against
+# debian/*.install — the manifest this repo already has, rather than a third
+# hand-written list that would only drift from the other two.
+#
+# NOT part of `check`, same reasoning as gui-test: it needs target/release/,
+# and a gate that fails where it cannot run teaches you to skip the gate.
+# Run it after touching the install targets or debian/*.install.
+install-check:
+	@d=$$(mktemp -d); \
+	  { $(MAKE) --no-print-directory install DESTDIR=$$d && \
+	    $(MAKE) --no-print-directory install-lsm DESTDIR=$$d; } >/dev/null && \
+	  tools/install-check --destdir $$d; \
+	  rc=$$?; rm -rf $$d; exit $$rc
 
 install:
 	install -D -m 0755 target/release/hwprivacy-daemon $(DESTDIR)$(PREFIX)/bin/hwprivacy-daemon
