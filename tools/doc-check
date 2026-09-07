@@ -301,6 +301,14 @@ SENTINELS = [
      "set_rule filling every category. Granting one device wrote deny for the "
      "other two, silently downgrading them from default_action. Categories are "
      "Option<Permission>; use AppRule::empty() — see d-a-rule-has-no-opinion-by-default."),
+    ("libc::getgrnam(",
+     "the non-reentrant group lookup is back. getgrnam returns a pointer into "
+     "SHARED STATIC storage, so a concurrent lookup overwrites it between the "
+     "call and the read of gr_gid — CI hit exactly that on 2026-09-07, where "
+     "lookup_gid(\"root\") returned 1001. hwprivacy-lsm runs as root and this "
+     "gid decides who owns the control socket that accepts policy pushes, so "
+     "the wrong answer is a privilege boundary. Use getgrnam_r with a "
+     "caller-owned buffer. The race test is probabilistic; this is not."),
     ("is clang installed?",
      "the skeleton build is guessing at its own cause again. This message "
      "named clang, and the one time it mattered — CI, 2026-09-07 — the cause "

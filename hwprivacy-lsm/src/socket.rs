@@ -292,14 +292,63 @@ fn describe_peer(stream: &UnixStream) -> String {
 
 /// Resolve a group name to a gid via getgrnam.
 fn lookup_gid(group: &str) -> Result<u32> {
+    // getgrnam_r, NOT getgrnam. The non-reentrant version returns a pointer
+    // into shared static storage, and "we only read gr_gid before returning"
+    // is not enough: another thread's lookup overwrites that buffer between
+    // the call and the read. CI caught it on 2026-09-07 — lookup_gid("root")
+    // returned 1001, the gid of the runner's own group, because a concurrent
+    // test was resolving $USER at the time. This runs as root and the result
+    // decides who owns the control socket that accepts policy pushes, so the
+    // wrong answer here is a privilege boundary, not a cosmetic bug.
     let cname = std::ffi::CString::new(group)?;
-    // SAFETY: getgrnam takes a NUL-terminated string and returns a pointer to
-    // static storage or NULL. We only read gr_gid before returning.
-    let ptr = unsafe { libc::getgrnam(cname.as_ptr()) };
-    if ptr.is_null() {
-        anyhow::bail!("no such group: {group}");
+
+    // The libc-recommended starting size for this buffer, asked for rather
+    // than guessed. Some platforms answer -1 ("indeterminate"); 1024 is the
+    // conventional floor for that case.
+    // SAFETY: sysconf with a valid name; returns a scalar.
+    let hint = unsafe { libc::sysconf(libc::_SC_GETGR_R_SIZE_MAX) };
+    let mut size = if hint > 0 { hint as usize } else { 1024 };
+    let mut buf = vec![0u8; size];
+
+    loop {
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::group = std::ptr::null_mut();
+
+        // SAFETY: cname is NUL-terminated and outlives the call; buf is a
+        // writable allocation of exactly `buf.len()` bytes owned by this
+        // frame; grp and found are valid out-parameters. Nothing here is
+        // shared with another thread, which is the entire point.
+        let rc = unsafe {
+            libc::getgrnam_r(
+                cname.as_ptr(),
+                &mut grp,
+                buf.as_mut_ptr() as *mut libc::c_char,
+                buf.len(),
+                &mut found,
+            )
+        };
+
+        if rc == libc::ERANGE {
+            // Grow and retry, but do not grow forever — a bounded failure is
+            // better than a hang in a root process.
+            size = size.saturating_mul(2);
+            if size > 1 << 20 {
+                anyhow::bail!("group lookup for {group} needs an implausible buffer");
+            }
+            buf.resize(size, 0);
+            continue;
+        }
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc))
+                .with_context(|| format!("group lookup failed for {group}"));
+        }
+        // rc == 0 with a NULL result means "no such group" — distinct from an
+        // error, and the two must not be collapsed.
+        if found.is_null() {
+            anyhow::bail!("no such group: {group}");
+        }
+        return Ok(grp.gr_gid);
     }
-    Ok(unsafe { (*ptr).gr_gid })
 }
 
 fn chown_group(path: &Path, gid: u32) -> Result<()> {
@@ -393,6 +442,65 @@ mod tests {
         let e = lookup_gid("definitely-not-a-real-group-xyzzy");
         assert!(e.is_err());
         assert!(format!("{:#}", e.unwrap_err()).contains("no such group"));
+    }
+
+    /// 2026-09-07, found by CI: lookup_gid used getgrnam, whose result lives in
+    /// shared static storage. Two tests resolving different groups in parallel
+    /// raced, and lookup_gid("root") returned 1001 — the gid of the runner's
+    /// own group — on a hosted runner. It passed the run before, which is what
+    /// a race looks like.
+    ///
+    /// This hammers two different groups from several threads at once. The
+    /// contention is not decoration: at 8x300 the buggy version PASSED, which
+    /// would have made this a test that proves nothing. Measured against the
+    /// reintroduced getgrnam on 2026-09-07, 16x4000 fires the assertion in
+    /// 3 trials out of 3 (1-5 threads tripping each time). Against getgrnam_r,
+    /// whose buffer belongs to the caller, it cannot fail.
+    ///
+    /// tools/doc-check carries the deterministic half: a sentinel that refuses
+    /// the non-reentrant call outright, since a race test is by nature
+    /// probabilistic.
+    #[test]
+    fn concurrent_lookups_do_not_clobber_each_other() {
+        // Any real non-root group will do as the thing to race against; take
+        // the first one the system actually has rather than assuming a name.
+        let groups = std::fs::read_to_string("/etc/group").unwrap_or_default();
+        let other = groups.lines().find_map(|l| {
+            let mut f = l.split(':');
+            let name = f.next()?;
+            let _passwd = f.next()?;
+            let gid: u32 = f.next()?.parse().ok()?;
+            if gid != 0 && !name.is_empty() {
+                Some((name.to_string(), gid))
+            } else {
+                None
+            }
+        });
+        let Some((other_name, other_gid)) = other else {
+            return; // no second group on this system; nothing to race
+        };
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let name = other_name.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..4_000 {
+                    assert_eq!(
+                        lookup_gid("root").unwrap(),
+                        0,
+                        "root's gid was clobbered by a concurrent lookup"
+                    );
+                    assert_eq!(
+                        lookup_gid(&name).unwrap(),
+                        other_gid,
+                        "{name}'s gid was clobbered by a concurrent lookup"
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("a lookup thread panicked");
+        }
     }
 
     #[test]
