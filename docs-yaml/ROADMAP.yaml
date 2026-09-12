@@ -2,30 +2,59 @@
 # Updated when work lands or priorities shift.
 ---
 current_state:
-  date: "2026-08-04"
-  stage: "build"
+  date: "2026-09-12"
+  as_of_note: >
+    Re-verified against the filesystem and the running host on 2026-09-12, not
+    against another document. The block below had carried date 2026-08-04 and
+    three claims that were false by then — see corrected_2026_09_12.
+  stage: "published, enforcing on both layers, not yet released"
   reality_check: >
-    This project is FEATURE-COMPLETE and was mis-remembered as unfinished. All
-    five planned phases exist in code, `cargo check --workspace` is clean, and
-    the daemon has been running continuously as a systemd user service. What
-    failed was not scope — it was four behavioural defects that made daily use
-    unpredictable.
+    Both enforcement layers run continuously and enforce. All five kernel
+    phases have landed; b1-b4 are fixed; the repo is public; CI is green on a
+    1.85.0/stable matrix; the .deb builds. What is NOT done is a release: no
+    .deb has ever been installed anywhere, there are no man pages, and no
+    reboot-and-attach test has run on a machine other than this one.
 
   verified_working:
     - "Cargo workspace, 7 crates, 16172 LOC, 255 tests run / 257 declared, builds clean (21 warnings, 0 errors) — verified 2026-09-12"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"
-    - "5 permission levels + per-stream gating for browsers"
-    - "D-Bus service, 11 methods, session bus, activation file installed"
-    - "hwprivacy-ctl — all 7 command groups functional against the live daemon"
-    - "hwprivacy-tui — 4 panels, keyboard rule editing"
-    - "hwprivacy-gui — GTK4 tabs, add/remove rules, ksni tray, close-to-tray"
+    - "FOUR permission levels — allow / ask / while_in_use / deny. NOT five, and there is no per-stream gating: ask_each and the whole per-stream branch were deleted 2026-08-23 (d-no-per-stream-grants). The string still parses, to `ask`, so old configs load."
+    - "D-Bus service, 17 methods, session bus, activation file installed"
+    - "hwprivacy-ctl — all command groups functional against the live daemon"
+    - "hwprivacy-tui — 4 panels, keyboard rule editing, kernel status line (5 tests since 2026-09-12; it had none)"
+    - "hwprivacy-gui — GTK4 tabs, add/remove rules, camera-grant dialog, kernel status label, ksni tray, close-to-tray; 19 gui-test checks against the live window"
     - "2-stage notifications (instant BLOCKED + action prompt)"
-    - "`hwprivacy-daemon install/uninstall` — systemd user unit + D-Bus activation"
-    - "Complete debian/ packaging tree"
+    - "Layer 2 enforcing BOTH guards from boot: camera by executable inode, ALSA capture nodes by allowlist"
+    - "Both guards REPORTED by every frontend since 2026-09-12 (GetAudioBackstop)"
+    - "debian/ packaging builds: 5 packages, lintian 0 errors, 5 no-manual-page warnings"
+
+  corrected_2026_09_12:
+    label: "What this block asserted that the host refuted. Recorded so the lapse is visible, not smoothed over."
+    was_false:
+    - "date said 2026-08-04 — five weeks stale, spanning the kernel pivot, the b1-b4 fixes, publication and CI"
+    - "'5 permission levels + per-stream gating for browsers' — there are FOUR, and per-stream gating was deleted 2026-08-23. Only a serde alias survives."
+    - "'D-Bus service, 11 methods' — 17"
+    - "measured_live_2026_08_04 reported 1.2% idle CPU and `running_from: target/release/`; both were superseded (0.033% via pw-dump --monitor, and ~/.local/bin since 2026-08-04)"
+
+  measured_live_2026_09_12:
+    layer1_idle: >
+      NOT re-measured comparably. The reading taken today was 0.101% of one
+      core over an 11-minute window that included several restarts and the
+      120 s startup device-rescan, so it is not comparable to the 0.033%
+      figure, which came from a 13-hour steady-state window. Recorded as
+      unknown rather than as a regression — see d-monitor-stream-not-polling
+      for the method that produced the comparable number.
+    layer2_idle: "0.043% of one core — matches the 0.041-0.045% recorded 2026-09-01"
+    guarded_devices: 4
+    active_rules: 8
+    kernel_allowlist: "6 keys from 7 exe_path rules — pipewire-pulse is a symlink to pipewire and shares its inode (CONVENTIONS > exe_path_identity)"
+    daemon_nrestarts: 0
+    running_from: "~/.local/bin/ for the four user binaries; /usr/bin/hwprivacy-lsm for the root helper"
 
   measured_live_2026_08_04:
+    note: "HISTORICAL. Kept because the 1.2% figure is referenced by the CPU-regression investigation; do not read it as current."
     daemon_pid: 2331
     uptime: "11h05m"
     cpu: "8m15s = 1.2% of one core, at idle"
@@ -1045,6 +1074,24 @@ kernel_layer:
 
 next_up:
   label: "Ordered. Tranche 1 landed 2026-08-21; what remains is below."
+  done_2026_09_12:
+    - "audio-backstop-visibility — GetAudioBackstop(); every frontend now reports both kernel guards and the reason one is off. See d-a-guard-that-is-not-reported-is-not-delivered."
+    - "doc-check DOC_CLAIMS + 3% LOC tolerance + the deleted-file hole in REQUIRED. See d-doc-claims-a-third-gate-shape."
+  closed_from_steps_2026_09_12:
+    label: >
+      These three sat in `steps` after shipping — `steps` states the FUTURE, so a
+      finished item must leave it. cpu-regression even carried "DONE 2026-09-01"
+      inline, which is exactly the mark-done-in-place that makes a roadmap
+      unreadable.
+    items:
+    - id: presets
+      shipped: "2026-08-23 — presets/*.toml, `hwprivacy-ctl preset import <name> --apply`, preview by default. Verified present in the install tree (/usr/share/hwprivacy/presets/) by tools/install-check."
+      ref: "d-presets-are-data"
+    - id: cpu-regression
+      shipped: "2026-09-01 — pw-dump --monitor replaced polling; 2.70-2.82% -> 0.033% of one core. Layer 2 re-measured today at 0.043%, matching its record."
+      ref: "d-monitor-stream-not-polling"
+    - id: git-init
+      shipped: "2026-08-04 — git exists; 90 commits and a public GitHub remote as of 2026-09-12."
   done_2026_08_23:
     - "notify-on-allow — a pure gate (notify_allow.rs) with a startup grace and a per-(app,device) cooldown; kernel layer reports CAMERA allows only, to avoid double-notifying the mic"
     - "offenders -> history, with an allowed column and a migration that preserved all 115 accumulated denials"
@@ -1054,16 +1101,6 @@ next_up:
     - "b1, b2, b3, b4 — ALL FOUR fixed, each new test verified to fail against the reintroduced defect"
     - "classify_link() covered — 14 tests, including that ordinary playback is not a monitor tap. It held the whole layer-1 security decision with zero tests since 2026-03-27."
   steps:
-  - id: presets
-    what: "Importable rule sets under /usr/share/hwprivacy/presets/ and ~/.config/hwprivacy/presets/."
-    why: "Costin 2026-08-21, after ruling out anything browser-specific: the MECHANISM is generic, the CONTENT is data the user opts into."
-    design:
-      - "candidate path LISTS per entry, not one path — /usr/lib/firefox-esr/... is Debian-specific"
-      - "import must NEVER widen an existing rule; skip and report"
-      - "--dry-run first; no auto-import. A preset granting camera=allow is a grant."
-      - "baseline (pipewire, wireplumber, xdg-desktop-portal) ships in the generated default config; applications are opt-in presets"
-    mode: execute
-
   - id: camera-sessions-need-an-answerable-denial
     what: >
       Make a kernel camera denial ACTIONABLE, so a camera session can be
@@ -1193,52 +1230,6 @@ next_up:
       fallback hid a broken release path for an hour.
     mode: decide
 
-  - id: cpu-regression
-    status: "DONE 2026-09-01. Diagnosed, then fixed: 2.70-2.82% -> 0.033%, measured on the live service."
-    what: "Layer 1's idle cost: 1.24% of a core (2026-08-04) -> 2.70-2.82% (2026-09-01)."
-    measured_2026_09_01:
-      layer1_steady_state: "2.70-2.82% of one core (three readings, 13h average 2.75%)"
-      pw_dump_alone_at_2hz: "1.74% of one core — 40 spawns in 20 s, no daemon involved"
-      daemons_own_work: "~1.0% — parse, diff, policy"
-      layer2_kernel_helper: "0.041-0.045%"
-    the_finding: >
-      62% of layer 1's idle cost is fork/exec of an external binary twice a
-      second, before a line of hwprivacy's code runs. capture_graph() spawns
-      pw-dump every tick: process spawn, PipeWire connect/enumerate/disconnect,
-      210 KB of JSON serialised by pw-dump and re-parsed by serde.
-    ruled_out: >
-      The graph did NOT grow. Docs record 272 KB; it is 210 KB / 87 objects now,
-      ~9 ms per dump. Fewer rules today (1 -> 4) than in August. The startup
-      device-rescan window is also NOT leaking: it does stop after 120 s,
-      verified by counting rescans in a clean 60 s window (zero). An earlier
-      count of 55 in 10 minutes was an artifact of repeated daemon restarts
-      during testing.
-    honest_conclusion: >
-      The 1.24% reading is the outlier, not the 2.8%. Both used cgroup CPU over
-      uptime, but the 2026-08-04 daemon ran on a machine in a state that cannot
-      be reconstructed. What IS established: the current cost is structural, and
-      most of it is not hwprivacy's code.
-    the_fix_and_its_measurement:
-      what: "`pw-dump --monitor` — one long-lived process streaming changes, instead of a spawn twice a second."
-      measured: "0.031% of one core at idle, vs 1.74% for spawning at 2 Hz. A 56x reduction, measured 2026-09-01 the same way (systemd scope, cgroup cpu.stat)."
-      projected: "layer 1 falls from ~2.7% to ~1.0% — below the 1.24% Costin already called 'very generous'."
-      why_it_is_not_trivial: >
-        It replaces the monitoring substrate: capture_graph() returns a full
-        snapshot today and every caller assumes that shape. --monitor emits
-        incremental changes, so the daemon must maintain the graph itself. That
-        is most of the work d-event-driven-substrate describes, without the
-        pipewire-rs dependency or the MSRV question.
-      relationship_to_event_driven_substrate: >
-        A cheaper path to the same place. pipewire-rs would also remove the ~500
-        ms race window and g1 (grandfathered links); --monitor removes the CPU
-        cost and the spawn, and MAY narrow the race, but that has not been
-        measured. Decide between them before writing code.
-    do_not: >
-      Do not raise poll_interval_ms. It buys CPU by widening the race window,
-      and most of the cost is per-spawn overhead rather than per-poll work, so
-      halving the rate does not halve the cost.
-    mode: decide
-
   - id: doc-check-host-tier
     what: "`make doc-check --host` — query systemd, cgroup CPU, and re-stat recorded inodes."
     why: >
@@ -1256,12 +1247,6 @@ next_up:
     ref: "DECISIONS.yaml d-event-driven-substrate"
     mode: decide
     est_minutes: 480
-
-  - id: git-init
-    what: "git init + .gitignore target/ before any of the above."
-    why: "3.2 GB repo with no version control and a running service pointed at target/release/. There is currently no way to undo a bad edit."
-    mode: execute
-    est_minutes: 10
 
 deferred:
   - id: emit-missing-signals
@@ -1289,8 +1274,20 @@ deferred:
     what: "Android-style green dot when mic or camera is live."
 
   - id: deb-build
-    what: "Run dpkg-buildpackage end to end, test install/uninstall on clean Debian 13."
-    note: "debian/ is complete but has never been exercised. control descriptions are boilerplate that never mention PipeWire."
+    what: "INSTALL the .deb and uninstall it, on a clean Debian 13 that can be rebooted."
+    corrected_2026_09_12: >
+      This said "debian/ is complete but has never been exercised". False since
+      2026-09-07: dpkg-buildpackage produces 5 packages with lintian reporting 0
+      errors and 5 warnings, all no-manual-page. Building it found three ways it
+      would have hurt users — a unit installed twice, generated postinst
+      snippets that would attach an eBPF LSM as root at apt-install time, and a
+      maintainer address asserting a Debian Developer identity not held.
+    what_actually_remains: >
+      No .deb has ever been INSTALLED anywhere, and nothing rebuilds it on push
+      (it cannot run on ubuntu-latest — Build-Depends: bpftool is a virtual
+      package there — so it needs a debian:trixie container job). The real prize
+      is executing README's install instructions, which no human ever has, and
+      that needs a machine you can reboot.
 
   - id: man-pages
     what: "One per binary. Required for any Debian ITP."

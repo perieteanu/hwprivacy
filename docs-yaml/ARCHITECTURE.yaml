@@ -1,5 +1,7 @@
 # What lives where, how data flows, who owns what.
-# Verified against source + the live running daemon on 2026-08-19.
+# Verified against source + the live running daemon on 2026-09-12.
+# Every number below was re-measured from the tree or the host on that date,
+# never copied from a sibling document.
 #
 # HISTORY OF THIS FILE: it was written 2026-08-04 22:38 and described a
 # 5-crate, PipeWire-only, zero-test project. That was accurate for eighteen
@@ -13,7 +15,12 @@ shape:
   layout: "Cargo workspace, 7 crates, 16172 LOC of first-party code (BPF C included; generated vmlinux.h excluded) — measured 2026-09-12"
   build: "cargo build --release --workspace  (or: make build)"
   binaries: 5
-  tests: 132        # 49 lsm + 62 daemon + 15 common + 6 proto. Zero in ctl/tui/gui.
+  tests: 257        # declared; 255 run (2 need a display). Measured 2026-09-12.
+  test_distribution: "daemon 123, common 60, lsm 56, proto 6, ctl 5, tui 5, gui 2"
+  corrected_2026_09_12: >
+    This said 132 tests and "Zero in ctl/tui/gui", which had been false since
+    2026-08-21 for ctl/gui and became false for the TUI on 2026-09-12 when
+    kernel_status_line got the crate's first five tests.
   test_distribution_warning: >
     The 2026-08-21 tranches closed the worst of it: the dismiss path, one-shot
     grants, rule-name sanitising, policy staleness, and finally the layer-1
@@ -45,17 +52,17 @@ two_layers:
 
 crates:
   hwprivacy-common:
-    loc: 698
+    loc: 2501
     purpose: "Shared types + the zbus client proxy. Every other crate depends on it."
     files:
-      config.rs:         "Permission enum (5 levels), AppRule (incl. exe_path, which governs BOTH layers), Config, TOML load/save, normalize_app_name, kernel-allowlist derivation + gap reporting"
+      config.rs:         "Permission enum (FOUR levels: allow/ask/while_in_use/deny — ask_each was deleted 2026-08-23 and survives only as a serde alias for ask), AppRule (incl. exe_path, which governs BOTH layers), Config, TOML load/save, normalize_app_name, kernel-allowlist derivation + gap reporting"
       device.rs:         "DeviceCategory (Microphone|Camera|Monitor), ProtectedDevice"
       stream.rs:         "StreamInfo, ActiveConnection, AccessEvent, AccessAction"
       dbus_interface.rs: "#[zbus::proxy] trait HwPrivacy — the client side of the API"
       preset.rs:         "importable rule sets: parsing, candidate-path resolution, and the import PLAN. Pure — the safety properties are testable without a filesystem."
 
   hwprivacy-daemon:
-    loc: 2095
+    loc: 7100
     purpose: "The only component that enforces anything. Everything else is a viewer."
     files:
       main.rs:            "CLI (run/install/uninstall/service-status), the monitoring loop, systemd+D-Bus unit installation"
@@ -65,25 +72,32 @@ crates:
       link_manager.rs:    "destroy_link() via pw-link --disconnect, fallback pw-cli destroy"
       stream_tracker.rs:  "active connections, 500-event ring buffer, one-shot grants, dismiss cooldowns"
       notification.rs:    "2-stage freedesktop notifications via notify-rust"
-      dbus_service.rs:    "#[zbus::interface] server impl — 11 methods, 3 declared signals"
+      dbus_service.rs:    "#[zbus::interface] server impl — 17 methods, 3 declared signals (AccessAttempt and StreamEvent are declared and never emitted; frontends poll)"
       state.rs:           "DaemonState = config + devices + tracker + known_link_ids + block_all"
       lsm_client.rs:      "layer 2 client — connects to the root helper's unix socket, reconnects every 10s, pushes the allowlist, RE-pushes it whenever PolicyFingerprint changes, receives kernel AccessEvents and folds them into the same tracker/notification path"
       history.rs:         "the persistent per-(identity, device, source) table behind `hwprivacy-ctl history` — denied AND allowed counts. Survives restarts; $XDG_STATE_HOME/hwprivacy/history.json, atomic writes, migrates from the pre-2026-08-21 offenders.json."
       notify_allow.rs:    "the pure gate deciding whether an ALLOWED access is announced: startup grace, per-(app,device) cooldown, never a burst summary."
 
   hwprivacy-ctl:
-    loc: 230
-    purpose: "CLI. status | devices | rules {list,set,remove} | streams | log | block-all | unblock-all"
+    loc: 772
+    purpose: "CLI. status | devices | rules {list,set,remove,allow-camera,denied-cameras} | streams | log | history | preset | block-all | unblock-all"
     note: "Pure D-Bus client. Cannot function without the daemon."
 
   hwprivacy-tui:
-    loc: 498
-    purpose: "ratatui 4-panel view (Devices/Streams/Rules/Events). Polls D-Bus every 1s."
-    keys: "Tab=cycle panel, Up/Down=select, r=refresh, q/Esc=quit; in Rules: a=allow d=deny e=ask_each w=while_in_use x=remove"
+    loc: 709
+    tests: 5
+    purpose: "ratatui 4-panel view (Devices/Streams/Rules/Events) + a two-line status bar carrying the kernel layer. Polls D-Bus every 1s."
+    keys: "Tab=cycle panel, Up/Down=select, r=refresh, q/Esc=quit; in Rules: a=allow d=deny w=while_in_use x=remove"
+    keys_corrected_2026_09_12: >
+      This listed e=ask_each, which has not existed since 2026-08-23. Verified
+      against input.rs: the only Rules keys are a/d/w/x. Note the consequence —
+      there is NO key for `ask`, so the TUI cannot set the permission that
+      default_action uses. Not fixed here; recorded because nothing else says it.
 
   hwprivacy-gui:
-    loc: 598
-    purpose: "GTK4 notebook (4 tabs) + ksni StatusNotifierItem tray. Polls D-Bus every 2s."
+    loc: 1077
+    tests: 2
+    purpose: "GTK4 notebook (4 tabs) + a kernel-layer label + ksni StatusNotifierItem tray. Polls D-Bus every 2s."
     files:
       main.rs:   "gtk::Application, tray thread + mpsc bridge, raw GLib log writer to suppress GTK 4.18 noise"
       window.rs: "tabs, add-rule form, Block All / Unblock All / Refresh, dbus_worker on its own tokio runtime"
@@ -91,7 +105,7 @@ crates:
     note: "Close button hides to tray (connect_close_request returns Propagation::Stop). Ctrl+Q or tray Exit really quits."
 
   hwprivacy-proto:
-    loc: 271
+    loc: 293
     tests: 6
     purpose: "The wire protocol between the root helper and the user daemon. serde + serde_json ONLY, deliberately — so the root process links no D-Bus stack."
     wire: "NDJSON, one JSON object per line. PROTO_VERSION = 1, checked before anything else is parsed."
@@ -104,8 +118,8 @@ crates:
     note: "A burst summary is identified by pid 0, so it contributes to the count without firing a second notification."
 
   hwprivacy-lsm:
-    loc: 2434
-    tests: 44
+    loc: 3674
+    tests: 56
     purpose: "The root helper. Owns the BPF maps and is the only writer to them."
     runs_as: >
       root, as hwprivacy-lsm.service (/usr/lib/systemd/system/), enabled and
@@ -247,22 +261,38 @@ dbus_api:
   service: "org.hwprivacy.Daemon"
   path: "/org/hwprivacy/Daemon"
   bus: "session"
-  methods: 14
+  as_of: "2026-09-12 — enumerated from hwprivacy-common/src/dbus_interface.rs, not from a sibling doc"
+  methods: 17
+  corrected_2026_09_12: >
+    This block said 14 methods and still listed AllowStream and DenyStream,
+    which were DELETED on 2026-08-23 with ask_each — so it advertised an API
+    that had not existed for three weeks. GetRules was also given as a(sss),
+    one row per (rule, category); it has been a(ssssss), one row per RULE,
+    since the same date. Five methods were missing entirely.
   method_list:
-    - "GetDevices() -> a(sssb)              (category, node, description, guarded)"
-    - "GetRules() -> a(sss)                 (app, device, permission)"
-    - "SetRule(app, device, perm) -> b        (false if the name cannot become a rule key)"
+    - "GetDevices() -> a(sssb)               (category, node, description, guarded)"
+    - "GetRules() -> a(ssssss)               (app, mic, camera, monitor, exe_path, gap_note). An unset category is \"\", NOT \"deny\"."
+    - "SetRule(app, device, perm) -> b        (false if the name cannot become a rule key, or for camera = while_in_use)"
+    - "SetRuleExe(app, exe_path) -> (bs)      (ok, message) — the binary the kernel layer matches by inode"
+    - "AllowCamera(app, exe_path) -> (bs)     grants at BOTH layers; doing only half leaves a rule that reads allow and denies"
     - "RemoveRule(app) -> b"
-    - "GetActiveStreams() -> a(susssssb)    (app, pid, device, node, media, perm, active)"
-    - "GetStatus() -> (buuuu)               (running, devices, rules, blocked, streams)"
-    - "GetEvents(last_n) -> a(ssss)         (timestamp, app, device, action) — device carries the b3 instance, e.g. 'microphone (mic2)'"
+    - "GetActiveStreams() -> a(susssssb)     (app, pid, device, node, media, perm, active)"
+    - "GetStatus() -> (buuuu)                (running, devices, rules, blocked, streams)"
+    - "GetEvents(last_n) -> a(ssss)          (timestamp, app, device, action)"
+    - "GetKernelStatus() -> (bbuus)          (connected, enforcing_camera, allowed_exes, unresolved, last_error)"
+    - "GetAudioBackstop() -> (bs)            (enforcing, why_not). Added 2026-09-12. why_not is empty iff enforcing, and is a sentence printed verbatim — including \"unknown\" when the helper is unreachable, because a disconnected daemon must not report its own default as fact."
+    - "GetSessions() -> a(ssu)               live while_in_use sessions (app, device, age_secs)"
     - "GetHistory() -> a(sssuuss)            (identity, device, source, denied, allowed, first, last) — was GetOffenders until 2026-08-21"
-    - "GetPresets() -> a(ssus)                (name, description, entry_count, source_path)"
-    - "ImportPreset(name, apply) -> a(ssb)    (app, outcome, was_added). apply=false plans and writes NOTHING."
-    - "BlockAll() -> b"
+    - "GetPresets() -> a(ssus)               (name, description, entry_count, source_path)"
+    - "ImportPreset(name, apply) -> a(ssb)   (app, outcome, was_added). apply=false plans and writes NOTHING."
+    - "BlockAll() -> b                        gates NEW links only; does not stop anything already recording (g2)"
     - "UnblockAll() -> b"
-    - "AllowStream(node_id, app_name) -> b   (both: a node id alone is not an identity)"
-    - "DenyStream(node_id) -> b"
+  removed:
+    - "AllowStream(node_id, app_name) / DenyStream(node_id) — deleted 2026-08-23 with ask_each. See d-no-per-stream-grants: the deny path destroys links the allow path cannot recreate."
+  additive_rule: >
+    New information gets a NEW method; an existing return tuple is never
+    widened, because three frontends depend on its shape. GetKernelStatus,
+    GetSessions, GetHistory and GetAudioBackstop all exist for that reason.
   signals_declared: ["AccessAttempt", "RuleChanged", "StreamEvent"]
   signals_actually_emitted: ["RuleChanged"]
   consequence: >

@@ -1206,3 +1206,136 @@ decisions:
       the block, a lone [ swallows the rest of the stream forever. Rewritten
       around both, and both verified to fail against a naive counter. Fourth
       such test in two days.
+
+  - id: d-a-guard-that-is-not-reported-is-not-delivered
+    date: "2026-09-12"
+    title: "A guard that no surface reports is not delivered"
+    context: >
+      The ALSA capture backstop enforced from 2026-09-06, survived a reboot and
+      closed g6 — the project's largest hole. For six days no frontend reported
+      it: enforcing_audio was tracked in KernelLayerState, carried over the
+      helper socket, and never crossed D-Bus. `hwprivacy-ctl status` printed
+      only "Camera enforced". The TUI showed nothing about layer 2 at all; the
+      GUI inferred camera denials from history rows and nothing else.
+    decision: >
+      An enforcement guard is finished when every frontend can say whether it is
+      on AND why it is not — not when it enforces.
+    why_this_is_a_security_defect_not_cosmetics: >
+      audio_backstop_blocker() is a hard interlock that switches enforcement OFF
+      and only warns to the journal, so the failure direction is silent. A
+      machine whose audio server is absent from the capture allowlist — a JACK
+      or PulseAudio box, or any config the shipped desktop-baseline preset
+      touched — has an unprotected microphone at layer 2 while every status
+      surface reads healthy, and nothing tells the user to look.
+    mechanism: >
+      Additive GetAudioBackstop() -> (enforcing, why_not), never a widened
+      GetKernelStatus. All judgement in one pure function,
+      lsm_client::audio_backstop_report.
+    ordering_is_the_substance: >
+      Ignorance outranks everything. A disconnected daemon still holds a config,
+      so the blocker would gladly produce a confident sentence about a machine
+      nobody can currently observe — which is the 2026-08-19 bug, where a status
+      line read "NOT blocked" while the camera was demonstrably blocked. Then
+      the helper's own report outranks the blocker, because the blocker only
+      describes what the NEXT push would decide.
+    the_branch_that_earns_the_function: >
+      connected + nothing blocking + microphone guarded + still off = a helper
+      running without --enforce-audio. That state has no other surface anywhere,
+      and it is what a partially applied upgrade leaves behind: on 2026-09-06 a
+      cp onto a running binary left the OLD helper under the NEW unit.
+    wording_lives_in_the_daemon: >
+      One producer, three verbatim consumers. ctl already carried the whole
+      argument for why an unreachable helper must read "unknown" rather than
+      "no"; copying that reasoning into the TUI and GUI is how three copies
+      drift apart.
+    gui_gets_its_own_label: >
+      status_label is the error sink — Error overwrites it, and AllowCamera
+      toasts route through Error — so a guard indicator there would be wiped by
+      the next toast and then read as stale-but-fine. That is the defect being
+      removed, reintroduced in the GUI.
+    an_old_daemon_reads_unknown_never_off: >
+      A frontend that gets no answer must not render OFF. Claiming protection is
+      absent when nothing was asked is the same class of lie as claiming
+      protection that is not there.
+    guarded_by: >
+      Two doc-check REQUIRED entries and three gui-test checks, the latter proven
+      against both a deleted label and a Kernel message that never sends.
+    generalisation: >
+      Applies to any future guard. notify_allow and GetSessions exist for the
+      same reason: a feature whose only evidence is a number that also moves for
+      other reasons is a feature nobody can check.
+
+  - id: d-aliased-exe-paths-share-one-kernel-key
+    date: "2026-09-12"
+    title: "Two exe_paths that resolve to one inode are one kernel principal"
+    context: >
+      The live config carries 7 rules with an exe_path and the kernel map holds
+      6 keys. /usr/bin/pipewire-pulse is a SYMLINK to /usr/bin/pipewire — both
+      ino 30017535 — and PolicyKey is (ino, dev), so they are ONE key.
+      "Allowed binaries: 6" is correct; it was chased as an off-by-one first.
+    decision: >
+      Aliased paths share one key and their permission bits are OR'd. That stays.
+      What is missing is a warning, and that is a separate decision.
+    consequence: >
+      The live `pipewire-pulse camera = "deny"` neither grants nor denies at
+      layer 2: pipewire's allow shares its inode and the OR wins. Layer 1 is
+      unaffected — it matches app_name, so the deny does apply there.
+    why_or_is_the_right_merge: >
+      The kernel allowlist is ALLOW-only under default-deny, so there is no deny
+      entry to lose. Last-writer-wins would instead make two rules about one
+      binary disagree according to rule ORDER, which dedup_by_path() already
+      exists to prevent.
+    what_is_deliberately_not_built: >
+      Nothing tells the user that a deny cannot take effect because a sibling
+      path shares the inode. Not added today: it is a new warning surface, and
+      this session was about reporting existing state honestly rather than
+      adding surfaces.
+    relationship: "d-executable-is-the-principal stands; it simply never considered aliasing."
+    rule: >
+      Resolve before reasoning — stat -L, or readlink -f. An inode count that
+      disagrees with a rule count is the first thing to check before hunting an
+      accounting bug.
+
+  - id: d-doc-claims-a-third-gate-shape
+    date: "2026-09-12"
+    title: "doc-check gains DOC_CLAIMS, for a doc that contradicts a file it describes"
+    context: >
+      doc-check was GREEN while four claims were stale and two were flatly
+      false. It already read CLAUDE.md and HANDOFF.md — they are in the
+      hardcoded DOCS list — so the file list was never the problem.
+    decision: >
+      Add DOC_CLAIMS: a forbidden string in one doc, refuted by a token in
+      another file. Mechanical, never prose review.
+    why_the_two_existing_shapes_could_not_cover_it: >
+      SENTINELS catch a defect returning to source. REQUIRED catches a fix
+      leaving source. Neither can express "this doc described a sibling file
+      correctly at the time and was never revisited when the sibling changed",
+      which is the rot that actually happens here.
+    what_it_caught_immediately: >
+      Both of CLAUDE.md's false claims — that README describes only layer 1 with
+      no occurrence of kernel/eBPF/LSM (false since 2026-08-19, and contradicted
+      forty lines below in the same file), and that MISSION.yaml is frozen
+      minutes before the kernel pivot and files the kernel layer in the
+      conditional (MISSION documents the backstop as enforcing).
+    tolerance_change: >
+      LOC_TOLERANCE 0.10 -> 0.03. At 10% a 1550-line stale claim cleared the
+      threshold by NINE lines, so the first number anyone reads was days wrong
+      while the gate printed "within tolerance". Tightening it immediately
+      exposed three more stale docs than hand-searching had found.
+    a_hole_closed_at_the_same_time: >
+      REQUIRED did `if body is None: continue`, so DELETING a guarded file
+      passed silently while removing one token from a surviving file failed — rm
+      was the cheapest way past the check. ANCHORS already treated a missing
+      cited file as a failure; REQUIRED now matches it.
+    gotcha_for_whoever_adds_the_next_entry: >
+      The forbidden string must be the form the doc ASSERTS in, narrow enough
+      that the sentence RETIRING the claim does not trip it. The first attempt
+      used "zero occurrences of" and the corrected file still failed, because
+      the correction quoted the old claim. Prefer the asserted wording including
+      its markdown emphasis. Same constraint SENTINELS have; it only bites here
+      because the scanned file is the doc itself.
+    still_not_covered: >
+      Every claim about the RUNNING HOST. doc-check reads files only, and this
+      session found ROADMAP's current_state five weeks stale with three false
+      assertions that no file-tier check could have caught. See
+      ROADMAP > next_up > doc-check-host-tier.
