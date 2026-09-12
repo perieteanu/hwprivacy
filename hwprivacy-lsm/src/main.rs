@@ -722,10 +722,19 @@ fn handle_request(
                     unresolved.len(),
                     if enforce_camera { "ON" } else { "OFF" }
                 );
+                // The consequence clause belongs to ON only. This line used to
+                // print "audio backstop OFF — capture nodes restricted to
+                // allowlisted executables", which states the opposite of its
+                // own verdict in the same breath, and the journal is the one
+                // record a reader consults about the backstop days later.
+                // Observed 2026-09-12 while verifying the guard-off path.
                 eprintln!(
-                    "hwprivacy-lsm: audio backstop {} — capture nodes restricted to \
-                     allowlisted executables",
-                    if enforce_audio { "ON" } else { "OFF" }
+                    "hwprivacy-lsm: {}",
+                    if enforce_audio {
+                        "audio backstop ON — capture nodes restricted to allowlisted executables"
+                    } else {
+                        "audio backstop OFF — capture nodes are NOT restricted by the kernel"
+                    }
                 );
 
                 // Persist so the next boot enforces this same list rather than

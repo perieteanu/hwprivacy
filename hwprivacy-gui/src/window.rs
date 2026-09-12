@@ -18,6 +18,15 @@ enum UiMessage {
     Streams(Vec<(String, u32, String, String, String, String, bool)>),
     Events(Vec<(String, String, String, String)>),
     Status(bool, u32, u32, u32, u32),
+    /// Kernel layer: (connected, enforcing_camera, audio_enforcing, audio_why).
+    ///
+    /// Its own message and its own label, NOT folded into `Status`. The status
+    /// label is also the error sink — `Error` overwrites it, and AllowCamera
+    /// success toasts are routed through `Error` too — so a kernel indicator
+    /// living there would be wiped by the next toast and then read as
+    /// stale-but-fine. A guard that silently stops being reported is the defect
+    /// this change exists to remove, not one to reintroduce in the GUI.
+    Kernel(bool, bool, bool, String),
     Error(String),
 }
 
@@ -65,6 +74,19 @@ pub fn build_ui(app: &gtk::Application) {
     status_label.set_margin_bottom(5);
     status_label.add_css_class("caption");
     main_box.append(&status_label);
+
+    // Layer 2, on its own label. The GUI showed nothing about kernel
+    // enforcement until 2026-09-12 except an inferred camera-denials list, so
+    // the stronger of the two layers was invisible in the graphical frontend.
+    // Deliberately NOT appended to status_label: that one doubles as the error
+    // and toast sink, and this must not be overwritable by an unrelated message.
+    let kernel_label = gtk::Label::new(Some("Kernel layer: checking..."));
+    kernel_label.set_halign(Align::Start);
+    kernel_label.set_margin_start(10);
+    kernel_label.set_margin_bottom(5);
+    kernel_label.add_css_class("caption");
+    main_box.append(&kernel_label);
+
     main_box.append(&gtk::Separator::new(Orientation::Horizontal));
 
     // Notebook (tabs)
@@ -238,6 +260,7 @@ pub fn build_ui(app: &gtk::Application) {
     let streams_list_c = streams_list.clone();
     let events_list_c = events_list.clone();
     let status_label_c = status_label.clone();
+    let kernel_label_c = kernel_label.clone();
     let cmd_tx_del = cmd_tx.clone();
     let cmd_tx_allow = cmd_tx.clone();
     let denials_list_c = denials_list.clone();
@@ -259,6 +282,34 @@ pub fn build_ui(app: &gtk::Application) {
                         if running { "Running" } else { "Stopped" },
                         devs, rules, blocked, streams,
                     ));
+                }
+                UiMessage::Kernel(connected, camera_on, audio_on, audio_why) => {
+                    // Same honesty rule as ctl: an unreachable helper is
+                    // UNKNOWN, never "off". It may be enforcing from its policy
+                    // cache with the daemon unable to see it.
+                    let text = if !connected {
+                        "Kernel layer: UNREACHABLE — may still be enforcing; \
+                         check systemctl is-active hwprivacy-lsm"
+                            .to_string()
+                    } else if audio_on {
+                        format!(
+                            "Kernel layer: camera {} | audio backstop ON",
+                            if camera_on { "ON" } else { "OFF" }
+                        )
+                    } else if audio_why.is_empty() {
+                        // The daemon never answered GetAudioBackstop.
+                        format!(
+                            "Kernel layer: camera {} | audio backstop UNKNOWN",
+                            if camera_on { "ON" } else { "OFF" }
+                        )
+                    } else {
+                        format!(
+                            "Kernel layer: camera {} | audio backstop OFF — {}",
+                            if camera_on { "ON" } else { "OFF" },
+                            audio_why
+                        )
+                    };
+                    kernel_label_c.set_text(&text);
                 }
                 UiMessage::Devices(devices) => {
                     clear_listbox(&devices_list_c);
@@ -634,6 +685,19 @@ async fn dbus_worker(
             DaemonCommand::Refresh => {
                 if let Ok(s) = proxy.get_status().await {
                     let _ = ui_tx.send(UiMessage::Status(s.0, s.1, s.2, s.3, s.4)).await;
+                }
+                // Two calls, one message. The audio half defaults to
+                // `(false, "")` — meaning UNKNOWN, not OFF — when the daemon
+                // predates GetAudioBackstop, so an old daemon cannot make the
+                // label claim the backstop is disabled.
+                if let Ok(k) = proxy.get_kernel_status().await {
+                    let (audio_on, audio_why) = proxy
+                        .get_audio_backstop()
+                        .await
+                        .unwrap_or((false, String::new()));
+                    let _ = ui_tx
+                        .send(UiMessage::Kernel(k.0, k.1, audio_on, audio_why))
+                        .await;
                 }
                 if let Ok(d) = proxy.get_devices().await {
                     let _ = ui_tx.send(UiMessage::Devices(d)).await;

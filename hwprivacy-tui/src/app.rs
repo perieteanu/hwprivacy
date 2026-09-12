@@ -48,6 +48,22 @@ pub struct App {
     pub events: Vec<(String, String, String, String)>,
     pub status: (bool, u32, u32, u32, u32),
 
+    /// Kernel layer: (connected, enforcing_camera, allowed, unresolved, err).
+    ///
+    /// The TUI showed nothing about layer 2 at all until 2026-09-12 — not the
+    /// camera guard, not the capture backstop — so the panel that is supposed
+    /// to be the at-a-glance view was silent about the stronger of the two
+    /// enforcement layers.
+    pub kernel: (bool, bool, u32, u32, String),
+
+    /// The ALSA capture backstop: (enforcing, why_not).
+    ///
+    /// Defaults to "not enforcing, reason unknown" so a daemon that predates
+    /// `GetAudioBackstop` renders as UNKNOWN rather than as OFF. Reporting a
+    /// missing method as "off" would claim absent protection is absent, which
+    /// is the same class of lie as claiming protection that is not there.
+    pub audio_backstop: (bool, String),
+
     /// Which category column the Rules panel is pointing at: 0 mic, 1 camera,
     /// 2 monitor.
     ///
@@ -80,6 +96,8 @@ impl App {
             rules: Vec::new(),
             events: Vec::new(),
             status: (false, 0, 0, 0, 0),
+            kernel: (false, false, 0, 0, String::new()),
+            audio_backstop: (false, String::new()),
             selected_device: 0,
         };
 
@@ -102,6 +120,12 @@ impl App {
         }
         if let Ok(s) = self.proxy.get_status().await {
             self.status = s;
+        }
+        if let Ok(k) = self.proxy.get_kernel_status().await {
+            self.kernel = k;
+        }
+        if let Ok(a) = self.proxy.get_audio_backstop().await {
+            self.audio_backstop = a;
         }
     }
 

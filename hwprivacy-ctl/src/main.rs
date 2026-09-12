@@ -123,9 +123,38 @@ fn perm_cell(p: &String) -> String {
     }
 }
 
+/// Break a daemon-supplied reason into lines that fit an indented block.
+///
+/// The reasons the daemon returns for a disabled audio backstop are whole
+/// sentences carrying the remedy — `audio_backstop_blocker()`'s are 60 to 90
+/// words. Printed unbroken they wrap at the terminal edge with no indent and
+/// stop looking like part of the field they explain.
+///
+/// Word-boundary only, and a word longer than `width` is left long rather than
+/// cut: these strings contain paths and commands (`hwprivacy-ctl preset import
+/// audio-backstop --apply`), and a command broken mid-token is a command the
+/// reader cannot copy.
+fn wrap_reason(reason: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in reason.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
-    use super::perm_cell;
+    use super::{perm_cell, wrap_reason};
 
     #[test]
     fn an_unset_category_renders_as_a_dash_not_as_deny() {
@@ -137,6 +166,43 @@ mod tests {
     fn a_set_category_renders_verbatim() {
         assert_eq!(perm_cell(&"ask_each".to_string()), "ask_each");
         assert_eq!(perm_cell(&"deny".to_string()), "deny");
+    }
+
+    /// Every line must fit, or the indented block it is printed into is not
+    /// indented at all past the first row.
+    #[test]
+    fn wrapping_respects_the_width() {
+        let reason = "the audio server (pipewire / wireplumber / pipewire-pulse) is not in \
+                      the capture allowlist — enforcing would deny EVERY application's \
+                      microphone";
+        let lines = wrap_reason(reason, 40);
+        assert!(lines.len() > 1, "a long reason must be broken up");
+        for l in &lines {
+            assert!(l.chars().count() <= 40, "line over width: {l:?}");
+        }
+        assert_eq!(
+            lines.join(" "),
+            reason.split_whitespace().collect::<Vec<_>>().join(" "),
+            "wrapping must not lose or reorder a word"
+        );
+    }
+
+    /// A command the user is told to run must survive intact. The remedy in
+    /// `audio_backstop_blocker()` is a command line; splitting a token inside
+    /// it yields something that cannot be copied and run.
+    #[test]
+    fn a_word_longer_than_the_width_is_not_cut() {
+        let lines = wrap_reason("run hwprivacy-ctl preset import audio-backstop --apply", 10);
+        assert!(
+            lines.iter().any(|l| l == "hwprivacy-ctl"),
+            "a long token must stay whole, got {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l == "audio-backstop"));
+    }
+
+    #[test]
+    fn an_empty_reason_produces_no_lines() {
+        assert!(wrap_reason("", 40).is_empty());
     }
 }
 
@@ -212,6 +278,35 @@ async fn main() -> anyhow::Result<()> {
                             "  Camera enforced:  {}",
                             if enforcing { "yes — non-allowlisted apps get EPERM" } else { "no (observing)" }
                         );
+                        // The ALSA capture backstop, reported beside the camera
+                        // rather than folded into it. The two follow different
+                        // device guards and can genuinely differ, and for six
+                        // days after the backstop started enforcing this line
+                        // did not exist — so the largest hole the project ever
+                        // closed was invisible here. The daemon owns the
+                        // wording, including the reason it is off; printing it
+                        // verbatim is what keeps ctl, the TUI and the GUI from
+                        // growing three versions of the same sentence.
+                        match proxy.get_audio_backstop().await {
+                            Ok((on, why)) => {
+                                if on {
+                                    println!(
+                                        "  Audio backstop:   yes — non-allowlisted apps get \
+                                         EPERM on capture nodes"
+                                    );
+                                } else {
+                                    println!("  Audio backstop:   no");
+                                    for line in wrap_reason(&why, 68) {
+                                        println!("                    {}", line);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                println!(
+                                    "  Audio backstop:   unknown — daemon predates this feature"
+                                );
+                            }
+                        }
                         println!("  Allowed binaries: {}", allowed);
                         if unresolved > 0 {
                             println!(
@@ -231,19 +326,26 @@ async fn main() -> anyhow::Result<()> {
                         // protection that is present are the same class of bug,
                         // and both destroy trust in the readout.
                         println!("  Connected:        no");
+                        // Both guards are unknown here, not just the camera.
+                        // Naming only one would imply the other had been
+                        // determined — the same "report a default as fact"
+                        // mistake this branch exists to avoid.
                         println!(
                             "  Camera enforced:  UNKNOWN — the daemon cannot reach the kernel helper,"
                         );
                         println!(
-                            "                    so it cannot see whether the camera is enforced."
+                            "  Audio backstop:   UNKNOWN   so it cannot see whether the camera or the"
+                        );
+                        println!(
+                            "                    ALSA capture nodes are enforced."
                         );
                         println!("                    Check directly with:");
                         println!("                      systemctl is-active hwprivacy-lsm");
                         println!(
-                            "                    If that unit is active, the camera IS being enforced"
+                            "                    If that unit is active, BOTH guards ARE being enforced"
                         );
                         println!(
-                            "                    from /var/lib/hwprivacy/policy regardless of this line."
+                            "                    from /var/lib/hwprivacy/policy regardless of these lines."
                         );
                     }
                     if !err.is_empty() {
@@ -289,6 +391,11 @@ async fn main() -> anyhow::Result<()> {
             //
             // Listing devices by what PipeWire happens to expose describes the
             // monitoring substrate, not the hardware. Say what is guarded.
+            // The same argument applies to the MICROPHONE since 2026-09-06,
+            // when the ALSA capture backstop started enforcing: the kernel
+            // guards /dev/snd/pcmC*D*c directly and this table said nothing
+            // about it for six days.
+            let audio = proxy.get_audio_backstop().await.ok();
             if let Some((connected, enforcing, allowed, unresolved, _)) = kernel {
                 println!();
                 println!("Kernel layer (eBPF LSM) — guards device nodes directly, not via PipeWire");
@@ -314,9 +421,41 @@ async fn main() -> anyhow::Result<()> {
                     println!("  Not connected — this daemon cannot see the kernel layer.");
                     println!("  It may still be enforcing. Check: systemctl is-active hwprivacy-lsm");
                 }
+                if connected {
+                    match &audio {
+                        Some((true, _)) => println!(
+                            "{:<12} {:<45} {:<30} {}",
+                            "microphone", "/dev/snd/pcmC*D*c (capture nodes)",
+                            format!("{allowed} executable(s) allowed"), "ON"
+                        ),
+                        Some((false, _)) => println!(
+                            "{:<12} {:<45} {:<30} {}",
+                            "microphone", "/dev/snd/pcmC*D*c (capture nodes)",
+                            "backstop off — see `status` for why", "OFF"
+                        ),
+                        None => println!(
+                            "{:<12} {:<45} {:<30} {}",
+                            "microphone", "/dev/snd/pcmC*D*c (capture nodes)",
+                            "unknown — daemon predates this", "?"
+                        ),
+                    }
+                }
                 println!();
                 println!("A camera absent from the PipeWire list above is not unprotected —");
                 println!("it may mean wireplumber was denied, so no PipeWire node exists at all.");
+                if matches!(audio, Some((true, _))) {
+                    // Stated every time the row says ON, because the row alone
+                    // invites the one reading this feature must never receive.
+                    // /dev/snd is opened by the audio server on everyone's
+                    // behalf, so the kernel sees `pipewire`, never the
+                    // application behind it. Per-application microphone policy
+                    // exists only in layer 1. A "microphone ... ON" row read as
+                    // per-app mic enforcement oversells the whole project.
+                    println!();
+                    println!("The microphone row is a BACKSTOP, not per-application policy: the kernel");
+                    println!("sees the audio server opening /dev/snd on every app's behalf, so it");
+                    println!("cannot name the app. Per-application mic policy is layer 1's job.");
+                }
             }
         }
 

@@ -65,6 +65,29 @@ pub trait HwPrivacy {
     /// (connected, enforcing_camera, allowed_exes, unresolved, last_error)
     fn get_kernel_status(&self) -> zbus::Result<(bool, bool, u32, u32, String)>;
 
+    /// The ALSA capture backstop: `(enforcing, why_not)`.
+    ///
+    /// `why_not` is empty iff `enforcing`. When it is not empty it is a complete
+    /// sentence, meant to be printed verbatim — including the case where the
+    /// daemon cannot reach the helper and therefore does not know.
+    ///
+    /// # Why the wording lives here and not in the frontends
+    ///
+    /// `enforcing_audio` has existed in `KernelLayerState` since the backstop
+    /// landed on 2026-09-06 and never crossed D-Bus, so for six days the
+    /// project's largest closed hole was invisible in `ctl`, the TUI and the
+    /// GUI alike. The fix is not three new format strings: ctl already carries
+    /// the whole argument for why a disconnected daemon must say "unknown"
+    /// rather than report its own default as fact (main.rs, the comment on the
+    /// `Camera enforced: UNKNOWN` branch, written after a status line claimed
+    /// "NOT blocked" on 2026-08-19 while the camera was demonstrably blocked).
+    /// Copying that reasoning into two more frontends is how the three copies
+    /// drift apart. One producer, three verbatim consumers.
+    ///
+    /// Additive, like GetKernelStatus and GetSessions — GetKernelStatus keeps
+    /// its tuple, so nothing that already reads it needs changing.
+    fn get_audio_backstop(&self) -> zbus::Result<(bool, String)>;
+
     /// Live `while_in_use` sessions: (app, device, age_secs).
     ///
     /// Additive, like GetKernelStatus and GetHistory — GetKernelStatus keeps

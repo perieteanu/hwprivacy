@@ -975,7 +975,7 @@ Path: `/org/hwprivacy/Daemon`
 
 ### Methods
 
-Verified against `hwprivacy-daemon/src/dbus_service.rs` on 2026-09-06.
+Verified against `hwprivacy-daemon/src/dbus_service.rs` on 2026-09-12.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
@@ -988,6 +988,7 @@ Verified against `hwprivacy-daemon/src/dbus_service.rs` on 2026-09-06.
 | `GetActiveStreams()` | `Array<(s, u32, s, s, s, s, b)>` | (app, pid, device, node, media, perm, active) |
 | `GetStatus()` | `(b, u32, u32, u32, u32)` | (running, devices, rules, blocked, streams) |
 | `GetKernelStatus()` | `(b, b, u32, u32, s)` | (connected, enforcing_camera, allowed_exes, unresolved, last_error) |
+| `GetAudioBackstop()` | `(b, s)` | The ALSA capture backstop: (enforcing, why_not). `why_not` is empty iff enforcing, and is a sentence meant to be printed verbatim — including "unknown" when the daemon cannot reach the helper |
 | `GetSessions()` | `Array<(s, s, u32)>` | Live `while_in_use` sessions: (app, device, age_secs) |
 | `GetEvents(last_n)` | `Array<(s, s, s, s)>` | (timestamp, app, device, action) — a 500-entry in-memory ring, lost on restart |
 | `GetHistory()` | `Array<(s, s, s, u32, u32, s, s)>` | (identity, device, source, denied, allowed, first_seen, last_seen) — **survives restarts**, unlike `GetEvents` |

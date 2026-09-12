@@ -36,6 +36,49 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(tabs, area);
 }
 
+/// The kernel-layer line, and whether it should alarm.
+///
+/// Pure so it can be tested — the rest of this module needs a terminal. The
+/// TUI reported nothing about layer 2 until 2026-09-12, neither the camera
+/// guard nor the ALSA capture backstop, so the one screen meant to be read at a
+/// glance was silent about the stronger enforcement layer.
+///
+/// `alarm` is true only when the helper is reachable AND a guard is off. A
+/// disconnected daemon is NOT an alarm: the helper may well be enforcing from
+/// `/var/lib/hwprivacy/policy` and the daemon simply cannot see it — reporting
+/// that as danger is the 2026-08-19 bug inverted, and a status line that cries
+/// wolf on a healthy machine is one that gets ignored on a broken one.
+pub fn kernel_status_line(
+    kernel: &(bool, bool, u32, u32, String),
+    audio: &(bool, String),
+) -> (String, bool) {
+    let (connected, camera_on, allowed, unresolved, _) = kernel;
+    if !connected {
+        return (
+            " Kernel: UNREACHABLE — may still be enforcing; check hwprivacy-lsm".to_string(),
+            false,
+        );
+    }
+    // An empty reason with enforcing=false means the daemon never answered —
+    // it predates GetAudioBackstop. That is "unknown", not "off".
+    let audio_word = match audio {
+        (true, _) => "audio backstop ON",
+        (false, why) if why.is_empty() => "audio backstop UNKNOWN",
+        (false, _) => "audio backstop OFF",
+    };
+    let mut line = format!(
+        " Kernel: connected | camera {} | {} | {} binary(ies) allowed",
+        if *camera_on { "ON" } else { "OFF" },
+        audio_word,
+        allowed,
+    );
+    if *unresolved > 0 {
+        line.push_str(&format!(" | {} UNUSABLE", unresolved));
+    }
+    let alarm = !*camera_on || !audio.0 || *unresolved > 0;
+    (line, alarm)
+}
+
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let (running, devices, rules, blocked, streams) = app.status;
     let status_text = format!(
@@ -46,9 +89,21 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         blocked,
         streams,
     );
-    let status = Paragraph::new(status_text)
-        .style(Style::default().fg(Color::Green).bg(Color::DarkGray))
-        .block(Block::default());
+
+    // Two lines in the chunk draw() already reserves as Length(3). A second
+    // row needs no layout change, no new tab, and no touch to Panel::next() or
+    // App::max_rows() — which matters in the one crate with no other tests.
+    let (kernel_text, alarm) = kernel_status_line(&app.kernel, &app.audio_backstop);
+    let status = Paragraph::new(vec![
+        Line::from(status_text).style(Style::default().fg(Color::Green)),
+        Line::from(kernel_text).style(Style::default().fg(if alarm {
+            Color::Red
+        } else {
+            Color::Green
+        })),
+    ])
+    .style(Style::default().bg(Color::DarkGray))
+    .block(Block::default());
 
     f.render_widget(status, area);
 }
@@ -308,5 +363,68 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}...", &s[..max - 3])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kernel_status_line;
+
+    fn kernel(connected: bool, camera: bool, allowed: u32, unresolved: u32)
+        -> (bool, bool, u32, u32, String)
+    {
+        (connected, camera, allowed, unresolved, String::new())
+    }
+
+    /// The healthy machine: both guards on, nothing to shout about.
+    #[test]
+    fn both_guards_on_is_not_an_alarm() {
+        let (line, alarm) = kernel_status_line(&kernel(true, true, 6, 0), &(true, String::new()));
+        assert!(line.contains("camera ON"));
+        assert!(line.contains("audio backstop ON"));
+        assert!(!alarm);
+    }
+
+    /// The state this whole change exists for. Before 2026-09-12 the TUI drew
+    /// no kernel line at all, so a machine with the backstop off looked
+    /// identical to one with it on.
+    #[test]
+    fn an_off_backstop_alarms_and_says_so() {
+        let (line, alarm) = kernel_status_line(
+            &kernel(true, true, 6, 0),
+            &(false, "the audio server is not in the capture allowlist".to_string()),
+        );
+        assert!(line.contains("audio backstop OFF"), "got: {line}");
+        assert!(alarm, "a guard that is off must catch the eye");
+    }
+
+    /// An old daemon has no GetAudioBackstop, so `refresh()` leaves the default
+    /// `(false, "")`. That must render as UNKNOWN: printing "OFF" would assert
+    /// that protection is absent when nothing was ever asked.
+    #[test]
+    fn a_daemon_without_the_method_reads_unknown_not_off() {
+        let (line, _) = kernel_status_line(&kernel(true, true, 6, 0), &(false, String::new()));
+        assert!(line.contains("audio backstop UNKNOWN"), "got: {line}");
+        assert!(!line.contains("backstop OFF"));
+    }
+
+    /// A disconnected daemon must not alarm. The helper may be enforcing from
+    /// its policy cache with the daemon simply unable to see it — that is the
+    /// documented 2026-08-19 situation, and painting it red teaches the user to
+    /// ignore the colour.
+    #[test]
+    fn unreachable_is_reported_without_crying_wolf() {
+        let (line, alarm) = kernel_status_line(&kernel(false, false, 0, 0), &(false, String::new()));
+        assert!(line.contains("UNREACHABLE"), "got: {line}");
+        assert!(line.contains("may still be enforcing"));
+        assert!(!alarm, "unknown is not danger");
+    }
+
+    /// Unusable entries mean apps are being denied by a rule that cannot work.
+    #[test]
+    fn unusable_entries_are_surfaced_and_alarm() {
+        let (line, alarm) = kernel_status_line(&kernel(true, true, 6, 2), &(true, String::new()));
+        assert!(line.contains("2 UNUSABLE"), "got: {line}");
+        assert!(alarm);
     }
 }

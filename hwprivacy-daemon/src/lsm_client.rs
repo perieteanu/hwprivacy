@@ -290,6 +290,72 @@ fn gap_delta<'a>(
     (opened, closed)
 }
 
+/// What to report about the ALSA capture backstop, from the four facts that
+/// decide it: whether we can see the helper, what the helper says it is doing,
+/// what the user asked for, and whether the interlock is withholding it.
+///
+/// Returns `(enforcing, why_not)`, where `why_not` is empty iff `enforcing`.
+///
+/// # Why this is a function and not four lines inside the D-Bus method
+///
+/// Pure, so every branch is reachable by a test with no daemon, no helper and
+/// no kernel — the same reason `gap_delta` above, `camera_already_denied_by_rule`
+/// below and `notification::decide` exist. The branch that justifies it is #4:
+/// "connected, and the helper says the backstop is off" has no other surface on
+/// this machine, and it is the state a partially-applied upgrade leaves behind.
+/// On 2026-09-06 a `cp` onto a running binary left the OLD helper with the NEW
+/// unit; the same shape here is a helper running without `--enforce-audio`
+/// while every other readout looks healthy.
+///
+/// # Why order matters
+///
+/// Ignorance outranks everything. A disconnected daemon still holds a config,
+/// so `audio_backstop_blocker()` would happily produce a confident sentence
+/// about a machine whose actual enforcement state is unknown — and presenting a
+/// stale config-derived reason as current fact is the 2026-08-19 bug over
+/// again. `enforcing` then outranks the blocker, because the helper's own
+/// report is what is true; the blocker only describes what the daemon would
+/// decide on the next push.
+pub(crate) fn audio_backstop_report(
+    connected: bool,
+    enforcing: bool,
+    mic_guarded: bool,
+    blocker: Option<String>,
+) -> (bool, String) {
+    if !connected {
+        return (
+            false,
+            "unknown — the daemon cannot reach the kernel helper, so it cannot \
+             see whether capture nodes are enforced. Check directly with: \
+             systemctl is-active hwprivacy-lsm"
+                .to_string(),
+        );
+    }
+    if enforcing {
+        return (true, String::new());
+    }
+    if let Some(why) = blocker {
+        // The interlock's own sentence, which already names the remedy. Not
+        // paraphrased here: two wordings of one condition drift.
+        return (false, why);
+    }
+    if !mic_guarded {
+        return (
+            false,
+            "the microphone is not guarded ([devices] microphone = false in \
+             config.toml), so layer 2 does not enforce capture nodes"
+                .to_string(),
+        );
+    }
+    (
+        false,
+        "the helper is connected and nothing is blocking enforcement, yet it \
+         reports the backstop OFF — it is running without --enforce-audio. \
+         Check: systemctl show hwprivacy-lsm -p ExecStart"
+            .to_string(),
+    )
+}
+
 /// One connection: handshake, push policy, then stream events until it drops —
 /// re-pushing whenever the intended policy or the files behind it change.
 async fn session(state: &SharedState, stream: UnixStream) -> anyhow::Result<()> {
@@ -1529,5 +1595,124 @@ mod tests {
         assert!(c.set_rule("firefox", &DeviceCategory::Camera, Permission::Allow));
         c.set_rule_exe("firefox", "/bin/sh").expect("binary");
         assert!(!camera_already_denied_by_rule(&c, "/bin/sh", "sh"));
+    }
+
+    // ---- audio_backstop_report -------------------------------------------
+    //
+    // The backstop enforced from 2026-09-06 and no surface said so until
+    // 2026-09-12, because `enforcing_audio` never left the daemon. These pin
+    // the five states apart. The two that matter are the ORDERING tests: a
+    // reason that is merely plausible is exactly how a status line comes to
+    // claim something it cannot know.
+
+    /// The healthy case, and the only one that may report `true`.
+    #[test]
+    fn an_enforcing_backstop_reports_yes_and_says_nothing_else() {
+        let (on, why) = audio_backstop_report(true, true, true, None);
+        assert!(on);
+        assert!(why.is_empty(), "an enforcing backstop needs no explanation");
+    }
+
+    /// Ignorance outranks everything, INCLUDING a blocker the config would
+    /// produce. This is the 2026-08-19 bug in a new place: with the helper
+    /// unreachable the daemon still holds a config, so `audio_backstop_blocker`
+    /// will happily return a confident sentence about a machine whose real
+    /// enforcement state nobody can see. Reporting it as the reason would
+    /// assert a fact from a guess.
+    /// Both inputs that could produce a confident answer are supplied, and
+    /// neither may be used.
+    ///
+    /// The `enforcing = true` half is the one that matters and the one this
+    /// test did not have when it was written: with `enforcing` checked first,
+    /// a disconnected daemon carrying a stale `true` reports the backstop ON —
+    /// protection asserted from a value nobody can currently observe. The
+    /// daemon does clear the flag on disconnect today (see the `connected =
+    /// false` arm above `run()`), but the invariant belongs here, where it is
+    /// checkable, rather than depending on a caller's discipline.
+    ///
+    /// Calibration note: with only the `enforcing = false` case, reordering
+    /// those two branches left this test PASSING — the input could not tell the
+    /// orders apart. Caught by running the mutation, not by reading it.
+    #[test]
+    fn a_disconnected_daemon_says_unknown_whatever_else_it_is_holding() {
+        for enforcing in [false, true] {
+            let (on, why) = audio_backstop_report(
+                false,
+                enforcing,
+                true,
+                Some("no executable is allowed to open a capture device".to_string()),
+            );
+            assert!(
+                !on,
+                "must not claim enforcement it cannot see (enforcing={enforcing})"
+            );
+            assert!(
+                why.contains("unknown"),
+                "a daemon that cannot see the helper must say so (enforcing={enforcing}), got: {why}"
+            );
+            assert!(
+                !why.contains("no executable is allowed"),
+                "the config's reason must not be presented as the live state: {why}"
+            );
+        }
+    }
+
+    /// And the helper's own report outranks the blocker in the other
+    /// direction. The blocker describes what the daemon WOULD decide on the
+    /// next push; `enforcing` is what the kernel is doing now. A config edited
+    /// a moment ago must not make a live backstop read as off.
+    #[test]
+    fn the_helpers_report_outranks_a_blocker_the_config_would_raise() {
+        let (on, why) = audio_backstop_report(
+            true,
+            true,
+            true,
+            Some("the audio server is not in the capture allowlist".to_string()),
+        );
+        assert!(on, "the helper says it is enforcing; that is the fact");
+        assert!(why.is_empty());
+    }
+
+    /// The interlock's sentence is passed through verbatim. It already names
+    /// the remedy (`preset import audio-backstop --apply`), and paraphrasing it
+    /// here would give one condition two wordings that drift apart.
+    #[test]
+    fn a_blocked_backstop_reports_the_interlocks_own_sentence() {
+        let reason = "no executable is allowed to open a capture device — \
+                      enforcing would deny the audio server itself";
+        let (on, why) = audio_backstop_report(true, false, true, Some(reason.to_string()));
+        assert!(!on);
+        assert_eq!(why, reason, "the interlock's wording must survive intact");
+    }
+
+    /// The user simply turned the microphone guard off. Not a fault, and it
+    /// must not read as one — nor be blamed on the interlock.
+    #[test]
+    fn an_unguarded_microphone_is_reported_as_the_users_choice() {
+        let (on, why) = audio_backstop_report(true, false, false, None);
+        assert!(!on);
+        assert!(
+            why.contains("not guarded"),
+            "say the guard is off, not that something failed: {why}"
+        );
+    }
+
+    /// The state with no other surface on this machine: connected, nothing
+    /// blocking, microphone guarded — and still off. That is a helper running
+    /// without `--enforce-audio`, which is what a partially-applied upgrade
+    /// leaves behind (the `cp`-onto-a-running-binary trap, 2026-09-06, where
+    /// the OLD helper ran under the NEW unit and the camera was bare).
+    ///
+    /// Without this branch the four above would cover every case a healthy
+    /// machine can produce, and the one broken case would fall through to
+    /// whichever arm happened to be last.
+    #[test]
+    fn a_helper_running_without_the_flag_is_named_as_such() {
+        let (on, why) = audio_backstop_report(true, false, true, None);
+        assert!(!on);
+        assert!(
+            why.contains("--enforce-audio"),
+            "name the missing flag — this is the only place it is visible: {why}"
+        );
     }
 }

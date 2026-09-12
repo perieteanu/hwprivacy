@@ -270,6 +270,38 @@ def main():
         all_text[:200],
     )
 
+    # -- the kernel layer is reported at all -------------------------------
+    #
+    # The GUI showed nothing about layer 2 until 2026-09-12 except a list of
+    # camera denials inferred from history rows, so the enforcement layer that
+    # actually stops Firefox and closed the direct-ALSA hole was invisible in
+    # the graphical frontend. A label CAN be asserted, unlike a notification,
+    # so there is no excuse for this one to be unchecked.
+    #
+    # Presence and wording only. Whether it overlaps or is cut off still needs
+    # eyes — see the closing note.
+    check(
+        "the window reports the kernel layer",
+        "Kernel layer:" in all_text,
+        all_text[:300],
+    )
+    # And it must not have gone stale on its placeholder: "checking..." is the
+    # initial text, so seeing it after a refresh means no Kernel message ever
+    # arrived — which is exactly how the audio state stayed invisible before.
+    check(
+        "the kernel label has been populated, not left at its placeholder",
+        "Kernel layer: checking..." not in all_text,
+        [s for s in every_string(root) if s.startswith("Kernel layer")][:1],
+    )
+    # The audio backstop specifically. The camera guard was reported (via the
+    # denials list) long before the audio one was, and reporting one while
+    # omitting the other reads as "the other is fine".
+    check(
+        "the kernel label names the audio backstop",
+        "audio backstop" in all_text.lower(),
+        [s for s in every_string(root) if s.startswith("Kernel layer")][:1],
+    )
+
     # -- the three combos --------------------------------------------------
     combos = by_role(page, "combo box")
     check("the add-rule form has three dropdowns", len(combos) == 3, f"found {len(combos)}")
