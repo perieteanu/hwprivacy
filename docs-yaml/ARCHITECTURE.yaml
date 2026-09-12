@@ -10,7 +10,7 @@
 ---
 shape:
   language: "Rust 2021 + one BPF C file"
-  layout: "Cargo workspace, 7 crates, 15432 LOC of first-party code (BPF C included; generated vmlinux.h excluded)"
+  layout: "Cargo workspace, 7 crates, 16172 LOC of first-party code (BPF C included; generated vmlinux.h excluded) — measured 2026-09-12"
   build: "cargo build --release --workspace  (or: make build)"
   binaries: 5
   tests: 132        # 49 lsm + 62 daemon + 15 common + 6 proto. Zero in ctl/tui/gui.

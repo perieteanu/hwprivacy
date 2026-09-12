@@ -34,6 +34,40 @@ app_naming:
     variant 'OBS [pipewire-pulse]' match a rule written as 'obs'. It is not a
     general fuzzy matcher and will not save you from a pasted label.
 
+exe_path_identity:
+  label: "The kernel's principal is an INODE, and two paths can share one."
+  measured_2026_09_12: >
+    The live config carries 7 rules with an exe_path, and the kernel map holds
+    6 keys. Not an off-by-one: /usr/bin/pipewire-pulse is a SYMLINK to
+    /usr/bin/pipewire, so `stat -L` gives both ino 30017535. PolicyKey is
+    (ino, dev), so they are ONE key.
+      stat -Lc '%d %i %n' /usr/bin/pipewire /usr/bin/pipewire-pulse
+      66306 30017535 /usr/bin/pipewire
+      66306 30017535 /usr/bin/pipewire-pulse
+  consequence: >
+    Permissions for aliased paths are OR'd together, because intended_policy()
+    folds by path and replace_policy() folds by key
+    (`*wanted.entry(k).or_insert(0) |= e.perms`). On this machine that means the
+    live `pipewire-pulse camera = "deny"` grants nothing and denies nothing at
+    layer 2: `pipewire camera = "allow"` shares its inode and wins.
+  why_that_is_not_a_bug_to_"fix"_blindly: >
+    The kernel allowlist is ALLOW-only under default-deny — there is no deny
+    entry to lose. OR-ing is therefore the correct merge: the alternative
+    (last-writer-wins) would make two rules about one binary silently disagree
+    depending on rule order, which is the hazard dedup_by_path() already exists
+    to prevent. What is genuinely missing is a WARNING: nothing tells the user
+    that a `deny` they wrote cannot take effect at layer 2 because a sibling
+    path shares the inode.
+  what_this_does_NOT_weaken: >
+    Layer 1 is unaffected — it matches app_name, so `pipewire-pulse` and
+    `pipewire` remain separate identities there and the camera = deny on
+    pipewire-pulse does apply at layer 1.
+  rule: >
+    When reasoning about an exe_path, resolve it: `stat -L`, or `readlink -f`.
+    An inode count that disagrees with a rule count is the first thing to check
+    before hunting an accounting bug — see d-executable-is-the-principal, which
+    does not cover aliasing.
+
 config_file:
   path: "~/.config/hwprivacy/config.toml"
   owner: "the daemon"

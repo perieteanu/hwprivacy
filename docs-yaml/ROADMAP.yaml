@@ -12,7 +12,7 @@ current_state:
     unpredictable.
 
   verified_working:
-    - "Cargo workspace, 7 crates, 15432 LOC, 240 tests, builds clean (trivial warnings, 0 errors) — verified 2026-09-06"
+    - "Cargo workspace, 7 crates, 16172 LOC, 255 tests run / 257 declared, builds clean (21 warnings, 0 errors) — verified 2026-09-12"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"
@@ -796,8 +796,19 @@ kernel_layer:
 
   phase_5_audio_backstop:
     status: >
-      BUILT 2026-09-06, enforcement OFF pending live acceptance. The
-      observe-only pass required here ran first and shaped the design.
+      ENFORCING since 2026-09-06, accepted live and reboot-verified — see
+      accepted_live_2026_09_06 and reboot_verified_2026_09_06 in this same
+      entry. The line here read "enforcement OFF pending live acceptance" until
+      2026-09-12, contradicting its own evidence two screens below; the
+      acceptance it was waiting for had happened the same evening it was
+      written. The observe-only pass required here ran first and shaped the
+      design.
+    visible_since_2026_09_12: >
+      For the first six days it enforced, NO frontend reported it:
+      enforcing_audio lived in KernelLayerState and never crossed D-Bus.
+      GetAudioBackstop now carries it, plus the reason when the interlock is
+      withholding enforcement, to ctl / TUI / GUI. Two doc-check REQUIRED
+      entries refuse its removal.
     observe_only_census_2026_09_06:
       method: >
         30 days of the helper's own journal. Every AUDIO record is already
@@ -960,10 +971,26 @@ kernel_layer:
       Phase 2 must dedupe by (exe key, device major) with a cooldown from the
       start rather than reproduce it.
   known_policy_keys:
-    note: "(dev, ino) pairs as Phase 2 will store them. Package upgrades change the inode — see the staleness mitigation in the plan."
-    firefox_esr: "dev=66306 ino=30287776  /usr/lib/firefox-esr/firefox-esr"
-    firefox_dev_edition: "dev=66306 ino=1310763   /home/perieteanu/firefox-developer/firefox-bin"
-    pipewire: "dev=66306 ino=30017535  /usr/bin/pipewire"
+    note: >
+      DO NOT record inodes here. A hardcoded inode has a half-life of ONE
+      package upgrade, and this block proved it three times: firefox-esr was
+      30287776 in August, 30282365 after the 2026-08-20 upgrade, and 30292989
+      when checked on 2026-09-12. Every number written here has been wrong
+      within weeks, and four other documents copied the first one.
+      Obtain them from the machine instead:
+        stat -Lc '%d %i %n' /usr/lib/firefox-esr/firefox-esr /usr/bin/pipewire
+        sudo hwprivacy-lsm --dump-policy      # what the KERNEL holds
+      Note `stat -L`: /usr/bin/pipewire-pulse is a SYMLINK to pipewire, so the
+      two share one inode and therefore one kernel policy key.
+    paths_that_matter:
+      - "/usr/lib/firefox-esr/firefox-esr — the test browser"
+      - "/home/perieteanu/firefox-developer/firefox-bin — a DIFFERENT binary; allowing one never allows the other, though layer 1 calls both 'Firefox'"
+      - "/usr/bin/pipewire — and pipewire-pulse, which is the same inode"
+    stability_is_the_point: >
+      The mechanism that keeps these current is PolicyFingerprint's 30 s
+      recheck (see policy_staleness_2026_08_21). Proven live a third time on
+      2026-09-12: firefox-esr had moved to ino 30292989 and the camera open at
+      10:49:36 was allowed, so the allowlist had already tracked the change.
   still_unobserved:
     - "Discord, Zoom, Telegram, OBS, cheese, and the Firefox Developer Edition have not yet been seen touching either device."
     - "Not a blocker: default-deny plus a notification surfaces each new consumer the first time it appears. That IS the discovery mechanism."
@@ -1288,7 +1315,7 @@ debt:
     - "DONE 2026-08-21: record_dismiss()/is_in_cooldown() are reachable now that b1 is fixed, and covered by tests"
     - "PwLink.output_port / input_port — parsed, never read (compiler warns)"
     - "AccessAction::RevokedOnDisconnect — variant never constructed"
-  compiler_warnings: 6
+  compiler_warnings: 21   # measured 2026-09-12; recorded as 6 since August
   clippy: "not installed for this toolchain — `cargo clippy` returns 'no such command'"
 
 answered_2026_08_21:

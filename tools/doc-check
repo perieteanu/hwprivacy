@@ -49,7 +49,16 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 JSON = "--json" in sys.argv
-LOC_TOLERANCE = 0.10
+# Was 0.10 until 2026-09-12, and 10% is too loose to be a gate.
+#
+# Measured that day: CLAUDE.md claimed 14042 LOC against a tree of 15592 — a
+# 1550-line drift, which cleared the 1559.2 threshold by NINE lines. The
+# project-shape line is the first thing anyone reads and it had been wrong for
+# days while this check printed "within tolerance". A tolerance exists so a
+# single commit does not turn the gate red, not so a doc can be a thousand
+# lines stale; 3% of this tree is ~470 lines, which is still several sessions
+# of work.
+LOC_TOLERANCE = 0.03
 
 failures = []
 passes = []
@@ -358,17 +367,88 @@ REQUIRED = [
      "grant cannot apply to the open() being asked about — the LSM hook "
      "answers in nanoseconds — so without this the prompt promises video that "
      "will not appear until the user clicks again."),
+    # OCCURRED 2026-09-06 to 2026-09-12: the ALSA capture backstop enforced
+    # from the day it landed and NO frontend reported it, because
+    # enforcing_audio was tracked in KernelLayerState and never crossed D-Bus.
+    # The dangerous direction is the inverse: audio_backstop_blocker() can
+    # switch enforcement off and only warns to the journal, so a machine whose
+    # audio server is not allowlisted has an unprotected microphone at layer 2
+    # while every status surface still looks healthy.
+    ("hwprivacy-daemon/src/dbus_service.rs", "get_audio_backstop",
+     "the audio backstop is invisible again. It enforces /dev/snd capture "
+     "nodes and, without this method, no frontend can see whether it is on — "
+     "nor that audio_backstop_blocker() has silently switched it OFF."),
+    ("hwprivacy-ctl/src/main.rs", "Audio backstop:",
+     "ctl is reporting the camera guard and not the audio one. Two guards "
+     "follow two device guards and can differ; reporting one and omitting the "
+     "other reads as 'the other is fine'."),
 ]
 _missing = 0
 for rel, token, why in REQUIRED:
     body = read(rel)
     if body is None:
+        # A DELETED file used to pass here silently, while removing one token
+        # from a surviving file failed — so the cheapest way past this check was
+        # to delete the file it guards. The ANCHORS loop above already treats a
+        # missing cited file as a failure; this now matches it.
+        _missing += 1
+        fail("required", rel, f"the file is GONE, so {token!r} cannot be present. {why}")
         continue
     if token not in body:
         _missing += 1
         fail("required", rel, f"{token!r} is GONE. {why}")
 if _missing == 0:
     ok(f"code that must not disappear is present ({len(REQUIRED)} checks)")
+
+# ══════════════════════════════════════════════════════════════════
+# 5c. A claim a doc makes ABOUT ANOTHER FILE, which that file refutes.
+#
+#     SENTINELS catch a defect returning to source. REQUIRED catches a fix
+#     leaving source. Neither can express the third shape, which is what
+#     actually rots here: a doc that describes a sibling file, correctly at the
+#     time, and is never revisited when the sibling changes.
+#
+#     Each entry is mechanical, not prose review: if `bad` appears in `doc` AND
+#     `token` appears in `other`, the claim is refuted. Add one only after a
+#     doc has actually misled someone.
+#
+#     GOTCHA, hit while writing the first two entries: `bad` must be the form
+#     the doc ASSERTS in, narrow enough that writing ABOUT the retired claim
+#     does not trip it. The first attempt used "zero occurrences of", and the
+#     sentence retiring the claim contained that phrase — so a corrected file
+#     still failed. Prefer the asserted wording including its markdown emphasis
+#     ("**Describes only layer 1**"), which a retrospective sentence will not
+#     reproduce. This is the same constraint SENTINELS have; it only bites here
+#     because the scanned file is the doc itself.
+#
+#     OCCURRED 2026-09-12, two at once, both in CLAUDE.md — the file whose own
+#     rule is "once a project has code, verify a doc claim against the
+#     filesystem, never against another document".
+# ══════════════════════════════════════════════════════════════════
+DOC_CLAIMS = [
+    ("CLAUDE.md", "**Describes only layer 1**", "README.md", "eBPF",
+     "CLAUDE.md asserted that README describes only layer 1 and contains no "
+     "occurrence of 'kernel', 'eBPF' or 'LSM'. README was realigned "
+     "2026-08-19 and swept end to end 2026-09-06 — and CLAUDE.md contradicted "
+     "itself about it forty lines further down the same file."),
+    ("CLAUDE.md", "Frozen 2026-08-04 22:37", "docs-yaml/MISSION.yaml", "2026-09-06",
+     "CLAUDE.md said MISSION.yaml is frozen minutes before the kernel pivot "
+     "and files the kernel layer under 'what would fix it', in the "
+     "conditional. MISSION.yaml documents the ALSA backstop as enforcing. "
+     "Reading it as conditional inverts what actually ships."),
+]
+_claims = 0
+for doc, bad, other, token, why in DOC_CLAIMS:
+    body = read(doc)
+    other_body = read(other)
+    if body is None or other_body is None:
+        continue
+    if bad in body and token in other_body:
+        _claims += 1
+        fail("doc-claim", doc,
+             f"{bad!r} is refuted by {token!r} in {other}. {why}")
+if _claims == 0:
+    ok(f"no doc contradicts a file it describes ({len(DOC_CLAIMS)} claims)")
 
 # ══════════════════════════════════════════════════════════════════
 # 6. Both layers described.  OCCURRED: ARCHITECTURE.yaml and README described
