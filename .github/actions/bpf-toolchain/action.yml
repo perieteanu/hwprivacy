@@ -11,7 +11,10 @@ runs:
   steps:
     # GTK4 for the GUI crate; clang/libbpf for the eBPF skeleton.
     #
-    # bpftool needs care. There is no standalone `bpftool` package on Ubuntu:
+    # All of this describes 24.04 (noble), which ci.yml pins. On 26.04 bpftool is
+    # a real package and this lookup finds nothing.
+    #
+    # bpftool needs care. There is no standalone `bpftool` package on noble:
     # the name is VIRTUAL, provided by linux-tools-common, which ships no
     # binary of its own. What linux-tools-common does ship is /usr/sbin/bpftool,
     # a wrapper that dispatches on `uname -r` — and hosted runners run an Azure
@@ -50,7 +53,9 @@ runs:
       run: |
         set -euo pipefail
         OUT=hwprivacy-lsm/src/bpf/vmlinux.h
-        BPFTOOL=$(ls -1 /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -V | tail -1)
+        # `|| true` because ls exits 2 on no match, and pipefail would end this
+        # step before the message below could say why. It did, 2026-10-31.
+        BPFTOOL=$(ls -1 /usr/lib/linux-tools/*/bpftool 2>/dev/null | sort -V | tail -1 || true)
         if [ -z "$BPFTOOL" ]; then
           echo "no bpftool under /usr/lib/linux-tools — linux-tools-generic shipped none"
           ls -la /usr/lib/linux-tools/ 2>&1 || true

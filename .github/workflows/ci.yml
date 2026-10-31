@@ -12,6 +12,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# The runner is pinned too. `ubuntu-latest` is as mutable as a tag: it moved to
+# 26.04 between 2026-09-12 and 2026-10-31, where bpftool is a real package at
+# /usr/sbin/bpftool and /usr/lib/linux-tools holds none, and every build job went
+# red before compiling a line. Move this on purpose, with bpf-toolchain beside it.
+#
 # Every action is pinned to a COMMIT SHA, not a tag. `@v5` and `@v2` are tags
 # and `@stable` is a branch — all three are mutable, so any of them can start
 # executing different code without a commit here. The trailing comment records
@@ -31,7 +36,7 @@ jobs:
   # is never masked by a build problem elsewhere.
   doc-check:
     name: docs match the code
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
       - name: make doc-check
@@ -39,7 +44,7 @@ jobs:
 
   test:
     name: build and test (rust ${{ matrix.rust }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -97,7 +102,7 @@ jobs:
   # need a machine you can reboot, and no hosted runner is one.
   install:
     name: make install installs what it declares
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09  # v5.1.0
 
