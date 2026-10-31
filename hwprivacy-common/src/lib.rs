@@ -3,6 +3,7 @@ pub mod device;
 pub mod stream;
 pub mod dbus_interface;
 pub mod preset;
+pub mod rule_merge;
 
 pub use config::{
     normalize_app_name, sanitize_rule_name, short_name, AppRule, Config, Permission,

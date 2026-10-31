@@ -689,9 +689,10 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
         return;
     }
 
+    let label = display_label(&state.read().await.config, &ev.exe_path, &app);
     info!(
         "Kernel layer DENIED {} -> {} ({}), {} open(s) total",
-        app,
+        label,
         ev.device,
         ev.role,
         ev.total_opens()
@@ -727,7 +728,7 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
         };
         if already_decided {
             crate::notification::notify_kernel_denial(
-                &app,
+                &label,
                 ev.pid,
                 category,
                 &ev.device,
@@ -741,13 +742,25 @@ async fn handle_event(state: &SharedState, ev: AccessEvent) {
     }
 
     crate::notification::notify_kernel_denial(
-        &app,
+        &label,
         ev.pid,
         category,
         &ev.device,
         "Blocked by the kernel.",
     )
     .await;
+}
+
+/// How a kernel event reads to a person: the owning rule, with the binary, so
+/// `firefox-bin` in a popup can be matched to the row in `rules list`. Display
+/// only. The tracker and the history stay keyed on the executable.
+fn display_label(config: &Config, exe_path: &str, exe_short: &str) -> String {
+    let owner = rule_key_for(config, exe_path, exe_short);
+    if owner == exe_short {
+        exe_short.to_string()
+    } else {
+        format!("{owner} ({exe_short})")
+    }
 }
 
 /// Has the user already said "deny" for this executable's camera?

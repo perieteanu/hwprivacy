@@ -93,6 +93,25 @@ pub trait HwPrivacy {
     /// [`crate::stream::link_audit_line`]. Additive.
     fn get_link_audit(&self) -> zbus::Result<(u64, u64, u64, u64)>;
 
+    /// Rules that look like one program:
+    /// `(name_rule, exe_rule, exe_path, conflicting_devices)`. Evidence, not a
+    /// verdict. See [`crate::rule_merge`].
+    fn get_rule_splits(&self) -> zbus::Result<Vec<(String, String, String, Vec<String>)>>;
+
+    /// Fold rule `from` into rule `into`. Returns `(ok, message)`: the resulting
+    /// rule and what the kernel allowlists gain or lose, or why it was refused.
+    /// Writes nothing unless `apply`, because a merge can be a grant. A choice is
+    /// `""` when the two rules do not disagree about that device.
+    fn merge_rules(
+        &self,
+        from: &str,
+        into: &str,
+        microphone: &str,
+        camera: &str,
+        monitor: &str,
+        apply: bool,
+    ) -> zbus::Result<(bool, String)>;
+
     /// Live `while_in_use` sessions: (app, device, age_secs).
     ///
     /// Additive, like GetKernelStatus and GetHistory — GetKernelStatus keeps

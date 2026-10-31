@@ -1419,3 +1419,34 @@ decisions:
       Ids and serials both restart with PipeWire, so a decision kept across a monitor
       respawn could match a different link with the same pair.
     journal_lines_exclude_media_name: "media.name holds page and meeting titles."
+
+  - id: d-one-program-one-rule
+    date: "2026-10-31"
+    title: "Two rules for one program are detected and merged explicitly, never automatically"
+    context: >
+      A PipeWire prompt names a rule after the declared name, a kernel prompt after
+      short_name(exe), so one program could hold two rows with opposite answers.
+      Measured: node 77 declared `Firefox Developer Edition`, binary firefox-bin, pid
+      3098, with `firefox developer edition` camera = allow and no binary beside
+      `firefox-bin` camera = deny. The kernel obeyed the deny while `rules list` read
+      as two unrelated apps.
+    decision: >
+      Observe (declared name, binary) from every stream, keep the pairs touching an
+      existing rule, and report a split when a rule with no binary matches the name
+      and a different rule owns the binary. Merging is an explicit act, previewed by
+      default, through one implementation every frontend shares.
+    why_not_automatic: >
+      Name, pid and binary on a stream are self-declared; for a pulse client the
+      attested pid is the audio server. The kernel allowlists read exe_path, so an
+      automatic join would let a process claim a trusted name and inherit its kernel
+      grants, including direct ALSA capture through microphone = allow. Attaching at
+      a camera prompt has the same flaw: the click names a camera, the side effect is
+      the microphone. So a split is announced and new ones can still be created.
+    merge_semantics:
+      - "The rule PipeWire reports stays, because layer 1 matches only by name. It takes the binary."
+      - "One opinion is kept and none stays none. A disagreement refuses until chosen, and is never an OR."
+      - "The preview states what each kernel allowlist gains or loses."
+      - "Refused the wrong way round, across two different binaries, and for a choice where nothing conflicts."
+    observed_pairs_cannot_grant: "Identities::observe takes &Config, so the compiler refuses a write. A test covers the behaviour."
+    known_nag: "A deliberate split keeps its banner: there is no dismissal yet. The popup shows once."
+    not_included: "The volume meter's unnamed `pipewire` identity. It has no process to join."

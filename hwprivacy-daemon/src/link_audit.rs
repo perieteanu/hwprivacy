@@ -345,6 +345,8 @@ mod tests {
             app_name: app.into(),
             pid: 1234,
             media_name: "private meeting title".into(),
+            declared_pid: 0,
+            process_binary: String::new(),
         }
     }
 

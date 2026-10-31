@@ -326,6 +326,95 @@ impl HwPrivacyService {
     ///
     /// All the judgement is in `audio_backstop_report`, which is pure and
     /// tested; this method only gathers the four inputs.
+    async fn get_rule_splits(&self) -> Vec<(String, String, String, Vec<String>)> {
+        let state = self.state.read().await;
+        state
+            .config
+            .find_rule_splits(&state.identities.pairs())
+            .into_iter()
+            .map(|s| (s.name_rule, s.exe_rule, s.exe_path, s.conflicts))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn merge_rules(
+        &self,
+        #[zbus(signal_context)] ctx: SignalContext<'_>,
+        from: &str,
+        into: &str,
+        microphone: &str,
+        camera: &str,
+        monitor: &str,
+        apply: bool,
+    ) -> (bool, String) {
+        let parse = |text: &str, device: &str| -> Result<Option<Permission>, String> {
+            if text.is_empty() {
+                return Ok(None);
+            }
+            text.parse()
+                .map(Some)
+                .map_err(|_| format!("'{text}' is not a permission for {device}"))
+        };
+        let choices = match (|| {
+            Ok::<_, String>(hwprivacy_common::rule_merge::MergeChoices {
+                microphone: parse(microphone, "the microphone")?,
+                camera: parse(camera, "the camera")?,
+                monitor: parse(monitor, "the monitor")?,
+            })
+        })() {
+            Ok(choices) => choices,
+            Err(why) => return (false, why),
+        };
+
+        let mut state = self.state.write().await;
+        let splits = state.config.find_rule_splits(&state.identities.pairs());
+        let key = hwprivacy_common::normalize_app_name;
+        let (from_key, into_key) = (key(from), key(into));
+        // Keeping the binary's name would leave no rule layer 1 can match.
+        if let Some(split) = splits
+            .iter()
+            .find(|s| key(&s.name_rule) == from_key && key(&s.exe_rule) == into_key)
+        {
+            return (
+                false,
+                format!(
+                    "The other way round: '{}' is the name PipeWire reports, so it has to \
+                     be the rule that stays. Merge '{}' into '{}'.",
+                    split.name_rule, split.exe_rule, split.name_rule
+                ),
+            );
+        }
+        let seen_as_one = splits
+            .iter()
+            .any(|s| key(&s.exe_rule) == from_key && key(&s.name_rule) == into_key);
+
+        let (after, mut report) = match state.config.merge_rules(from, into, &choices) {
+            Ok(result) => result,
+            Err(why) => return (false, why),
+        };
+        if !seen_as_one {
+            report.push_str(
+                "\nNote: hwprivacy has not seen these as one program. Check the binary above.",
+            );
+        }
+        if !apply {
+            return (true, report);
+        }
+
+        let before = std::mem::replace(&mut state.config, after);
+        if let Err(e) = state.config.save() {
+            state.config = before;
+            tracing::error!("Failed to save config: {}", e);
+            return (false, format!("Nothing was written: {e}"));
+        }
+        state.policy_dirty.notify_waiters();
+        drop(state);
+
+        let _ = Self::rule_changed(&ctx, into, "all", "merged").await;
+        info!("Rules merged: '{}' into '{}'", from, into);
+        (true, report)
+    }
+
     async fn get_link_audit(&self) -> (u64, u64, u64, u64) {
         let counts = self.state.read().await.link_ledger.counts;
         (

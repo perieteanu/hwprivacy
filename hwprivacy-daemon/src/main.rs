@@ -1,6 +1,7 @@
 mod dbus_service;
 mod device_discovery;
 mod history;
+mod identity;
 mod link_audit;
 mod link_manager;
 mod lsm_client;
@@ -468,6 +469,26 @@ async fn monitoring_loop(state: SharedState) {
             } else {
                 info!("{}", line.text);
             }
+        }
+
+        // Evidence only: this can tell the user two rules look like one program.
+        // It writes nothing but its own table. See rule_merge.rs.
+        let new_splits = {
+            let mut guard = state.write().await;
+            let s = &mut *guard;
+            s.identities.observe(&snapshot.nodes, &s.config);
+            let splits = s.config.find_rule_splits(&s.identities.pairs());
+            let fresh = s.identities.take_unannounced(splits);
+            s.identities.save_if_dirty();
+            fresh
+        };
+        for split in new_splits {
+            // Logged as well as shown: a popup is invisible to any automated check.
+            info!(
+                "Announced split rule: '{}' and '{}' look like one program ({})",
+                split.name_rule, split.exe_rule, split.exe_path
+            );
+            notification::notify_rule_split(&split).await;
         }
 
         // Group them (see group_links). One group = one decision, one prompt,

@@ -67,6 +67,9 @@ pub struct App {
     /// The link ledger. `None` when the daemon predates `GetLinkAudit`.
     pub link_audit: Option<(u64, u64, u64, u64)>,
 
+    /// How many pairs of rules look like one program.
+    pub rule_splits: usize,
+
     /// Which category column the Rules panel is pointing at: 0 mic, 1 camera,
     /// 2 monitor.
     ///
@@ -102,6 +105,7 @@ impl App {
             kernel: (false, false, 0, 0, String::new()),
             audio_backstop: (false, String::new()),
             link_audit: None,
+            rule_splits: 0,
             selected_device: 0,
         };
 
@@ -132,6 +136,7 @@ impl App {
             self.audio_backstop = a;
         }
         self.link_audit = self.proxy.get_link_audit().await.ok();
+        self.rule_splits = self.proxy.get_rule_splits().await.map_or(0, |s| s.len());
     }
 
     /// The category the Rules panel's column cursor is on.

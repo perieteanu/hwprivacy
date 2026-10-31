@@ -99,6 +99,25 @@ enum RulesAction {
         #[arg(long = "as")]
         as_app: Option<String>,
     },
+    /// Combine two rules that are one program. Previews unless --apply.
+    Merge {
+        /// The rule that goes, usually named after the binary (`firefox-bin`)
+        from: String,
+        /// The rule that stays: the name PipeWire reports
+        into: String,
+        /// Answer for the microphone, if the two rules disagree
+        #[arg(long)]
+        microphone: Option<String>,
+        /// Answer for the camera, if the two rules disagree
+        #[arg(long)]
+        camera: Option<String>,
+        /// Answer for the monitor, if the two rules disagree
+        #[arg(long)]
+        monitor: Option<String>,
+        /// Write it. A merge can be a grant, so the default is a preview.
+        #[arg(long)]
+        apply: bool,
+    },
     /// Attach (or clear, with "") the kernel-layer executable for an app.
     SetExe {
         /// App name of an existing rule
@@ -275,6 +294,11 @@ async fn main() -> anyhow::Result<()> {
                     );
                 }
                 Err(_) => println!("  Links:            unknown — daemon predates this feature"),
+            }
+
+            let splits = proxy.get_rule_splits().await.map(|s| s.len()).unwrap_or(0);
+            if splits > 0 {
+                println!("  Split rules:      {splits}  <- see: hwprivacy-ctl rules list");
             }
 
             // Kernel layer. Reported separately and always — "not connected"
@@ -521,6 +545,18 @@ async fn main() -> anyhow::Result<()> {
                         println!("!  {}: {}", app, note);
                         println!("   Fix: hwprivacy-ctl rules denied-cameras");
                     }
+                    for (name_rule, exe_rule, exe_path, conflicts) in
+                        proxy.get_rule_splits().await.unwrap_or_default()
+                    {
+                        println!();
+                        println!(
+                            "!  '{name_rule}' and '{exe_rule}' look like one program ({exe_path})"
+                        );
+                        if !conflicts.is_empty() {
+                            println!("   They disagree about: {}", conflicts.join(", "));
+                        }
+                        println!("   Preview: hwprivacy-ctl rules merge \"{exe_rule}\" \"{name_rule}\"");
+                    }
                 }
             }
             RulesAction::DeniedCameras => {
@@ -572,6 +608,29 @@ async fn main() -> anyhow::Result<()> {
                 // minute for a grant that already landed will conclude the
                 // command failed and start debugging a working system.
                 println!("The kernel layer has it now.");
+            }
+            RulesAction::Merge { from, into, microphone, camera, monitor, apply } => {
+                let (ok, message) = proxy
+                    .merge_rules(
+                        &from,
+                        &into,
+                        microphone.as_deref().unwrap_or(""),
+                        camera.as_deref().unwrap_or(""),
+                        monitor.as_deref().unwrap_or(""),
+                        apply,
+                    )
+                    .await?;
+                println!("{}", message);
+                if !ok {
+                    eprintln!("Nothing was written.");
+                    std::process::exit(2);
+                }
+                if apply {
+                    println!("Merged.");
+                } else {
+                    println!();
+                    println!("Preview only. Nothing was written. Add --apply to do it.");
+                }
             }
             RulesAction::SetExe { app, path } => {
                 let (ok, msg) = proxy.set_rule_exe(&app, &path).await?;

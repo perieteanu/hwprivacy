@@ -293,6 +293,22 @@ def main():
         "Kernel layer: checking..." not in all_text,
         [s for s in every_string(root) if s.startswith("Kernel layer")][:1],
     )
+    # -- the link ledger is reported, and has been populated ----------------
+    check(
+        "the link ledger is reported and has been populated",
+        "Links:" in all_text and "Links: checking..." not in all_text,
+        [s for s in every_string(root) if s.startswith("Links:")][:1],
+    )
+    # -- a split rule is visible on the tab where the two rows are ----------
+    # The daemon is the authority: with no split the banner must be absent, so
+    # this asserts both ways and cannot pass on an empty window.
+    _, rules_output = ctl("rules", "list")
+    split_expected = "look like one program" in rules_output
+    check(
+        "the rules tab agrees with the daemon about split rules",
+        ("look like one program" in all_text) == split_expected,
+        f"expected={split_expected}",
+    )
     # The audio backstop specifically. The camera guard was reported (via the
     # denials list) long before the audio one was, and reporting one while
     # omitting the other reads as "the other is fine".
@@ -317,7 +333,8 @@ def main():
         check("permission dropdown is a closed list", not editable(combos[2]))
 
     # -- one rule, one row -------------------------------------------------
-    daemon_rules = [r[0] for r in daemon("GetRules")]
+    daemon_rows = daemon("GetRules")
+    daemon_rules = [r[0] for r in daemon_rows]
     lists = by_role(page, "list")
     rule_rows = by_role(lists[0], "list item") if lists else []
     check(
@@ -337,10 +354,12 @@ def main():
     # to have a gap. A check that depends on which rule sorts first is not
     # checking the thing it names.
     if rule_rows:
-        # daemon_rules rows are (app, mic, cam, mon, exe, note); an empty
-        # permission string is an unset category.
+        # daemon_rows are (app, mic, cam, mon, exe, note); an empty permission
+        # string is an unset category. This read daemon_rules, which holds only
+        # the names, so it indexed the LETTERS of a name: it never found a gap
+        # and reported SKIPPED, until a three-letter rule name made it crash.
         gapped = next(
-            (r for r in daemon_rules if not r[1] or not r[2] or not r[3]), None
+            (r for r in daemon_rows if not r[1] or not r[2] or not r[3]), None
         )
         if gapped:
             row_text = next(

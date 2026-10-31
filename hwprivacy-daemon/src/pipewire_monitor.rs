@@ -37,6 +37,11 @@ pub struct NodeInfo {
     pub app_name: String,
     pub pid: u32,
     pub media_name: String,
+    /// `application.process.id`. Self-declared, unlike `pid`, which prefers the
+    /// server-attested value and so reads as the audio server for a pulse client.
+    pub declared_pid: u32,
+    /// `application.process.binary`. Self-declared.
+    pub process_binary: String,
 }
 
 /// One port on a node.
@@ -383,6 +388,13 @@ fn parse_node(id: u32, obj: &Value, clients: &HashMap<u32, &Value>) -> Option<No
         app_name,
         pid,
         media_name,
+        declared_pid: lookup("application.process.id")
+            .and_then(prop_as_u32)
+            .unwrap_or(0),
+        process_binary: lookup("application.process.binary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
     })
 }
 
@@ -584,6 +596,40 @@ mod graph_state_tests {
         g.apply_block(&blocks[0]);
         assert!(g.apply_block(&[link(96, 101, 110, 58, 36)]).is_empty());
         assert_eq!(g.snapshot().links[0].serial, Some(935));
+    }
+
+    /// The props as a real pulse client's node carries them (values from the live
+    /// graph, 2026-10-31): the pid arrives as a string, and the client's attested
+    /// pid is the audio server's.
+    #[test]
+    fn a_node_keeps_what_it_declares_about_itself() {
+        let mut g = GraphState::new();
+        g.apply_block(&[
+            json!({
+                "id": 33,
+                "type": "PipeWire:Interface:Client",
+                "info": { "props": {
+                    "application.name": "Firefox Developer Edition",
+                    "pipewire.sec.pid": 2100
+                }}
+            }),
+            json!({
+                "id": 77,
+                "type": "PipeWire:Interface:Node",
+                "info": { "props": {
+                    "media.class": "Stream/Output/Audio",
+                    "client.id": 33,
+                    "application.name": "Firefox Developer Edition",
+                    "application.process.id": "3098",
+                    "application.process.binary": "firefox-bin"
+                }}
+            }),
+        ]);
+        let snap = g.snapshot();
+        let n = snap.nodes.get(&77).unwrap();
+        assert_eq!(n.pid, 2100, "the attested pid is the server");
+        assert_eq!(n.declared_pid, 3098);
+        assert_eq!(n.process_binary, "firefox-bin");
     }
 
     /// A stale client would hand its identity to whichever later node names the

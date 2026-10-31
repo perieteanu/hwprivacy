@@ -101,6 +101,14 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         }
         None => (" Links: unknown — daemon predates this feature".to_string(), false),
     };
+    let links_text = if app.rule_splits > 0 {
+        format!(
+            "{links_text} | {} split rule(s): hwprivacy-ctl rules list",
+            app.rule_splits
+        )
+    } else {
+        links_text
+    };
     let status = Paragraph::new(vec![
         Line::from(status_text).style(Style::default().fg(Color::Green)),
         Line::from(kernel_text).style(Style::default().fg(if alarm {

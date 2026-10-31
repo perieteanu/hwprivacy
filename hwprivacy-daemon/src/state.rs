@@ -1,5 +1,6 @@
 use hwprivacy_common::device::ProtectedDevice;
 use hwprivacy_common::Config;
+use crate::identity::Identities;
 use crate::link_audit::LinkLedger;
 use crate::lsm_client::KernelLayerState;
 use crate::history::History;
@@ -22,6 +23,8 @@ pub struct DaemonState {
     pub known_link_ids: HashSet<u32>,
     /// A recorded decision for every live link on a protected device.
     pub link_ledger: LinkLedger,
+    /// Which declared names have been seen as which binaries. Evidence only.
+    pub identities: Identities,
     /// Emergency block-all mode
     pub block_all: bool,
     /// What we know about the kernel (eBPF LSM) layer. Absent/disconnected is
@@ -55,6 +58,7 @@ impl DaemonState {
             tracker: StreamTracker::new(),
             known_link_ids: HashSet::new(),
             link_ledger: LinkLedger::default(),
+            identities: Identities::load(crate::identity::default_path()),
             block_all: false,
             kernel: KernelLayerState::default(),
             history: History::load_with_legacy(

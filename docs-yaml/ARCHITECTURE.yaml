@@ -12,10 +12,10 @@
 ---
 shape:
   language: "Rust 2021 + one BPF C file"
-  layout: "Cargo workspace, 7 crates, 17197 LOC of first-party code (BPF C included; generated vmlinux.h excluded) — measured 2026-09-12"
+  layout: "Cargo workspace, 7 crates, 18543 LOC of first-party code (BPF C included; generated vmlinux.h excluded) — measured 2026-09-12"
   build: "cargo build --release --workspace  (or: make build)"
   binaries: 5
-  tests: 281        # declared; 279 run (2 need a display). Measured 2026-10-31.
+  tests: 308        # declared; 306 run (2 need a display). Measured 2026-10-31.
   test_distribution: "daemon 123, common 60, lsm 56, proto 6, ctl 5, tui 5, gui 2"
   corrected_2026_09_12: >
     This said 132 tests and "Zero in ctl/tui/gui", which had been false since
@@ -72,8 +72,10 @@ crates:
       link_manager.rs:    "destroy_link() via pw-link --disconnect, fallback pw-cli destroy"
       stream_tracker.rs:  "active connections, 500-event ring buffer, one-shot grants, dismiss cooldowns"
       notification.rs:    "2-stage freedesktop notifications via notify-rust"
-      dbus_service.rs:    "#[zbus::interface] server impl — 17 methods, 3 declared signals (AccessAttempt and StreamEvent are declared and never emitted; frontends poll)"
-      state.rs:           "DaemonState = config + devices + tracker + known_link_ids + block_all"
+      link_audit.rs:      "LinkLedger::reconcile decides what needs a decision from (id, serial), one journal line per link; verify_denial checks a destroy took. See d-every-link-is-accounted-for"
+      identity.rs:        "observed (declared name, binary) pairs, persisted to identities.json. Evidence only, never reaches an allowlist. See d-one-program-one-rule"
+      dbus_service.rs:    "#[zbus::interface] server impl — 20 methods, 3 declared signals (AccessAttempt and StreamEvent are declared and never emitted; frontends poll)"
+      state.rs:           "DaemonState = config + devices + tracker + known_link_ids + link_ledger + identities + block_all"
       lsm_client.rs:      "layer 2 client — connects to the root helper's unix socket, reconnects every 10s, pushes the allowlist, RE-pushes it whenever PolicyFingerprint changes, receives kernel AccessEvents and folds them into the same tracker/notification path"
       history.rs:         "the persistent per-(identity, device, source) table behind `hwprivacy-ctl history` — denied AND allowed counts. Survives restarts; $XDG_STATE_HOME/hwprivacy/history.json, atomic writes, migrates from the pre-2026-08-21 offenders.json."
       notify_allow.rs:    "the pure gate deciding whether an ALLOWED access is announced: startup grace, per-(app,device) cooldown, never a burst summary."
@@ -156,7 +158,7 @@ enforcement_pipeline_layer_1_pipewire:
     rss: "20.7 MB"
   steps:
     - "1. capture_graph(): pw-dump -> HashMap<node_id, NodeInfo> + Vec<PwLink>"
-    - "2. diff_links(): links whose link_id is not in state.known_link_ids"
+    - "2. LinkLedger::reconcile(): every live link with no decision for its (id, object.serial) that classify_link recognises. Replaced new_link_ids as the input on 2026-10-31."
     - "3. classify_link(): is either endpoint a ProtectedDevice? which side is the app?"
     - "4. devices.is_guarded(category)? if not, skip entirely"
     - "5. block_all flag? destroy + log + next"
@@ -261,8 +263,8 @@ dbus_api:
   service: "org.hwprivacy.Daemon"
   path: "/org/hwprivacy/Daemon"
   bus: "session"
-  as_of: "2026-09-12 — enumerated from hwprivacy-common/src/dbus_interface.rs, not from a sibling doc"
-  methods: 17
+  as_of: "2026-10-31 — enumerated from hwprivacy-common/src/dbus_interface.rs, not from a sibling doc"
+  methods: 20
   corrected_2026_09_12: >
     This block said 14 methods and still listed AllowStream and DenyStream,
     which were DELETED on 2026-08-23 with ask_each — so it advertised an API
@@ -281,6 +283,9 @@ dbus_api:
     - "GetEvents(last_n) -> a(ssss)          (timestamp, app, device, action)"
     - "GetKernelStatus() -> (bbuus)          (connected, enforcing_camera, allowed_exes, unresolved, last_error)"
     - "GetAudioBackstop() -> (bs)            (enforcing, why_not). Added 2026-09-12. why_not is empty iff enforcing, and is a sentence printed verbatim — including \"unknown\" when the helper is unreachable, because a disconnected daemon must not report its own default as fact."
+    - "GetLinkAudit() -> (tttt)              link ledger: (seen, protected, decided_late, denied_alive). Added 2026-10-31."
+    - "GetRuleSplits() -> a(sssas)           rules that look like one program: (name_rule, exe_rule, exe_path, conflicts). Evidence only. Added 2026-10-31."
+    - "MergeRules(ssssssb) -> (bs)           fold one rule into another; previews unless the last argument is true. Added 2026-10-31."
     - "GetSessions() -> a(ssu)               live while_in_use sessions (app, device, age_secs)"
     - "GetHistory() -> a(sssuuss)            (identity, device, source, denied, allowed, first, last) — was GetOffenders until 2026-08-21"
     - "GetPresets() -> a(ssus)               (name, description, entry_count, source_path)"

@@ -344,6 +344,7 @@ hwprivacy-ctl devices                         # list discovered devices
 hwprivacy-ctl rules list                      # show all rules
 hwprivacy-ctl rules set firefox mic while_in_use   # set a rule
 hwprivacy-ctl rules allow-camera <path> --as <rule>  # camera needs the BINARY
+hwprivacy-ctl rules merge <from> <into>       # two rules, one program: previews
 hwprivacy-ctl rules denied-cameras            # what the kernel has denied,
                                               # with the path to allow
 hwprivacy-ctl rules remove firefox            # remove all rules for app
@@ -565,6 +566,29 @@ hwprivacy-ctl rules set obs monitor allow
 hwprivacy-ctl rules set suspicious-app mic deny
 ```
 
+### One program, two rules
+
+A PipeWire prompt names a rule after what the application calls itself, and a
+kernel prompt names it after the binary, so one program can end up with two rows:
+
+```
+firefox developer edition   allow   allow   —   (none)
+firefox-bin                 allow   deny    —   /home/you/firefox-developer/firefox-bin
+```
+
+`hwprivacy-ctl rules list`, `status` and the GUI's Rules tab point these out once
+hwprivacy has seen the name and the binary together. Combine them:
+
+```bash
+hwprivacy-ctl rules merge firefox-bin "firefox developer edition"                 # refuses: they disagree
+hwprivacy-ctl rules merge firefox-bin "firefox developer edition" --camera deny   # preview
+hwprivacy-ctl rules merge firefox-bin "firefox developer edition" --camera deny --apply
+```
+
+The rule that stays is the one PipeWire reports, and it takes the binary. Nothing
+merges by itself: the join is what a stream says about itself, and acting on that
+unasked would let a process claim a trusted name and inherit its kernel grants.
+
 ### Monitor in real-time
 
 ```bash
@@ -758,8 +782,7 @@ packaging; "Phase 5" there is the ALSA backstop, which has **not** started.
 - [ ] **pipewire-rs native bindings** (v2): replace the `pw-dump`/`pw-link`
       subprocesses with the library. Note this is **no longer about CPU or
       polling** — `pw-dump --monitor` already removed both. What remains is
-      registry enumeration on connect, which would also close limitation 6
-      (links that already exist at daemon start).
+      registry enumeration on connect.
 - [ ] **Process path identity**: Match apps by executable path (`/usr/bin/firefox`)
       in addition to PipeWire client name, for stronger identification.
 - [ ] **XDG Portal integration**: Coordinate with the Flatpak/portal permission
@@ -864,9 +887,9 @@ packaging; "Phase 5" there is the ALSA backstop, which has **not** started.
    (intercepting every read) or revoking on policy change — a design step, not
    a patch.
 
-9. **Links that already exist when the daemon starts are never evaluated.**
-   They are seeded into `known_link_ids` and grandfathered in. Starting the
-   daemon does not stop an in-progress capture.
+9. **Nothing is enforced at layer 1 while the daemon is stopped.** A link formed
+   in that time is evaluated when the daemon starts, and denied if a rule says so
+   (verified live 2026-10-31), but whatever it carried in between has gone.
 
 10. **`BlockAll()` does not stop anything already recording.** It blocks *new*
    links. An active stream survives it.
@@ -991,6 +1014,9 @@ Verified against `hwprivacy-daemon/src/dbus_service.rs` on 2026-09-12.
 | `GetStatus()` | `(b, u32, u32, u32, u32)` | (running, devices, rules, blocked, streams) |
 | `GetKernelStatus()` | `(b, b, u32, u32, s)` | (connected, enforcing_camera, allowed_exes, unresolved, last_error) |
 | `GetAudioBackstop()` | `(b, s)` | The ALSA capture backstop: (enforcing, why_not). `why_not` is empty iff enforcing, and is a sentence meant to be printed verbatim — including "unknown" when the daemon cannot reach the helper |
+| `GetLinkAudit()` | `(u64, u64, u64, u64)` | The link ledger: (seen, protected, decided_late, denied_alive). Either of the last two above zero needs attention. |
+| `GetRuleSplits()` | `Array<(s, s, s, Array<s>)>` | Rules that look like one program: (name_rule, exe_rule, exe_path, conflicts). Evidence, not a verdict. |
+| `MergeRules(from, into, microphone, camera, monitor, apply)` | `(b, s)` | Fold one rule into another. Previews unless `apply`. A choice is `""` where the rules agree. |
 | `GetSessions()` | `Array<(s, s, u32)>` | Live `while_in_use` sessions: (app, device, age_secs) |
 | `GetEvents(last_n)` | `Array<(s, s, s, s)>` | (timestamp, app, device, action) — a 500-entry in-memory ring, lost on restart |
 | `GetHistory()` | `Array<(s, s, s, u32, u32, s, s)>` | (identity, device, source, denied, allowed, first_seen, last_seen) — **survives restarts**, unlike `GetEvents` |

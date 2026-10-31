@@ -2,6 +2,18 @@ use gtk::prelude::*;
 use gtk::{self, glib, Align, Orientation, SelectionMode};
 use hwprivacy_common::dbus_interface::HwPrivacyProxy;
 
+type RuleSplitRow = (String, String, String, Vec<String>);
+
+/// One merge the user is asking for. A choice is "" where the rules agree.
+#[derive(Debug, Clone)]
+struct MergeRequest {
+    from: String,
+    into: String,
+    microphone: String,
+    camera: String,
+    monitor: String,
+}
+
 #[derive(Debug)]
 enum UiMessage {
     Devices(Vec<(String, String, String, bool)>),
@@ -27,6 +39,10 @@ enum UiMessage {
     /// stale-but-fine. A guard that silently stops being reported is the defect
     /// this change exists to remove, not one to reintroduce in the GUI.
     Kernel(bool, bool, bool, String),
+    /// Rules that look like one program: (name_rule, exe_rule, exe_path, conflicts).
+    RuleSplits(Vec<RuleSplitRow>),
+    /// A merge preview from the daemon, to confirm or cancel.
+    MergePreview(MergeRequest, String),
     /// The link ledger, on its own label for the same reason as `Kernel`.
     LinkAudit(Option<(u64, u64, u64, u64)>),
     Error(String),
@@ -40,6 +56,10 @@ enum DaemonCommand {
     /// leaves a rule that reads `allow` and denies.
     AllowCamera { app: String, exe_path: String },
     RemoveRule(String),
+    /// Ask the daemon what this merge would do. Writes nothing.
+    PreviewMerge(MergeRequest),
+    /// Do it. Only ever sent from the preview dialog.
+    ApplyMerge(MergeRequest),
     BlockAll,
     UnblockAll,
 }
@@ -119,6 +139,12 @@ pub fn build_ui(app: &gtk::Application) {
     rules_box.set_margin_top(10);
     rules_box.set_margin_start(10);
     rules_box.set_margin_end(10);
+
+    // Rules that look like one program. Above the list, because the two rows it
+    // is about read as two unrelated apps until something says otherwise.
+    let splits_box = gtk::Box::new(Orientation::Vertical, 6);
+    rules_box.append(&splits_box);
+
     let rules_list = gtk::ListBox::new();
     rules_list.set_selection_mode(SelectionMode::None);
     let rules_scroll = gtk::ScrolledWindow::new();
@@ -271,6 +297,9 @@ pub fn build_ui(app: &gtk::Application) {
     let status_label_c = status_label.clone();
     let kernel_label_c = kernel_label.clone();
     let links_label_c = links_label.clone();
+    let splits_box_c = splits_box.clone();
+    let last_splits: std::cell::RefCell<Vec<RuleSplitRow>> = std::cell::RefCell::new(Vec::new());
+    let cmd_tx_split = cmd_tx.clone();
     let cmd_tx_del = cmd_tx.clone();
     let cmd_tx_allow = cmd_tx.clone();
     let denials_list_c = denials_list.clone();
@@ -320,6 +349,22 @@ pub fn build_ui(app: &gtk::Application) {
                         )
                     };
                     kernel_label_c.set_text(&text);
+                }
+                UiMessage::RuleSplits(splits) => {
+                    // Only when something changed. A refresh arrives every 2 s,
+                    // and rebuilding would throw away a choice being made.
+                    if *last_splits.borrow() != splits {
+                        while let Some(child) = splits_box_c.first_child() {
+                            splits_box_c.remove(&child);
+                        }
+                        for split in &splits {
+                            splits_box_c.append(&split_row(split, &cmd_tx_split));
+                        }
+                        *last_splits.borrow_mut() = splits;
+                    }
+                }
+                UiMessage::MergePreview(request, report) => {
+                    show_merge_preview(&window_c, request, &report, cmd_tx_split.clone());
                 }
                 UiMessage::LinkAudit(audit) => {
                     links_label_c.set_text(&match audit {
@@ -676,6 +721,124 @@ fn show_grant_dialog(
     win.present();
 }
 
+/// One split: what it is, a choice for each device the rules disagree about, and
+/// a button that stays off until every choice is made. The daemon refuses the
+/// merge otherwise, and a button that can only fail is worse than a disabled one.
+fn split_row(
+    split: &RuleSplitRow,
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<DaemonCommand>,
+) -> gtk::Box {
+    let (name_rule, exe_rule, exe_path, conflicts) = split;
+    let row = gtk::Box::new(Orientation::Vertical, 4);
+
+    let text = gtk::Label::new(Some(&format!(
+        "\u{2018}{name_rule}\u{2019} and \u{2018}{exe_rule}\u{2019} look like one program ({exe_path})"
+    )));
+    text.set_halign(Align::Start);
+    text.set_wrap(true);
+    text.add_css_class("perm-deny");
+    row.append(&text);
+
+    let controls = gtk::Box::new(Orientation::Horizontal, 6);
+    let merge = gtk::Button::with_label("Preview merge");
+    merge.set_sensitive(conflicts.is_empty());
+
+    let mut choosers: Vec<(String, gtk::ComboBoxText)> = Vec::new();
+    for device in conflicts {
+        let label = gtk::Label::new(Some(&format!("{device}:")));
+        controls.append(&label);
+        let combo = gtk::ComboBoxText::new();
+        let options: &[&str] = if device == "camera" {
+            &["allow", "deny"]
+        } else {
+            &["allow", "deny", "ask"]
+        };
+        for option in options {
+            combo.append_text(option);
+        }
+        controls.append(&combo);
+        choosers.push((device.clone(), combo));
+    }
+    for (_, combo) in &choosers {
+        let all: Vec<gtk::ComboBoxText> = choosers.iter().map(|(_, c)| c.clone()).collect();
+        let merge_c = merge.clone();
+        combo.connect_changed(move |_| {
+            merge_c.set_sensitive(all.iter().all(|c| c.active().is_some()));
+        });
+    }
+
+    let from = exe_rule.clone();
+    let into = name_rule.clone();
+    let cmd = cmd_tx.clone();
+    merge.connect_clicked(move |_| {
+        let chosen = |device: &str| {
+            choosers
+                .iter()
+                .find(|(d, _)| d == device)
+                .and_then(|(_, c)| c.active_text())
+                .map(|t| t.to_string())
+                .unwrap_or_default()
+        };
+        let _ = cmd.send(DaemonCommand::PreviewMerge(MergeRequest {
+            from: from.clone(),
+            into: into.clone(),
+            microphone: chosen("microphone"),
+            camera: chosen("camera"),
+            monitor: chosen("monitor"),
+        }));
+    });
+    controls.append(&merge);
+    row.append(&controls);
+    row
+}
+
+/// The daemon's own description of a merge, and the only way to confirm one. A
+/// merge can be a grant, so nothing is written before someone has read this.
+fn show_merge_preview(
+    parent: &gtk::ApplicationWindow,
+    request: MergeRequest,
+    report: &str,
+    cmd_tx: tokio::sync::mpsc::UnboundedSender<DaemonCommand>,
+) {
+    let win = gtk::Window::builder()
+        .title("Merge rules")
+        .transient_for(parent)
+        .modal(true)
+        .default_width(520)
+        .build();
+
+    let vbox = gtk::Box::new(Orientation::Vertical, 10);
+    vbox.set_margin_top(14);
+    vbox.set_margin_bottom(14);
+    vbox.set_margin_start(14);
+    vbox.set_margin_end(14);
+
+    let text = gtk::Label::new(Some(report));
+    text.set_halign(Align::Start);
+    text.set_wrap(true);
+    text.add_css_class("monospace");
+    vbox.append(&text);
+
+    let buttons = gtk::Box::new(Orientation::Horizontal, 6);
+    buttons.set_halign(Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let apply = gtk::Button::with_label("Merge");
+    buttons.append(&cancel);
+    buttons.append(&apply);
+    vbox.append(&buttons);
+    win.set_child(Some(&vbox));
+
+    let win_cancel = win.clone();
+    cancel.connect_clicked(move |_| win_cancel.close());
+    let win_apply = win.clone();
+    apply.connect_clicked(move |_| {
+        let _ = cmd_tx.send(DaemonCommand::ApplyMerge(request.clone()));
+        win_apply.close();
+    });
+
+    win.present();
+}
+
 fn clear_listbox(list: &gtk::ListBox) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
@@ -724,6 +887,9 @@ async fn dbus_worker(
                 let _ = ui_tx
                     .send(UiMessage::LinkAudit(proxy.get_link_audit().await.ok()))
                     .await;
+                if let Ok(splits) = proxy.get_rule_splits().await {
+                    let _ = ui_tx.send(UiMessage::RuleSplits(splits)).await;
+                }
                 if let Ok(d) = proxy.get_devices().await {
                     let _ = ui_tx.send(UiMessage::Devices(d)).await;
                 }
@@ -750,6 +916,45 @@ async fn dbus_worker(
             DaemonCommand::SetRule(app, dev, perm) => {
                 let _ = proxy.set_rule(&app, &dev, &perm).await;
                 let _ = ui_tx.send(UiMessage::Status(true, 0, 0, 0, 0)).await; // trigger refresh
+            }
+            DaemonCommand::PreviewMerge(request) => {
+                let reply = proxy
+                    .merge_rules(
+                        &request.from,
+                        &request.into,
+                        &request.microphone,
+                        &request.camera,
+                        &request.monitor,
+                        false,
+                    )
+                    .await;
+                let message = match reply {
+                    Ok((true, report)) => UiMessage::MergePreview(request, report),
+                    Ok((false, why)) => UiMessage::Error(format!("Nothing was written: {why}")),
+                    Err(e) => UiMessage::Error(format!("D-Bus: {e}")),
+                };
+                let _ = ui_tx.send(message).await;
+            }
+            DaemonCommand::ApplyMerge(request) => {
+                let reply = proxy
+                    .merge_rules(
+                        &request.from,
+                        &request.into,
+                        &request.microphone,
+                        &request.camera,
+                        &request.monitor,
+                        true,
+                    )
+                    .await;
+                let message = match reply {
+                    Ok((true, _)) => UiMessage::Error(format!(
+                        "Merged \u{2018}{}\u{2019} into \u{2018}{}\u{2019}",
+                        request.from, request.into
+                    )),
+                    Ok((false, why)) => UiMessage::Error(format!("Nothing was written: {why}")),
+                    Err(e) => UiMessage::Error(format!("D-Bus: {e}")),
+                };
+                let _ = ui_tx.send(message).await;
             }
             DaemonCommand::AllowCamera { app, exe_path } => {
                 // Atomic on the daemon side, so a successful grant never

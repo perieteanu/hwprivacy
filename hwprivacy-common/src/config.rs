@@ -116,6 +116,15 @@ impl AppRule {
         }
     }
 
+    /// Set or clear this rule's opinion for one category.
+    pub fn set_opinion(&mut self, category: &super::DeviceCategory, perm: Option<Permission>) {
+        match category {
+            super::DeviceCategory::Microphone => self.microphone = perm,
+            super::DeviceCategory::Camera => self.camera = perm,
+            super::DeviceCategory::Monitor => self.monitor = perm,
+        }
+    }
+
     pub fn set_permission(&mut self, category: &super::DeviceCategory, perm: Permission) {
         match category {
             super::DeviceCategory::Microphone => self.microphone = Some(perm),
@@ -841,7 +850,7 @@ impl Config {
             .iter()
             .any(|(path, _)| {
                 let name = short_name(path);
-                name == "pipewire" || name == "wireplumber" || name == "pipewire-pulse"
+                AUDIO_SERVER_NAMES.contains(&name.as_str())
             });
         if !has_server {
             return Some(
@@ -883,6 +892,10 @@ pub fn short_name(exe_path: &str) -> String {
         .unwrap_or(exe_path)
         .to_string()
 }
+
+/// The executables that make up the audio server on the only stack measured. See
+/// `audio_backstop_blocker` for why this list is PipeWire-shaped.
+pub const AUDIO_SERVER_NAMES: [&str; 3] = ["pipewire", "wireplumber", "pipewire-pulse"];
 
 /// What pipewire-alsa calls every client: `PipeWire ALSA [<program>]`. Lowercase,
 /// as the matcher compares it.

@@ -34,6 +34,12 @@ app_naming:
     variant 'OBS [pipewire-pulse]' match a rule written as 'obs'. It is not a
     general fuzzy matcher and will not save you from a pasted label.
 
+one_program_one_rule:
+  label: "A rule carries both identities. Two rules for one program is a defect to merge."
+  how_it_happens: "A PipeWire prompt names a rule after the declared name, a kernel prompt after short_name(exe)."
+  fix: "hwprivacy-ctl rules merge <binary rule> <name rule>, or the GUI's Rules tab. The name rule stays: layer 1 matches only by name."
+  rule: "The observed join is evidence. It never writes a rule or reaches an allowlist. See d-one-program-one-rule."
+
 exe_path_identity:
   label: "The kernel's principal is an INODE, and two paths can share one."
   measured_2026_09_12: >

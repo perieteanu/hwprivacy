@@ -16,7 +16,7 @@ current_state:
     reboot-and-attach test has run on a machine other than this one.
 
   verified_working:
-    - "Cargo workspace, 7 crates, 17197 LOC, 279 tests run / 281 declared, builds clean (21 warnings, 0 errors) — verified 2026-09-12"
+    - "Cargo workspace, 7 crates, 18543 LOC, 306 tests run / 308 declared, builds clean (21 warnings, 0 errors) — verified 2026-09-12"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"
@@ -318,10 +318,10 @@ policy_staleness_2026_08_21:
 security_gaps:
   label: "Real holes not listed in README > Known Limitations."
   g1_grandfathered_links:
-    what: "Links that already exist when the daemon starts are never evaluated."
-    where: "main.rs:158 seeds known_link_ids with every link from the initial capture, then only the diff is processed"
-    effect: "A mic tap active before daemon start survives forever. Also means every daemon restart re-grandfathers everything."
-    fixed_free_by: "d-event-driven-substrate (registry enumeration gives existing objects on connect)"
+    what: "CLOSED. Links that already existed when the daemon started were never evaluated."
+    closed_by: "b854665 (2026-09-02): the monitor's seed block reports its links as new, and nothing filters them. The docs kept saying otherwise for two months."
+    verified_live_2026_10_31: "Daemon stopped, a monitor capture under a denied name formed links 84 and 91, daemon started: both destroyed, DENIED logged. tools/acceptance/link-audit-probe.sh, section 3."
+    still_true: "Nothing is enforced while the daemon is stopped."
 
   g2_blockall_does_not_block:
     what: "The emergency Block All button does not stop anything already recording."
@@ -409,10 +409,10 @@ security_gaps:
       A PipeWire prompt names the rule after the declared name. A kernel prompt
       names it short_name(exe). firefox-esr has one rule only because its binary
       was attached by hand with --as.
-    direction: >
-      Not built. The join exists in the data: the stream's application.process.id
-      and the kernel event's tgid are the same number. Detecting the split and
-      offering a merge is the smaller first step.
+    status: >
+      Detection and an explicit merge landed 2026-10-31 (d-one-program-one-rule). New
+      splits are still created, then announced. Not built: joining on the kernel
+      event's tgid, which is attested where the stream's pid is not.
 
   g_devices_frozen_after_two_minutes:
     what: "Device discovery runs only at start and for the first 120 s, so a USB microphone plugged in later may not be guarded by layer 1."

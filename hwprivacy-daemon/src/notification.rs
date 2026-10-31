@@ -187,6 +187,30 @@ pub async fn notify_allowed(
     .ok();
 }
 
+/// Tell the user two rules look like one program. Never a prompt: merging can
+/// be a grant, so it gets a preview on a surface that can show one.
+pub async fn notify_rule_split(split: &hwprivacy_common::rule_merge::RuleSplit) {
+    let summary = "One program, two rules".to_string();
+    let body = format!(
+        "<b>{}</b> and <b>{}</b> look like the same program ({}).\n\
+         <i>Preview combining them: hwprivacy-ctl rules merge \"{}\" \"{}\"</i>",
+        split.name_rule, split.exe_rule, split.exe_path, split.exe_rule, split.name_rule,
+    );
+
+    tokio::task::spawn_blocking(move || {
+        let result = Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .timeout(10000)
+            .show();
+        if let Err(e) = result {
+            warn!("Failed to send split-rule notification: {}", e);
+        }
+    })
+    .await
+    .ok();
+}
+
 /// Tell the user a denial did not take: the access is still running.
 pub async fn notify_could_not_stop(app_name: &str, device: DeviceCategory) {
     let summary = format!("COULD NOT STOP: {} → {}", app_name, device_label(device));

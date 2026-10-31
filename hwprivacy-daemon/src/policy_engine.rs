@@ -187,6 +187,8 @@ mod tests {
             app_name: app.into(),
             pid: 1234,
             media_name: String::new(),
+            declared_pid: 0,
+            process_binary: String::new(),
         }
     }
 
