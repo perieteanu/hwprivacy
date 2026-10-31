@@ -75,6 +75,8 @@ pub struct PortInfo {
 /// * a removal is the object with `"info": null`. There is no other delete
 ///   signal, and missing one means an object that never goes away — a link
 ///   that never releases, a session that never ends.
+///
+/// A removal carries no `type`: on the wire it is exactly `{"id": N, "info": null}`.
 #[derive(Debug, Default)]
 pub struct GraphState {
     nodes: HashMap<u32, NodeInfo>,
@@ -118,17 +120,12 @@ impl GraphState {
         // Clients first, within the block, so a Node arriving alongside its
         // Client can still resolve it.
         for obj in objects {
-            if obj.get("type").and_then(|t| t.as_str()) == Some("PipeWire:Interface:Client") {
-                let id = obj.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                match obj.get("info") {
-                    Some(Value::Null) | None => {
-                        self.client_props.remove(&id);
-                    }
-                    Some(info) => {
-                        if let Some(props) = info.get("props") {
-                            self.client_props.insert(id, props.clone());
-                        }
-                    }
+            let id = obj.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            if is_removal(obj) {
+                self.client_props.remove(&id);
+            } else if obj.get("type").and_then(|t| t.as_str()) == Some("PipeWire:Interface:Client") {
+                if let Some(props) = obj.get("info").and_then(|i| i.get("props")) {
+                    self.client_props.insert(id, props.clone());
                 }
             }
         }
@@ -144,28 +141,30 @@ impl GraphState {
 
             // `"info": null` is a REMOVAL. Checked before anything else,
             // because every parse_* below would simply return None on it and
-            // the object would silently persist forever.
-            let removed = matches!(obj.get("info"), Some(Value::Null));
+            // the object would silently persist forever. Checked before the
+            // TYPE above all: a real removal is `{"id": N, "info": null}` and
+            // has none. Ids are global across object types, so clearing every
+            // map cannot hit the wrong object.
+            if is_removal(obj) {
+                self.nodes.remove(&id);
+                self.ports.remove(&id);
+                self.links.remove(&id);
+                continue;
+            }
 
             match obj_type {
                 "PipeWire:Interface:Node" => {
-                    if removed {
-                        self.nodes.remove(&id);
-                    } else if let Some(info) = parse_node(id, obj, &clients) {
+                    if let Some(info) = parse_node(id, obj, &clients) {
                         self.nodes.insert(id, info);
                     }
                 }
                 "PipeWire:Interface:Port" => {
-                    if removed {
-                        self.ports.remove(&id);
-                    } else if let Some(port) = parse_port(id, obj) {
+                    if let Some(port) = parse_port(id, obj) {
                         self.ports.insert(id, port);
                     }
                 }
                 "PipeWire:Interface:Link" => {
-                    if removed {
-                        self.links.remove(&id);
-                    } else if let Some(link) = parse_link(id, obj) {
+                    if let Some(link) = parse_link(id, obj) {
                         // New only if the graph had never seen this id. A link
                         // emits several blocks as it negotiates, and each is an
                         // update, not a new access.
@@ -271,6 +270,10 @@ pub async fn capture_graph() -> Result<GraphSnapshot> {
     );
 
     Ok(snapshot)
+}
+
+fn is_removal(obj: &Value) -> bool {
+    matches!(obj.get("info"), Some(Value::Null))
 }
 
 fn parse_node(id: u32, obj: &Value, clients: &HashMap<u32, &Value>) -> Option<NodeInfo> {
@@ -499,8 +502,77 @@ mod graph_state_tests {
     /// A removal is `"info": null` and nothing else. Miss it and the object
     /// lives forever — a link that never releases, so a while_in_use session
     /// that never ends.
-    fn removal(id: u32, kind: &str) -> Value {
-        json!({ "id": id, "type": format!("PipeWire:Interface:{kind}"), "info": null })
+    ///
+    /// There is NO `type` here, because `pw-dump` does not send one. This
+    /// helper used to add it, which is how removals went unapplied from
+    /// 2026-09-02 to 2026-10-31 with every test green.
+    fn removal(id: u32) -> Value {
+        json!({ "id": id, "info": null })
+    }
+
+    /// Bytes from `pw-dump --monitor`, captured live on 2026-10-31 from two
+    /// short playback streams and trimmed to the blocks for one id. Captured
+    /// because the hand-written fixture is what hid this defect.
+    const CAPTURED_LINK_96_LIFECYCLE: &str = r#"[
+      [{"id": 96, "type": "PipeWire:Interface:Link", "version": 3, "permissions": ["r", "x"], "info": {"output-node-id": 101, "output-port-id": 110, "input-node-id": 58, "input-port-id": 36, "change-mask": ["state", "format", "props"], "state": "negotiating", "error": null, "format": {"mediaType": "audio", "mediaSubtype": "dsp", "format": "F32P"}, "props": {"client.id": 33, "factory.id": 21, "link.async": true, "link.input.node": 58, "link.input.port": 36, "link.output.node": 101, "link.output.port": 110, "object.id": 96, "object.serial": 935}}}],
+      [{"id": 96, "type": "PipeWire:Interface:Link", "version": 3, "permissions": ["r", "x"], "info": {"output-node-id": 101, "output-port-id": 110, "input-node-id": 58, "input-port-id": 36, "change-mask": ["state"], "state": "active", "error": null, "format": {"mediaType": "audio", "mediaSubtype": "dsp", "format": "F32P"}, "props": {"client.id": 33, "factory.id": 21, "link.async": true, "link.input.node": 58, "link.input.port": 36, "link.output.node": 101, "link.output.port": 110, "object.id": 96, "object.serial": 935}}}],
+      [{"id": 96, "info": null}],
+      [{"id": 96, "type": "PipeWire:Interface:Link", "version": 3, "permissions": ["r", "x"], "info": {"output-node-id": 101, "output-port-id": 92, "input-node-id": 58, "input-port-id": 44, "change-mask": ["state", "format", "props"], "state": "negotiating", "error": null, "format": {"mediaType": "audio", "mediaSubtype": "dsp", "format": "F32P"}, "props": {"client.id": 33, "factory.id": 21, "link.async": true, "link.input.node": 58, "link.input.port": 44, "link.output.node": 101, "link.output.port": 92, "object.id": 96, "object.serial": 942}}}],
+      [{"id": 96, "info": null}]
+    ]"#;
+
+    /// THE test for the security half of the removal defect. PipeWire recycles
+    /// ids within seconds, and "never seen this id" is what makes a link new, so
+    /// a removal that goes unapplied means the next link on that id is never
+    /// evaluated: no deny, no prompt, no log line.
+    #[test]
+    fn a_link_on_a_recycled_id_is_new_again() {
+        let blocks: Vec<Vec<Value>> = serde_json::from_str(CAPTURED_LINK_96_LIFECYCLE).unwrap();
+        let mut g = GraphState::new();
+
+        assert_eq!(g.apply_block(&blocks[0]), vec![96], "first sighting is new");
+        assert!(g.apply_block(&blocks[1]).is_empty(), "a state change is not new");
+        g.apply_block(&blocks[2]);
+        assert!(!g.link_ids().contains(&96), "the removal must delete the link");
+
+        assert_eq!(
+            g.apply_block(&blocks[3]),
+            vec![96],
+            "same id, different link: it must be evaluated like any other"
+        );
+        g.apply_block(&blocks[4]);
+        assert_eq!(g.counts().2, 0, "and the second removal must delete it too");
+    }
+
+    /// A stale client would hand its identity to whichever later node names the
+    /// recycled client id.
+    #[test]
+    fn a_removal_forgets_a_client() {
+        let mut g = GraphState::new();
+        g.apply_block(&[json!({
+            "id": 5,
+            "type": "PipeWire:Interface:Client",
+            "info": { "props": { "application.name": "Firefox" } }
+        })]);
+        g.apply_block(&[removal(5)]);
+        g.apply_block(&[json!({
+            "id": 10,
+            "type": "PipeWire:Interface:Node",
+            "info": { "props": { "media.class": "Stream/Input/Audio", "client.id": 5 } }
+        })]);
+        let snap = g.snapshot();
+        assert_ne!(snap.nodes.get(&10).expect("node applied").app_name, "Firefox");
+    }
+
+    /// Ids are global across object types — the capture shows 96 as a link and
+    /// then as something else — so a type-less removal cannot pick one map.
+    #[test]
+    fn a_removal_applies_whatever_the_id_was() {
+        let mut g = GraphState::new();
+        g.apply_block(&[node(10, "Audio/Source", "mic")]);
+        g.apply_block(&[link(30, 10, 11, 20, 21)]);
+        g.apply_block(&[removal(10), removal(30)]);
+        assert_eq!(g.counts(), (0, 0, 0));
     }
 
     #[test]
@@ -523,11 +595,11 @@ mod graph_state_tests {
         g.apply_block(&[node(10, "Audio/Source", "mic"), link(30, 10, 11, 20, 21)]);
         assert_eq!(g.counts(), (1, 0, 1));
 
-        g.apply_block(&[removal(30, "Link")]);
+        g.apply_block(&[removal(30)]);
         assert_eq!(g.counts().2, 0, "the link must be gone");
         assert!(!g.link_ids().contains(&30));
 
-        g.apply_block(&[removal(10, "Node")]);
+        g.apply_block(&[removal(10)]);
         assert_eq!(g.counts().0, 0, "the node must be gone");
     }
 
@@ -605,7 +677,7 @@ mod graph_state_tests {
         g.apply_block(&[link(30, 10, 11, 20, 21), link(31, 12, 13, 22, 23)]);
         assert_eq!(g.snapshot().links.len(), 2);
 
-        g.apply_block(&[removal(30, "Link")]);
+        g.apply_block(&[removal(30)]);
         let snap = g.snapshot();
         assert_eq!(snap.links.len(), 1);
         assert_eq!(snap.links[0].link_id, 31);

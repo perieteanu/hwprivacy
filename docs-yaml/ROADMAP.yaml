@@ -16,7 +16,7 @@ current_state:
     reboot-and-attach test has run on a machine other than this one.
 
   verified_working:
-    - "Cargo workspace, 7 crates, 16172 LOC, 255 tests run / 257 declared, builds clean (21 warnings, 0 errors) — verified 2026-09-12"
+    - "Cargo workspace, 7 crates, 16367 LOC, 263 tests run / 265 declared, builds clean (21 warnings, 0 errors) — verified 2026-09-12"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"
@@ -398,6 +398,25 @@ security_gaps:
     microphone: "ffmpeg -hide_banner -f alsa -i hw:0,0 -t 3 -f null -"
     pass_criterion_for_kernel_layer: "both commands must fail with EPERM for a denied app"
     caution: "the camera test lights the webcam LED; the mic test records real audio (discarded to null). Ask before running either."
+
+  g_one_program_two_rules:
+    what: "One program can hold two rules that disagree, because a rule's name comes from whichever layer asked first."
+    measured_2026_10_31: >
+      PID 3098 declares `Firefox Developer Edition` to PipeWire and runs
+      firefox-bin. The live config has `firefox developer edition` camera = allow
+      with no exe_path, and `firefox-bin` camera = deny. The kernel obeys the deny.
+    why: >
+      A PipeWire prompt names the rule after the declared name. A kernel prompt
+      names it short_name(exe). firefox-esr has one rule only because its binary
+      was attached by hand with --as.
+    direction: >
+      Not built. The join exists in the data: the stream's application.process.id
+      and the kernel event's tgid are the same number. Detecting the split and
+      offering a merge is the smaller first step.
+
+  g_devices_frozen_after_two_minutes:
+    what: "Device discovery runs only at start and for the first 120 s, so a USB microphone plugged in later may not be guarded by layer 1."
+    status: "READ IN THE CODE (main.rs monitoring_loop), NOT TESTED. The kernel backstop's capture minors were not checked for this case either."
 
 kernel_layer:
   label: "eBPF LSM enforcement (hwprivacy-lsm). Plan: ~/.claude/plans/curried-swinging-scone.md"

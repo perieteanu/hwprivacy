@@ -871,14 +871,37 @@ pub fn short_name(exe_path: &str) -> String {
         .to_string()
 }
 
+/// What pipewire-alsa calls every client: `PipeWire ALSA [<program>]`. Lowercase,
+/// as the matcher compares it.
+const ALSA_PLUGIN_PREFIX: &str = "pipewire alsa [";
+
 /// See [`Config::normalized_key`]. Free function so internal callers can use
 /// it without going through `Config`.
+///
+/// Must be idempotent. Rules are stored in this form and normalised again on
+/// every lookup, so a second pass that strips more compares two different keys
+/// for one name. It used to strip exactly one bracket: `PipeWire ALSA [audacity]
+/// [app-audacity@…]` looked up as `pipewire alsa [audacity]`, while the rule
+/// written from it compared as `pipewire alsa`, which missed Audacity and matched
+/// every other ALSA-plugin client that had no unit annotation.
+///
+/// Trailing brackets are annotations and all of them go, except in the ALSA form,
+/// where the first bracket is the only thing naming the program.
 pub fn normalize_app_name(app_name: &str) -> String {
-    let trimmed = match app_name.rfind(" [") {
-        Some(idx) if app_name.ends_with(']') => &app_name[..idx],
-        _ => app_name,
-    };
-    trimmed.trim().to_lowercase()
+    let lower = app_name.trim().to_lowercase();
+    if let Some(rest) = lower.strip_prefix(ALSA_PLUGIN_PREFIX) {
+        if let Some(end) = rest.find(']') {
+            return format!("{ALSA_PLUGIN_PREFIX}{}]", &rest[..end]);
+        }
+    }
+    let mut key = lower.as_str();
+    while key.ends_with(']') {
+        match key.rfind(" [") {
+            Some(idx) => key = key[..idx].trim_end(),
+            None => break,
+        }
+    }
+    key.to_string()
 }
 
 /// Turn a human-supplied string into a storable rule key, or `None` if it
@@ -889,9 +912,9 @@ pub fn normalize_app_name(app_name: &str) -> String {
 /// They run at different times and must stay different. `normalize_app_name` is
 /// the MATCHER: it runs on every lookup, against names PipeWire reports, and it
 /// is deliberately narrow — it exists to make `OBS`, `obs` and
-/// `OBS [pipewire-pulse]` share one rule, and nothing more. Widening it would
-/// make every future lookup fuzzier, which is the wrong direction for the
-/// function that decides access.
+/// `OBS [pipewire-pulse]` share one rule, and to drop annotations, nothing more.
+/// Widening it would make every future lookup fuzzier, which is the wrong
+/// direction for the function that decides access.
 ///
 /// This one runs once, on WRITE, on a string a human typed or pasted. It can
 /// afford to be forgiving because a bad result is visible immediately in
@@ -954,6 +977,97 @@ mod tests {
         assert_eq!(normalize_app_name("OBS [pipewire-pulse]"), "obs");
         assert_eq!(normalize_app_name("Firefox"), "firefox");
         assert_eq!(normalize_app_name("  Spaced  "), "spaced");
+    }
+
+    /// Names as they appear in the live journal.
+    const LIVE_NAMES: &[&str] = &[
+        "PipeWire ALSA [audacity] [app-audacity@f7dc872e676045cb894051c0a541fee2]",
+        "PipeWire ALSA [VBoxHeadless] [app-com.microsoft.VSCode-27366]",
+        "PipeWire ALSA [audacity]",
+        "WirePlumber [export] [wireplumber]",
+        "Firefox [pipewire-pulse]",
+        "Firefox Developer Edition [pipewire-pulse]",
+        "pipewire [pipewire-pulse]",
+        "obs",
+    ];
+
+    /// Rules are stored normalised and normalised again on every lookup, so a
+    /// matcher that is not idempotent compares two different keys for one name.
+    #[test]
+    fn normalizing_twice_changes_nothing() {
+        for name in LIVE_NAMES {
+            let once = normalize_app_name(name);
+            assert_eq!(normalize_app_name(&once), once, "{name}");
+        }
+    }
+
+    /// A click on Allow must apply to the name it was clicked for. Measured on
+    /// 2026-10-31: the rule written from Audacity's own event did not match it.
+    #[test]
+    fn a_rule_written_from_an_event_matches_that_event() {
+        for name in LIVE_NAMES {
+            let mut c = Config::default();
+            assert!(c.set_rule(name, &DeviceCategory::Microphone, Permission::Allow));
+            assert_eq!(
+                c.get_permission(name, &DeviceCategory::Microphone),
+                Permission::Allow,
+                "{name}"
+            );
+        }
+    }
+
+    /// The new launch has a new scope hash and must not ask again.
+    #[test]
+    fn an_alsa_rule_survives_a_new_launch() {
+        let mut c = Config::default();
+        c.set_rule(
+            "PipeWire ALSA [audacity] [app-audacity@f7dc872e676045cb894051c0a541fee2]",
+            &DeviceCategory::Microphone,
+            Permission::Allow,
+        );
+        for later in ["PipeWire ALSA [audacity] [app-audacity@0000]", "PipeWire ALSA [audacity]"] {
+            assert_eq!(
+                c.get_permission(later, &DeviceCategory::Microphone),
+                Permission::Allow,
+                "{later}"
+            );
+        }
+    }
+
+    /// Every ALSA-plugin client is called `PipeWire ALSA [...]`, so the bracket
+    /// is the only thing telling them apart. The rule as it sits in the live
+    /// config must not grant the microphone to anything else.
+    #[test]
+    fn an_alsa_rule_does_not_cover_other_alsa_programs() {
+        let mut c = Config::default();
+        c.policy.default_action = Permission::Deny;
+        c.rules.push(AppRule {
+            app_name: "pipewire alsa [audacity]".into(),
+            microphone: Some(Permission::Allow),
+            camera: None,
+            monitor: None,
+            exe_path: None,
+        });
+        for other in [
+            "PipeWire ALSA [ffmpeg]",
+            "PipeWire ALSA [VBoxHeadless]",
+            "PipeWire ALSA [VBoxHeadless] [app-com.microsoft.VSCode-27366]",
+            "PipeWire ALSA",
+        ] {
+            assert_eq!(
+                c.get_permission(other, &DeviceCategory::Microphone),
+                Permission::Deny,
+                "{other}"
+            );
+        }
+    }
+
+    /// WirePlumber's export client is WirePlumber: the 2026-10-05 click wrote to
+    /// the `wireplumber` rule, and that rule must be the one that answers.
+    #[test]
+    fn every_trailing_annotation_goes_outside_the_alsa_form() {
+        assert_eq!(normalize_app_name("WirePlumber [export] [wireplumber]"), "wireplumber");
+        assert_eq!(normalize_app_name("WirePlumber [export]"), "wireplumber");
     }
 
     /// The live config has a rule named `Firefox [pipewire-pulse] (pid:2332)`.

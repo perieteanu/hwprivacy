@@ -12,10 +12,10 @@
 ---
 shape:
   language: "Rust 2021 + one BPF C file"
-  layout: "Cargo workspace, 7 crates, 16172 LOC of first-party code (BPF C included; generated vmlinux.h excluded) — measured 2026-09-12"
+  layout: "Cargo workspace, 7 crates, 16367 LOC of first-party code (BPF C included; generated vmlinux.h excluded) — measured 2026-09-12"
   build: "cargo build --release --workspace  (or: make build)"
   binaries: 5
-  tests: 257        # declared; 255 run (2 need a display). Measured 2026-09-12.
+  tests: 265        # declared; 263 run (2 need a display). Measured 2026-10-31.
   test_distribution: "daemon 123, common 60, lsm 56, proto 6, ctl 5, tui 5, gui 2"
   corrected_2026_09_12: >
     This said 132 tests and "Zero in ctl/tui/gui", which had been false since

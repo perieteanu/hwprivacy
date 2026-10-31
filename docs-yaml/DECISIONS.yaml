@@ -1339,3 +1339,56 @@ decisions:
       session found ROADMAP's current_state five weeks stale with three false
       assertions that no file-tier check could have caught. See
       ROADMAP > next_up > doc-check-host-tier.
+
+  - id: d-removal-carries-no-type
+    date: "2026-10-31"
+    title: "A graph removal is applied by id, because the wire format has no type on it"
+    context: >
+      pw-dump --monitor sends a removal as exactly {"id": N, "info": null}. Captured
+      live for links and clients. apply_block dispatched on `type` first, so from
+      b854665 (2026-09-02) every removal fell through and the object stayed in the
+      graph until the monitor respawned. The tests passed throughout because the
+      fixture added a `type` the tool never sends.
+    consequences_of_the_defect:
+      - "A link on a previously used id was not new, so it was never classified: no deny, no prompt, no log line. PipeWire reuses ids within seconds."
+      - "hwprivacy-ctl streams listed links that were gone."
+      - "has_active_link stayed true, so a while_in_use session could not end. Usage figures for while_in_use from 2026-09-02 to the fix cannot count ended sessions."
+    decision: >
+      Check for removal before looking at the type and clear every map. Ids are
+      global across object types, so this cannot hit the wrong object. Graph
+      fixtures for wire behaviour are captured bytes, not hand-written JSON, and a
+      doc-check sentinel refuses the old fixture.
+    unaffected: "The kernel layer. It does not read this graph."
+    verified_live_2026_10_31: >
+      One probe, before and after: monitor capture under the denied name `amixer`.
+      Old daemon, two runs: 3/3 and 2/3 trials kept a link. In one trial it logged
+      DENIED and destroyed one link while the other channel stayed live, so a DENIED
+      line did not prove the access was stopped. New daemon: 0/3, every link
+      destroyed, including ids reused within the run.
+    what_cannot_be_known: >
+      What passed between 2026-09-02 and the fix. A skipped link logged nothing.
+
+  - id: d-matcher-is-idempotent
+    date: "2026-10-31"
+    title: "normalize_app_name must be idempotent, and the ALSA plugin's bracket is identity"
+    context: >
+      Rules are stored normalised and normalised again on lookup. Stripping exactly
+      one bracket meant `PipeWire ALSA [audacity] [app-audacity@hash]` looked up as
+      `pipewire alsa [audacity]` while the rule written from it compared as
+      `pipewire alsa`. The rule missed Audacity and matched any ALSA-plugin client
+      with no unit annotation. `WirePlumber [export] [wireplumber]` missed the
+      `wireplumber` rule its own click had written to.
+    decision: >
+      All trailing brackets are annotations and go, except that `PipeWire ALSA [x]`
+      keeps its first bracket, which is the only thing naming the program. Existing
+      rules need no edit: the live `pipewire alsa [audacity]` now means Audacity.
+    behaviour_change: "`wireplumber [export]` now resolves to the `wireplumber` rule instead of default_action. History rows already written under the old key stay under it."
+
+  - id: d-this-machine-stays-on-ask
+    date: "2026-10-31"
+    title: "Costin's machine runs default_action = ask"
+    context: >
+      d-deny-by-default changed the code default and left configs that name
+      default_action alone. This machine names `ask`, so it has never run the
+      posture the docs describe. Made explicit rather than left as a leftover.
+    decision: "Keep `ask` here, by Costin's ruling. The shipped default stays `deny`."

@@ -262,6 +262,11 @@ ok("cited source lines match their anchors and are in range")
 #     Add one only after a bug has actually occurred, never speculatively.
 # ══════════════════════════════════════════════════════════════════
 SENTINELS = [
+    ('"type": format!("PipeWire:Interface:{kind}"), "info": null',
+     "the removal fixture has invented a `type` again. A real removal from "
+     "`pw-dump --monitor` is exactly {\"id\": N, \"info\": null}. This fixture kept "
+     "the tests green from 2026-09-02 to 2026-10-31 while apply_block dropped "
+     "every removal, so a link on a recycled id was never evaluated by policy."),
     ("perm.or(Some(Permission::Deny))",
      "b1: this collapsed 'dismissed' into a permanent deny rule. Dismissal must "
      "stay distinguishable — see notification::PromptOutcome."),
