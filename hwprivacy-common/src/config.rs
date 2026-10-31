@@ -172,6 +172,14 @@ pub struct PolicyConfig {
     /// its prompt, in seconds. Was a `const` in stream_tracker.rs.
     #[serde(default = "default_dismiss_cooldown")]
     pub dismiss_cooldown_secs: u64,
+    /// How long a destroyed link gets to leave the graph before the daemon
+    /// retries, and then reports that it could not stop the access, in ms.
+    ///
+    /// A link leaves in about 11 ms (measured for the monitor stream), so this
+    /// only needs to outlast a busy moment. Longer is a longer wait before a
+    /// failed denial is noticed.
+    #[serde(default = "default_denied_link_grace")]
+    pub denied_link_grace_ms: u64,
     /// How often the daemon re-checks that the executables in the kernel
     /// allowlist are still the same files, in seconds.
     ///
@@ -287,12 +295,17 @@ fn default_notify_allow_cooldown() -> u64 {
     300
 }
 
+fn default_denied_link_grace() -> u64 {
+    1000
+}
+
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
             default_action: default_deny_action(),
             poll_interval_ms: default_poll_interval(),
             dismiss_cooldown_secs: default_dismiss_cooldown(),
+            denied_link_grace_ms: default_denied_link_grace(),
             exe_recheck_secs: default_exe_recheck(),
             while_in_use_settle_secs: default_while_in_use_settle(),
             awaiting_open_secs: default_awaiting_open(),

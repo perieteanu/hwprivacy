@@ -64,6 +64,9 @@ pub struct App {
     /// is the same class of lie as claiming protection that is not there.
     pub audio_backstop: (bool, String),
 
+    /// The link ledger. `None` when the daemon predates `GetLinkAudit`.
+    pub link_audit: Option<(u64, u64, u64, u64)>,
+
     /// Which category column the Rules panel is pointing at: 0 mic, 1 camera,
     /// 2 monitor.
     ///
@@ -98,6 +101,7 @@ impl App {
             status: (false, 0, 0, 0, 0),
             kernel: (false, false, 0, 0, String::new()),
             audio_backstop: (false, String::new()),
+            link_audit: None,
             selected_device: 0,
         };
 
@@ -127,6 +131,7 @@ impl App {
         if let Ok(a) = self.proxy.get_audio_backstop().await {
             self.audio_backstop = a;
         }
+        self.link_audit = self.proxy.get_link_audit().await.ok();
     }
 
     /// The category the Rules panel's column cursor is on.

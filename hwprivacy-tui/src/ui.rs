@@ -90,13 +90,25 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
         streams,
     );
 
-    // Two lines in the chunk draw() already reserves as Length(3). A second
+    // Three lines in the chunk draw() already reserves as Length(3). A new
     // row needs no layout change, no new tab, and no touch to Panel::next() or
     // App::max_rows() — which matters in the one crate with no other tests.
     let (kernel_text, alarm) = kernel_status_line(&app.kernel, &app.audio_backstop);
+    let (links_text, links_alarm) = match app.link_audit {
+        Some(audit) => {
+            let (line, alarm) = hwprivacy_common::stream::link_audit_line(audit);
+            (format!(" Links: {line}"), alarm)
+        }
+        None => (" Links: unknown — daemon predates this feature".to_string(), false),
+    };
     let status = Paragraph::new(vec![
         Line::from(status_text).style(Style::default().fg(Color::Green)),
         Line::from(kernel_text).style(Style::default().fg(if alarm {
+            Color::Red
+        } else {
+            Color::Green
+        })),
+        Line::from(links_text).style(Style::default().fg(if links_alarm {
             Color::Red
         } else {
             Color::Green

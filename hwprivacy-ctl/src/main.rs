@@ -266,6 +266,17 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            match proxy.get_link_audit().await {
+                Ok(audit) => {
+                    let (line, alarm) = hwprivacy_common::stream::link_audit_line(audit);
+                    println!(
+                        "  Links:            {line}{}",
+                        if alarm { "  <- see: journalctl --user -u hwprivacy" } else { "" }
+                    );
+                }
+                Err(_) => println!("  Links:            unknown — daemon predates this feature"),
+            }
+
             // Kernel layer. Reported separately and always — "not connected"
             // is real information, not an absence worth hiding.
             match proxy.get_kernel_status().await {

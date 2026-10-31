@@ -87,3 +87,21 @@ impl std::fmt::Display for AccessAction {
         }
     }
 }
+
+/// The link ledger as one line, and whether it needs attention. One wording, for
+/// the same reason as `GetAudioBackstop`: three frontends growing three versions
+/// of it is how they come to disagree.
+///
+/// Neither count is routine. `decided_late` means a link reached a decision by
+/// the safety net rather than the normal path, and `denied_alive` means access
+/// could not be stopped.
+pub fn link_audit_line(audit: (u64, u64, u64, u64)) -> (String, bool) {
+    let (seen, protected, decided_late, denied_alive) = audit;
+    (
+        format!(
+            "{seen} seen, {protected} on protected devices, {decided_late} decided late, \
+             {denied_alive} denied but alive"
+        ),
+        decided_late > 0 || denied_alive > 0,
+    )
+}

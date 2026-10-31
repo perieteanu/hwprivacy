@@ -326,6 +326,16 @@ impl HwPrivacyService {
     ///
     /// All the judgement is in `audio_backstop_report`, which is pure and
     /// tested; this method only gathers the four inputs.
+    async fn get_link_audit(&self) -> (u64, u64, u64, u64) {
+        let counts = self.state.read().await.link_ledger.counts;
+        (
+            counts.seen,
+            counts.protected,
+            counts.decided_late,
+            counts.denied_alive,
+        )
+    }
+
     async fn get_audio_backstop(&self) -> (bool, String) {
         let state = self.state.read().await;
         crate::lsm_client::audio_backstop_report(

@@ -187,6 +187,34 @@ pub async fn notify_allowed(
     .ok();
 }
 
+/// Tell the user a denial did not take: the access is still running.
+pub async fn notify_could_not_stop(app_name: &str, device: DeviceCategory) {
+    let summary = format!("COULD NOT STOP: {} → {}", app_name, device_label(device));
+    let body = format!(
+        "<b>{}</b> was denied <b>{}</b>, but the connection could not be removed.\n\
+         <i>It may still have access. Close the application, then see \
+         journalctl --user -u hwprivacy</i>",
+        app_name,
+        device_label(device),
+    );
+    let icon = device_icon(device);
+
+    tokio::task::spawn_blocking(move || {
+        let result = Notification::new()
+            .summary(&summary)
+            .body(&body)
+            .icon(icon)
+            .urgency(Urgency::Critical)
+            .timeout(0)
+            .show();
+        if let Err(e) = result {
+            warn!("Failed to send could-not-stop notification: {}", e);
+        }
+    })
+    .await
+    .ok();
+}
+
 /// Kernel-layer denial notification. Informational only — no action buttons.
 ///
 /// Originally not routed through [`ask_user_permission`] because that path

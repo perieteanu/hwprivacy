@@ -613,6 +613,8 @@ exe_recheck_secs = 30            # re-resolve allowlisted binaries (catches a
                                  # package upgrade changing an inode)
 awaiting_open_secs = 60          # a granted session that is never opened
                                  # expires after this
+denied_link_grace_ms = 1000      # a denied link gets this long to leave the
+                                 # graph before a retry, then an alarm
 notify_on_allow = true           # announce ALLOWED access, not only denials
 notify_allow_grace_secs = 60     # stay quiet for this long after startup
 notify_allow_cooldown_secs = 300 # per (app, device), between allow notices

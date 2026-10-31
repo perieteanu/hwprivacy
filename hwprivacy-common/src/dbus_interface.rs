@@ -88,6 +88,11 @@ pub trait HwPrivacy {
     /// its tuple, so nothing that already reads it needs changing.
     fn get_audio_backstop(&self) -> zbus::Result<(bool, String)>;
 
+    /// The link ledger since the daemon started:
+    /// `(seen, protected, decided_late, denied_alive)`. See
+    /// [`crate::stream::link_audit_line`]. Additive.
+    fn get_link_audit(&self) -> zbus::Result<(u64, u64, u64, u64)>;
+
     /// Live `while_in_use` sessions: (app, device, age_secs).
     ///
     /// Additive, like GetKernelStatus and GetHistory — GetKernelStatus keeps

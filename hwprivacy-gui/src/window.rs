@@ -27,6 +27,8 @@ enum UiMessage {
     /// stale-but-fine. A guard that silently stops being reported is the defect
     /// this change exists to remove, not one to reintroduce in the GUI.
     Kernel(bool, bool, bool, String),
+    /// The link ledger, on its own label for the same reason as `Kernel`.
+    LinkAudit(Option<(u64, u64, u64, u64)>),
     Error(String),
 }
 
@@ -86,6 +88,13 @@ pub fn build_ui(app: &gtk::Application) {
     kernel_label.set_margin_bottom(5);
     kernel_label.add_css_class("caption");
     main_box.append(&kernel_label);
+
+    let links_label = gtk::Label::new(Some("Links: checking..."));
+    links_label.set_halign(Align::Start);
+    links_label.set_margin_start(10);
+    links_label.set_margin_bottom(5);
+    links_label.add_css_class("caption");
+    main_box.append(&links_label);
 
     main_box.append(&gtk::Separator::new(Orientation::Horizontal));
 
@@ -261,6 +270,7 @@ pub fn build_ui(app: &gtk::Application) {
     let events_list_c = events_list.clone();
     let status_label_c = status_label.clone();
     let kernel_label_c = kernel_label.clone();
+    let links_label_c = links_label.clone();
     let cmd_tx_del = cmd_tx.clone();
     let cmd_tx_allow = cmd_tx.clone();
     let denials_list_c = denials_list.clone();
@@ -310,6 +320,18 @@ pub fn build_ui(app: &gtk::Application) {
                         )
                     };
                     kernel_label_c.set_text(&text);
+                }
+                UiMessage::LinkAudit(audit) => {
+                    links_label_c.set_text(&match audit {
+                        Some(audit) => {
+                            let (line, alarm) = hwprivacy_common::stream::link_audit_line(audit);
+                            format!(
+                                "Links: {line}{}",
+                                if alarm { " — see journalctl --user -u hwprivacy" } else { "" }
+                            )
+                        }
+                        None => "Links: unknown — daemon predates this feature".to_string(),
+                    });
                 }
                 UiMessage::Devices(devices) => {
                     clear_listbox(&devices_list_c);
@@ -699,6 +721,9 @@ async fn dbus_worker(
                         .send(UiMessage::Kernel(k.0, k.1, audio_on, audio_why))
                         .await;
                 }
+                let _ = ui_tx
+                    .send(UiMessage::LinkAudit(proxy.get_link_audit().await.ok()))
+                    .await;
                 if let Ok(d) = proxy.get_devices().await {
                     let _ = ui_tx.send(UiMessage::Devices(d)).await;
                 }

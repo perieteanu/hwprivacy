@@ -16,7 +16,7 @@ current_state:
     reboot-and-attach test has run on a machine other than this one.
 
   verified_working:
-    - "Cargo workspace, 7 crates, 16367 LOC, 263 tests run / 265 declared, builds clean (21 warnings, 0 errors) — verified 2026-09-12"
+    - "Cargo workspace, 7 crates, 17197 LOC, 279 tests run / 281 declared, builds clean (21 warnings, 0 errors) — verified 2026-09-12"
     - "Device auto-discovery — 4 devices found live (mic, camera, 2 sinks)"
     - "Monitor-tap detection by link direction (validated: parecord got 0 bytes)"
     - "Link destruction via pw-link --disconnect with pw-cli fallback"

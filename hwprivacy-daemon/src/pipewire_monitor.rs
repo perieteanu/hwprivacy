@@ -8,6 +8,8 @@ use tracing::{debug, info, trace, warn};
 #[derive(Debug, Clone)]
 pub struct PwLink {
     pub link_id: u32,
+    /// `object.serial`. Never reused, unlike `link_id`.
+    pub serial: Option<u64>,
     pub output_node: u32,
     pub output_port: u32,
     pub input_node: u32,
@@ -164,11 +166,23 @@ impl GraphState {
                     }
                 }
                 "PipeWire:Interface:Link" => {
-                    if let Some(link) = parse_link(id, obj) {
-                        // New only if the graph had never seen this id. A link
+                    if let Some(mut link) = parse_link(id, obj) {
+                        // New only if the graph had never seen this link. A link
                         // emits several blocks as it negotiates, and each is an
-                        // update, not a new access.
-                        if self.links.insert(id, link).is_none() {
+                        // update, not a new access. A different serial on a known
+                        // id is a different link, whatever happened to the removal.
+                        // A block with no serial says nothing either way.
+                        let is_new = match self.links.get(&id) {
+                            None => true,
+                            Some(old) => {
+                                if link.serial.is_none() {
+                                    link.serial = old.serial;
+                                }
+                                old.serial != link.serial
+                            }
+                        };
+                        self.links.insert(id, link);
+                        if is_new {
                             new_links.push(id);
                         }
                     }
@@ -444,9 +458,14 @@ fn parse_link(id: u32, obj: &Value) -> Option<PwLink> {
     let output_port = info.get("output-port-id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let input_node = info.get("input-node-id").and_then(|v| v.as_u64())? as u32;
     let input_port = info.get("input-port-id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let serial = info
+        .get("props")
+        .and_then(|p| p.get("object.serial"))
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
 
     Some(PwLink {
         link_id: id,
+        serial,
         output_node,
         output_port,
         input_node,
@@ -542,6 +561,29 @@ mod graph_state_tests {
         );
         g.apply_block(&blocks[4]);
         assert_eq!(g.counts().2, 0, "and the second removal must delete it too");
+    }
+
+    /// The second line of defence: lose the removal entirely, and the serial
+    /// still says this is a different link. `blocks[2]` is the removal.
+    #[test]
+    fn a_new_serial_on_a_known_id_is_new_even_if_the_removal_was_lost() {
+        let blocks: Vec<Vec<Value>> = serde_json::from_str(CAPTURED_LINK_96_LIFECYCLE).unwrap();
+        let mut g = GraphState::new();
+        g.apply_block(&blocks[0]);
+        g.apply_block(&blocks[1]);
+        assert_eq!(g.apply_block(&blocks[3]), vec![96]);
+        assert_eq!(g.snapshot().links[0].serial, Some(942));
+    }
+
+    /// An update with no serial must not look like a different link, and must
+    /// not erase the serial already known.
+    #[test]
+    fn a_block_with_no_serial_is_not_new_and_keeps_the_serial() {
+        let blocks: Vec<Vec<Value>> = serde_json::from_str(CAPTURED_LINK_96_LIFECYCLE).unwrap();
+        let mut g = GraphState::new();
+        g.apply_block(&blocks[0]);
+        assert!(g.apply_block(&[link(96, 101, 110, 58, 36)]).is_empty());
+        assert_eq!(g.snapshot().links[0].serial, Some(935));
     }
 
     /// A stale client would hand its identity to whichever later node names the
@@ -749,6 +791,8 @@ impl BlockSplitter {
 /// One update from the monitor: the graph as it now stands, plus the links
 /// that are new in this update.
 pub struct GraphUpdate {
+    /// This update is the first block from a fresh `pw-dump --monitor`.
+    pub seed: bool,
     pub snapshot: GraphSnapshot,
     pub new_link_ids: Vec<u32>,
     pub link_ids: HashSet<u32>,
@@ -855,6 +899,7 @@ where
                     info!("PipeWire graph seeded: {n} nodes, {p} ports, {l} links");
                 }
                 on_update(GraphUpdate {
+                    seed: blocks_seen == 1,
                     snapshot: graph.snapshot(),
                     new_link_ids,
                     link_ids: graph.link_ids(),

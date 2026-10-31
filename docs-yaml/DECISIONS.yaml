@@ -1392,3 +1392,30 @@ decisions:
       default_action alone. This machine names `ask`, so it has never run the
       posture the docs describe. Made explicit rather than left as a leftover.
     decision: "Keep `ask` here, by Costin's ruling. The shipped default stays `deny`."
+
+  - id: d-every-link-is-accounted-for
+    date: "2026-10-31"
+    title: "A live link on a protected device always has a recorded decision, and a miss is reported"
+    context: >
+      d-removal-carries-no-type fixed one way for a link to be skipped. The blindness
+      remained: a line was written only after a link was reported new AND recognised,
+      so anything failing earlier was silent, which is why a policy bypass ran for two
+      months and what passed cannot be reconstructed. A DENIED line was also written
+      without looking, and stood beside a live link on 2026-10-31.
+    decision: >
+      The monitoring loop decides from LinkLedger::reconcile, not from new_link_ids. A
+      link is identified by (id, object.serial). Each update, a live link on a protected
+      device with no decision gets one, whatever caused the miss, and any reason other
+      than "new" is a WARN and a counter. Every link gets one journal line. After a
+      denial the graph is checked, the destroy is retried once, and survivors are an
+      ERROR, a counter and a notification. The counts cross D-Bus via GetLinkAudit.
+    also_closes: >
+      A link classified once before its node, ports or device were known was never
+      looked at again. It is now decided when it can be.
+    not_a_guarantee_of: >
+      Anything while the daemon is stopped; the journal shows those gaps. It does not
+      add attribution either: the name on a line is still self-declared.
+    a_reseed_forgets: >
+      Ids and serials both restart with PipeWire, so a decision kept across a monitor
+      respawn could match a different link with the same pair.
+    journal_lines_exclude_media_name: "media.name holds page and meeting titles."

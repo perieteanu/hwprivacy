@@ -1,6 +1,7 @@
 mod dbus_service;
 mod device_discovery;
 mod history;
+mod link_audit;
 mod link_manager;
 mod lsm_client;
 mod notification;
@@ -16,7 +17,7 @@ use hwprivacy_common::stream::AccessAction;
 use hwprivacy_common::{Config, DeviceCategory, Permission};
 use policy_engine::PolicyDecision;
 use state::DaemonState;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -351,6 +352,43 @@ mod group_tests {
     }
 }
 
+/// Confirm that links just destroyed are really gone. A DENIED line used to be
+/// written without looking, and on 2026-10-31 one was written with a channel of
+/// the same stream still flowing.
+fn spawn_denial_check(
+    state: SharedState,
+    links: Vec<link_audit::LinkKey>,
+    app: String,
+    category: DeviceCategory,
+) {
+    tokio::spawn(async move {
+        let grace = std::time::Duration::from_millis(
+            state.read().await.config.policy.denied_link_grace_ms,
+        );
+        let ledger_state = state.clone();
+        let survivors = link_audit::verify_denial(
+            grace,
+            links,
+            move |keys| {
+                let ledger_state = ledger_state.clone();
+                async move { ledger_state.read().await.link_ledger.still_alive(&keys) }
+            },
+            |ids| async move { link_manager::destroy_links(&ids).await },
+        )
+        .await;
+        if survivors.is_empty() {
+            return;
+        }
+        state.write().await.link_ledger.counts.denied_alive += survivors.len() as u64;
+        // Logged as well as shown: a popup is invisible to any automated check.
+        error!(
+            "COULD NOT STOP {} → {:?}: links {:?} are still alive after a retry",
+            app, category, survivors
+        );
+        notification::notify_could_not_stop(&app, category).await;
+    });
+}
+
 /// Main monitoring loop: poll PipeWire graph, detect new links, enforce policy.
 /// Watch the PipeWire graph and act on every change.
 ///
@@ -410,38 +448,40 @@ async fn monitoring_loop(state: SharedState) {
 
     while let Some(update) = rx.recv().await {
         let snapshot = update.snapshot;
-        let new_links: Vec<pipewire_monitor::PwLink> = snapshot
-            .links
-            .iter()
-            .filter(|l| update.new_link_ids.contains(&l.link_id))
-            .cloned()
-            .collect();
 
-        {
-            let mut s = state.write().await;
+        // The ledger decides what needs a decision, not "was it reported new".
+        // That difference is d-every-link-is-accounted-for: a link that a step
+        // upstream failed to deliver is decided and reported, not skipped.
+        let reconciled = {
+            let mut guard = state.write().await;
+            let s = &mut *guard;
             s.known_link_ids = update.link_ids.clone();
+            if update.seed {
+                s.link_ledger.forget();
+            }
+            s.link_ledger
+                .reconcile(&snapshot, &update.new_link_ids, &s.devices)
+        };
+        for line in &reconciled.lines {
+            if line.warn {
+                warn!("{}", line.text);
+            } else {
+                info!("{}", line.text);
+            }
         }
 
-        // Classify every new link, then group them (see group_links). One
-        // group = one decision, one prompt, but ALL of its links get enforced.
-        let matches: Vec<(u32, policy_engine::LinkMatch)> = {
-            let s = state.read().await;
-            new_links
-                .iter()
-                .filter_map(|link| {
-                    policy_engine::classify_link(
-                        link.output_node,
-                        link.output_port,
-                        link.input_node,
-                        link.input_port,
-                        &snapshot.nodes,
-                        &snapshot.ports,
-                        &s.devices,
-                    )
-                    .map(|m| (link.link_id, m))
-                })
-                .collect()
-        };
+        // Group them (see group_links). One group = one decision, one prompt,
+        // but ALL of its links get enforced.
+        let keys: HashMap<u32, link_audit::LinkKey> = reconciled
+            .pending
+            .iter()
+            .map(|p| (p.key.0, p.key))
+            .collect();
+        let matches: Vec<(u32, policy_engine::LinkMatch)> = reconciled
+            .pending
+            .into_iter()
+            .map(|p| (p.key.0, p.link_match))
+            .collect();
 
         for group in group_links(matches) {
             let s = state.read().await;
@@ -454,13 +494,30 @@ async fn monitoring_loop(state: SharedState) {
 
             // Skip if device category is not guarded
             if !s.config.devices.is_guarded(&device.category) {
+                info!(
+                    "Links {:?}: {} → {:?}: this device is not guarded, left alone",
+                    link_ids, stream.app_name, device.category
+                );
                 continue;
             }
+
+            let group_keys: Vec<link_audit::LinkKey> =
+                link_ids.iter().filter_map(|id| keys.get(id).copied()).collect();
 
             // Check block-all mode
             if s.block_all {
                 drop(s);
+                info!(
+                    "Links {:?}: {} → {:?}: block-all",
+                    link_ids, stream.app_name, device.category
+                );
                 link_manager::destroy_links(link_ids).await;
+                spawn_denial_check(
+                    state.clone(),
+                    group_keys,
+                    stream.app_name.clone(),
+                    device.category,
+                );
                 let mut s = state.write().await;
                 s.log_denied(
                     &stream.app_name,
@@ -478,6 +535,10 @@ async fn monitoring_loop(state: SharedState) {
                 std::time::Duration::from_secs(s.config.policy.while_in_use_settle_secs),
             );
             let decision = policy_engine::evaluate(&s.config, stream, device, session_live);
+            info!(
+                "Links {:?}: {} → {:?}: {:?}",
+                link_ids, stream.app_name, device.category, decision
+            );
 
             // Act on decision
             match decision {
@@ -575,6 +636,7 @@ async fn monitoring_loop(state: SharedState) {
 
                     drop(s);
                     link_manager::destroy_links(link_ids).await;
+                    spawn_denial_check(state.clone(), group_keys, app.clone(), cat);
                     let mut s = state.write().await;
                     s.log_denied(&app, pid, cat, &node);
                     drop(s);
@@ -594,6 +656,7 @@ async fn monitoring_loop(state: SharedState) {
                     //    channel flowing while the popup says BLOCKED.
                     drop(s);
                     link_manager::destroy_links(link_ids).await;
+                    spawn_denial_check(state.clone(), group_keys, app.clone(), cat);
 
                     // 2. Check cooldown — if user recently dismissed the same
                     //    prompt, silently block without notification spam

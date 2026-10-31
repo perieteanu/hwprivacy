@@ -262,6 +262,11 @@ ok("cited source lines match their anchors and are in range")
 #     Add one only after a bug has actually occurred, never speculatively.
 # ══════════════════════════════════════════════════════════════════
 SENTINELS = [
+    ("update.new_link_ids.contains",
+     "the loop is deciding from 'was it reported new' again. That is what made "
+     "the 2026-09-02 defect silent: a link the graph failed to report was never "
+     "evaluated and left no trace. Decide from LinkLedger::reconcile. See "
+     "d-every-link-is-accounted-for."),
     ('"type": format!("PipeWire:Interface:{kind}"), "info": null',
      "the removal fixture has invented a `type` again. A real removal from "
      "`pw-dump --monitor` is exactly {\"id\": N, \"info\": null}. This fixture kept "
@@ -362,6 +367,13 @@ if _sentinel_hits == 0:
 #     keep accepting the rule and every unit test will keep passing.
 # ══════════════════════════════════════════════════════════════════
 REQUIRED = [
+    ("hwprivacy-daemon/src/main.rs", ".reconcile(&snapshot",
+     "the monitoring loop must decide from the link ledger. Without it a live "
+     "link on a protected device can go undecided and unrecorded, which is how a "
+     "policy bypass ran unseen for two months. See d-every-link-is-accounted-for."),
+    ("hwprivacy-daemon/src/main.rs", "spawn_denial_check(state.clone(), group_keys, app.clone(), cat)",
+     "a denial must be verified against the graph. A DENIED line written without "
+     "looking stood beside a live link on 2026-10-31."),
     ("hwprivacy-daemon/src/lsm_client.rs", "prompt_kernel_camera_denial",
      "a denied CAMERA must raise an ACTIONABLE prompt. Without it a "
      "while_in_use camera session can never be started, and the rule denies "
